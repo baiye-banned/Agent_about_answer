@@ -32,6 +32,23 @@ backend/checkpointer.db
 .vscode/
 .claude/
 
+# AI agent / local assistant context
+AGENTS.md
+agents.md
+agent.md
+CLAUDE.md
+claude.md
+.codex/
+.agents/
+
+# Local multi-agent harness state
+harness.json
+feature_list.json
+
+# AI-generated planning/test notes, not executable test suites
+tests/.test.md
+tests/*.test.md
+
 # OS
 .DS_Store
 Thumbs.db
