@@ -118,6 +118,15 @@
                 <el-icon><Document /></el-icon>
                 参考 {{ message.sources.length }} 篇资料
               </button>
+              <button
+                v-if="hasTrace(message)"
+                type="button"
+                class="ml-2 mt-3 inline-flex items-center gap-1 rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-500 hover:border-brand-500 hover:text-brand-700"
+                @click="openTrace(message)"
+              >
+                <el-icon><Document /></el-icon>
+                流程
+              </button>
               <div
                 v-if="message.ragas_status"
                 class="mt-3 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600"
@@ -182,6 +191,15 @@
             >
               <el-icon><Document /></el-icon>
               参考 {{ chatStore.streamSources.length }} 篇资料
+            </button>
+            <button
+              v-if="chatStore.streamTrace.events?.length"
+              type="button"
+              class="ml-2 mt-3 inline-flex items-center gap-1 rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-500 hover:border-brand-500 hover:text-brand-700"
+              @click="openTrace({ learning_trace: chatStore.streamTrace })"
+            >
+              <el-icon><Document /></el-icon>
+              流程
             </button>
           </div>
         </article>
@@ -293,6 +311,101 @@
       </div>
       <el-empty v-else description="暂无参考资料" />
     </el-drawer>
+
+    <el-drawer v-model="traceVisible" title="本次回答执行流程" size="720px" append-to-body>
+      <div v-loading="traceLoading" class="space-y-4">
+        <div class="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+          Trace ID：{{ activeTrace.trace_id || '--' }} · 状态：{{ activeTrace.status || '--' }}
+        </div>
+        <el-tabs v-model="traceTab">
+          <el-tab-pane label="时间线" name="timeline">
+            <el-timeline v-if="traceEvents.length">
+              <el-timeline-item
+                v-for="event in traceEvents"
+                :key="event.index"
+                :timestamp="event.time"
+                placement="top"
+              >
+                <div class="rounded-md border border-slate-200 bg-white p-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <p class="text-sm font-medium text-slate-800">{{ event.index }}. {{ event.stage }}</p>
+                    <span class="text-xs text-slate-400">{{ event.function }}</span>
+                  </div>
+                  <p class="mt-1 text-xs leading-5 text-slate-500">{{ event.note || '暂无说明' }}</p>
+                </div>
+              </el-timeline-item>
+            </el-timeline>
+            <el-empty v-else description="暂无流程事件" />
+          </el-tab-pane>
+
+          <el-tab-pane label="变量流" name="variables">
+            <el-table :data="traceVariableRows" size="small" border>
+              <el-table-column prop="name" label="变量" width="180" />
+              <el-table-column prop="stage" label="创建/使用位置" width="180" />
+              <el-table-column prop="value" label="值摘要" />
+            </el-table>
+          </el-tab-pane>
+
+          <el-tab-pane label="检索过程" name="retrieval">
+            <el-collapse v-if="retrievalRoutes.length">
+              <el-collapse-item
+                v-for="route in retrievalRoutes"
+                :key="route.route"
+                :title="`${route.route} · ${route.count || 0} 条`"
+              >
+                <p class="mb-2 whitespace-pre-wrap text-xs text-slate-500">Query：{{ route.query }}</p>
+                <div class="space-y-2">
+                  <div
+                    v-for="item in route.items || []"
+                    :key="`${route.route}-${item.file_id}-${item.chunk_id}`"
+                    class="rounded-md border border-slate-200 bg-white p-2 text-xs"
+                  >
+                    <p class="font-medium text-slate-700">{{ item.file_name || '未命名资料' }} #{{ item.chunk_id }}</p>
+                    <p class="mt-1 whitespace-pre-wrap text-slate-500">{{ item.excerpt }}</p>
+                  </div>
+                </div>
+              </el-collapse-item>
+            </el-collapse>
+            <el-empty v-else description="暂无检索明细" />
+          </el-tab-pane>
+
+          <el-tab-pane label="记忆管理" name="memory">
+            <div class="space-y-3 text-xs leading-5 text-slate-600">
+              <p>滑动窗口：最近 4 轮；摘要触发：完整回答轮数 &gt; 8 且未摘要轮数 &gt;= 4。</p>
+              <div
+                v-for="event in memoryEvents"
+                :key="event.index"
+                class="rounded-md border border-slate-200 bg-white p-3"
+              >
+                <p class="font-medium text-slate-800">{{ event.stage }}</p>
+                <p class="mt-1">{{ event.note }}</p>
+                <pre class="mt-2 max-h-56 overflow-auto rounded bg-slate-50 p-2">{{ formatJson(event.creates || event.result || event.params) }}</pre>
+              </div>
+              <el-empty v-if="!memoryEvents.length" description="暂无记忆事件" />
+            </div>
+          </el-tab-pane>
+
+          <el-tab-pane label="RAGAS评估" name="ragas">
+            <div class="space-y-3 text-xs leading-5 text-slate-600">
+              <div
+                v-for="event in ragasEvents"
+                :key="event.index"
+                class="rounded-md border border-slate-200 bg-white p-3"
+              >
+                <p class="font-medium text-slate-800">{{ event.stage }}</p>
+                <p class="mt-1">{{ event.note }}</p>
+                <pre class="mt-2 max-h-56 overflow-auto rounded bg-slate-50 p-2">{{ formatJson(event.result || event.params || event.creates) }}</pre>
+              </div>
+              <el-empty v-if="!ragasEvents.length" description="暂无 RAGAS 事件" />
+            </div>
+          </el-tab-pane>
+
+          <el-tab-pane label="原始JSON" name="json">
+            <pre class="max-h-[70vh] overflow-auto rounded-md bg-slate-950 p-3 text-xs leading-5 text-slate-100">{{ prettyTrace }}</pre>
+          </el-tab-pane>
+        </el-tabs>
+      </div>
+    </el-drawer>
   </div>
 </template>
 
@@ -329,6 +442,10 @@ const renameTitle = ref('')
 const renameRef = ref(null)
 const sourcesVisible = ref(false)
 const activeSources = ref([])
+const traceVisible = ref(false)
+const traceLoading = ref(false)
+const traceTab = ref('timeline')
+const activeTrace = ref({ trace_id: '', status: '', events: [] })
 const attachments = ref([])
 const uploadingAttachment = ref(false)
 const knowledgeBases = computed(() => knowledgeStore.knowledgeBases)
@@ -360,6 +477,40 @@ const ragasMetrics = [
   { key: 'response_relevancy', label: 'Relevancy' },
   { key: 'context_precision_without_reference', label: 'Context precision' },
 ]
+
+const traceEvents = computed(() => activeTrace.value?.events || [])
+
+const traceVariableRows = computed(() => {
+  const rows = []
+  for (const event of traceEvents.value) {
+    for (const groupName of ['creates', 'uses', 'params', 'result']) {
+      const group = event[groupName] || {}
+      for (const [name, value] of Object.entries(group)) {
+        rows.push({
+          name,
+          stage: `${event.stage} / ${groupName}`,
+          value: stringifyBrief(value),
+        })
+      }
+    }
+  }
+  return rows
+})
+
+const retrievalRoutes = computed(() => {
+  const event = [...traceEvents.value].reverse().find((item) => item.stage === 'retrieval_completed')
+  return event?.creates?.routes || []
+})
+
+const memoryEvents = computed(() =>
+  traceEvents.value.filter((event) => event.stage?.includes('memory'))
+)
+
+const ragasEvents = computed(() =>
+  traceEvents.value.filter((event) => event.stage?.includes('ragas'))
+)
+
+const prettyTrace = computed(() => formatJson(activeTrace.value))
 
 onMounted(async () => {
   await refreshKnowledgeBases()
@@ -512,6 +663,55 @@ function scrollToBottom() {
 function openSources(sources) {
   activeSources.value = sources || []
   sourcesVisible.value = true
+}
+
+function hasTrace(message) {
+  const trace = message?.learning_trace || message?.retrieval_trace?.learning_trace || {}
+  return Boolean(message?.trace_id || trace.trace_id || trace.events?.length)
+}
+
+async function openTrace(message) {
+  traceVisible.value = true
+  traceTab.value = 'timeline'
+  const embeddedTrace = message?.learning_trace || message?.retrieval_trace?.learning_trace || {}
+  activeTrace.value = embeddedTrace || { trace_id: '', status: '', events: [] }
+  const traceId = message?.trace_id || embeddedTrace.trace_id
+  if (!traceId && !message?.id) return
+
+  traceLoading.value = true
+  try {
+    const response = message?.id
+      ? await chatAPI.getMessageTrace(message.id)
+      : await chatAPI.getTrace(traceId)
+    activeTrace.value = normalizeTrace(response)
+  } catch (error) {
+    if (!activeTrace.value?.events?.length) {
+      ElMessage.warning('暂无可加载的流程详情')
+    }
+  } finally {
+    traceLoading.value = false
+  }
+}
+
+function normalizeTrace(trace = {}) {
+  return {
+    trace_id: trace.trace_id || '',
+    status: trace.status || '',
+    events: Array.isArray(trace.events) ? trace.events : [],
+  }
+}
+
+function formatJson(value) {
+  try {
+    return JSON.stringify(value || {}, null, 2)
+  } catch {
+    return String(value || '')
+  }
+}
+
+function stringifyBrief(value) {
+  const text = typeof value === 'string' ? value : formatJson(value)
+  return text.length > 220 ? `${text.slice(0, 220)}...` : text
 }
 
 function formatScore(score) {

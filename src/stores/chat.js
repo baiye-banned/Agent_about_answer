@@ -2,6 +2,9 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { chatAPI, streamChat } from '@/api/chat'
 
+const EVALUATION_POLL_INTERVAL_MS = 3000
+const EVALUATION_POLL_TIMEOUT_MS = 190000
+
 export const useChatStore = defineStore('chat', () => {
   const conversations = ref([])
   const currentId = ref(null)
@@ -13,6 +16,7 @@ export const useChatStore = defineStore('chat', () => {
   const streaming = ref(false)
   const streamContent = ref('')
   const streamSources = ref([])
+  const streamTrace = ref({ trace_id: '', status: 'running', events: [] })
   const streamingConversationId = ref(null)
   const pendingRouteConversationId = ref(null)
   const selectedKnowledgeBaseId = ref(null)
@@ -61,7 +65,7 @@ export const useChatStore = defineStore('chat', () => {
     loading.value = true
     try {
       const response = await chatAPI.getMessages(id)
-      messages.value = Array.isArray(response) ? response : []
+      messages.value = Array.isArray(response) ? response.map(normalizeMessage) : []
       const conversation = conversations.value.find((item) => item.id === id)
       if (conversation?.knowledge_base_id) {
         selectedKnowledgeBaseId.value = conversation.knowledge_base_id
@@ -131,6 +135,7 @@ export const useChatStore = defineStore('chat', () => {
     streaming.value = true
     streamContent.value = ''
     streamSources.value = []
+    streamTrace.value = { trace_id: '', status: 'running', events: [] }
     streamImageAnalysis.value = null
     streamingConversationId.value = currentId.value
     pendingRouteConversationId.value = null
@@ -163,6 +168,10 @@ export const useChatStore = defineStore('chat', () => {
           streamSources.value = event.sources || []
           return
         }
+        if (event?.type === 'trace') {
+          mergeStreamTrace(event)
+          return
+        }
         if (event?.type === 'image_analysis') {
           streamImageAnalysis.value = normalizeImageAnalysis(event.analysis || event)
           return
@@ -182,6 +191,7 @@ export const useChatStore = defineStore('chat', () => {
         role: 'assistant',
         content: streamContent.value,
         sources: streamSources.value,
+        learning_trace: cloneTrace(streamTrace.value),
         ...streamImageAnalysisFields(),
         ragas_status: 'pending',
         isLocal: true,
@@ -208,6 +218,7 @@ export const useChatStore = defineStore('chat', () => {
           role: 'assistant',
           content: `${streamContent.value}\n\n*(已停止生成)*`,
           sources: streamSources.value,
+          learning_trace: cloneTrace(streamTrace.value),
           isLocal: true,
         })
       }
@@ -215,14 +226,12 @@ export const useChatStore = defineStore('chat', () => {
       const message = getStreamErrorMessage(error)
       errorMessage.value = message
       if (currentId.value === streamingConversationId.value) {
-        const content = streamContent.value
-          ? `${streamContent.value}\n\n${message}`
-          : message
         addMessage({
           role: 'assistant',
-          content,
+          content: streamContent.value || message,
           sources: streamSources.value,
           stream_error: message,
+          learning_trace: cloneTrace(streamTrace.value),
           ...streamImageAnalysisFields(),
           isLocal: true,
         })
@@ -239,6 +248,7 @@ export const useChatStore = defineStore('chat', () => {
     streaming.value = false
     streamContent.value = ''
     streamSources.value = []
+    streamTrace.value = { trace_id: '', status: 'running', events: [] }
     streamImageAnalysis.value = null
     streamingConversationId.value = null
     pendingRouteConversationId.value = null
@@ -273,6 +283,30 @@ export const useChatStore = defineStore('chat', () => {
         image_analysis_error: analysis.error,
         image_description: analysis.description,
       },
+    }
+  }
+
+  function mergeStreamTrace(event = {}) {
+    const traceId = event.trace_id || streamTrace.value.trace_id || ''
+    const nextEvents = [...(streamTrace.value.events || [])]
+    if (event.event) {
+      const exists = nextEvents.some((item) => item.index === event.event.index)
+      if (!exists) {
+        nextEvents.push(event.event)
+      }
+    }
+    streamTrace.value = {
+      trace_id: traceId,
+      status: event.status || streamTrace.value.status || 'running',
+      events: nextEvents.sort((a, b) => Number(a.index || 0) - Number(b.index || 0)),
+    }
+  }
+
+  function cloneTrace(trace = {}) {
+    return {
+      trace_id: trace.trace_id || '',
+      status: trace.status || '',
+      events: Array.isArray(trace.events) ? trace.events.map((event) => ({ ...event })) : [],
     }
   }
 
@@ -333,13 +367,13 @@ export const useChatStore = defineStore('chat', () => {
     evaluationPollStartedAt.value = Date.now()
     let elapsed = 0
     evaluationPollTimer.value = window.setInterval(async () => {
-      elapsed += 3000
+      elapsed += EVALUATION_POLL_INTERVAL_MS
       if (currentId.value !== conversationId) {
         stopEvaluationPolling()
         return
       }
       const nextMessages = await refreshMessages(conversationId).catch(() => messages.value)
-      if (elapsed > 110000) {
+      if (elapsed > EVALUATION_POLL_TIMEOUT_MS) {
         markLocalEvaluationTimeout()
         stopEvaluationPolling()
         return
@@ -347,7 +381,7 @@ export const useChatStore = defineStore('chat', () => {
       if (!hasPendingEvaluation(nextMessages)) {
         stopEvaluationPolling()
       }
-    }, 3000)
+    }, EVALUATION_POLL_INTERVAL_MS)
   }
 
   function stopEvaluationPolling() {
@@ -391,6 +425,7 @@ export const useChatStore = defineStore('chat', () => {
 
   function normalizeMessage(message) {
     const retrievalTrace = message.retrieval_trace || {}
+    const learningTrace = message.learning_trace || retrievalTrace.learning_trace || {}
     return {
       id: message.id || null,
       role: message.role,
@@ -402,6 +437,8 @@ export const useChatStore = defineStore('chat', () => {
       ragas_error: message.ragas_error || '',
       stream_error: message.stream_error || '',
       retrieval_trace: retrievalTrace,
+      learning_trace: learningTrace,
+      trace_id: message.trace_id || learningTrace.trace_id || '',
       image_analysis_status: message.image_analysis_status || retrievalTrace.image_analysis_status || '',
       image_analysis_error: message.image_analysis_error || retrievalTrace.image_analysis_error || '',
       image_description: message.image_description || retrievalTrace.image_description || '',
@@ -420,6 +457,7 @@ export const useChatStore = defineStore('chat', () => {
     streaming,
     streamContent,
     streamSources,
+    streamTrace,
     streamingConversationId,
     pendingRouteConversationId,
     selectedKnowledgeBaseId,

@@ -1,6 +1,7 @@
 import uuid
 
 from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -42,6 +43,9 @@ class Conversation(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     knowledge_base_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=True)
     title = Column(String(200), nullable=False)
+    memory_summary = Column(Text, default="")
+    memory_summary_upto_message_id = Column(Integer, default=0)
+    memory_updated_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -58,13 +62,13 @@ class Message(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     conversation_id = Column(String(36), ForeignKey("conversations.id"), nullable=False)
     role = Column(String(10), nullable=False)
-    content = Column(Text, nullable=False)
+    content = Column(LONGTEXT, nullable=False)
     sources = Column(Text, default="")
     attachments = Column(Text, default="")
     ragas_status = Column(String(20), default="")
     ragas_scores = Column(Text, default="")
     ragas_error = Column(Text, default="")
-    retrieval_trace = Column(Text, default="")
+    retrieval_trace = Column(LONGTEXT, default="")
     created_at = Column(DateTime, server_default=func.now())
 
     conversation = relationship("Conversation", back_populates="messages")
@@ -77,7 +81,20 @@ class KnowledgeFile(Base):
     knowledge_base_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=True)
     name = Column(String(255), nullable=False)
     size = Column(Integer, nullable=False)
-    content = Column(Text, default="")
+    content = Column(LONGTEXT, default="")
     created_at = Column(DateTime, server_default=func.now())
 
     knowledge_base = relationship("KnowledgeBase", back_populates="files")
+
+
+class ChatTraceSession(Base):
+    __tablename__ = "chat_trace_sessions"
+
+    id = Column(String(36), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    conversation_id = Column(String(36), nullable=True)
+    message_id = Column(Integer, nullable=True)
+    status = Column(String(20), default="running")
+    events = Column(LONGTEXT, default="[]")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

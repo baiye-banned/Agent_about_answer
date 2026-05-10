@@ -1,4 +1,4 @@
-﻿<template>
+﻿﻿<template>
   <div class="h-full overflow-y-auto bg-slate-50 p-6">
     <div class="mx-auto max-w-7xl">
       <div class="mb-5 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
@@ -164,6 +164,7 @@
           label-position="top"
           require-asterisk-position="right"
           status-icon
+          @submit.prevent="submitKnowledgeBaseDialog"
         >
           <el-form-item label="知识库名称" prop="name">
             <el-input
@@ -172,7 +173,6 @@
               maxlength="100"
               clearable
               placeholder="请输入知识库名称"
-              @keyup.enter="submitKnowledgeBaseDialog"
             />
           </el-form-item>
         </el-form>
@@ -328,7 +328,10 @@ watch([filteredFiles, pageSize], () => {
 })
 
 async function fetchFiles() {
-  if (!currentKnowledgeBaseId.value) return
+  if (!currentKnowledgeBaseId.value) {
+    allFiles.value = []
+    return
+  }
   loading.value = true
   try {
     const response = await knowledgeAPI.getList({ knowledge_base_id: currentKnowledgeBaseId.value })
@@ -339,13 +342,13 @@ async function fetchFiles() {
 }
 
 async function initializeKnowledgeBases() {
-  await fetchKnowledgeBases()
-  currentKnowledgeBaseId.value = knowledgeBases.value[0]?.id || null
+  const list = await fetchKnowledgeBases()
+  currentKnowledgeBaseId.value = resolveKnowledgeBaseId(currentKnowledgeBaseId.value, list)
   await fetchFiles()
 }
 
 async function fetchKnowledgeBases() {
-  await knowledgeStore.refreshKnowledgeBases()
+  return knowledgeStore.refreshKnowledgeBases()
 }
 
 async function handleKnowledgeBaseChange() {
@@ -392,23 +395,69 @@ async function submitKnowledgeBaseDialog() {
   try {
     if (knowledgeBaseDialogMode.value === 'create') {
       const created = await knowledgeAPI.createBase(name)
-      ElMessage.success('知识库已创建')
-      await fetchKnowledgeBases()
+      knowledgeStore.upsertKnowledgeBase(created)
       currentKnowledgeBaseId.value = created.id
+      selectedFiles.value = []
+      page.value = 1
+      allFiles.value = []
+      ElMessage.success('知识库已创建')
+      await refreshKnowledgeBasesPreserving(created)
       await fetchFiles()
     } else if (current) {
-      await knowledgeAPI.renameBase(current.id, name)
+      const renamed = await knowledgeAPI.renameBase(current.id, name)
+      knowledgeStore.upsertKnowledgeBase(renamed)
       ElMessage.success('知识库已重命名')
-      await fetchKnowledgeBases()
+      await refreshKnowledgeBasesPreserving(renamed)
     }
 
     knowledgeBaseDialogVisible.value = false
   } catch (error) {
     const message = error.response?.data?.detail || error.response?.data?.message || '操作失败，请稍后重试'
+    if (isDuplicateKnowledgeBaseError(error, message)) {
+      try {
+        await ElMessageBox.alert('知识库已存在', '提示', {
+          confirmButtonText: '知道了',
+          type: 'warning',
+          showClose: false,
+          appendTo: 'body',
+          customClass: 'knowledge-base-alert-dialog',
+        })
+      } finally {
+        knowledgeBaseDialogVisible.value = false
+      }
+      return
+    }
     ElMessage.error(message)
   } finally {
     knowledgeBaseSubmitting.value = false
   }
+}
+
+function isDuplicateKnowledgeBaseError(error, message) {
+  return error.response?.status === 400 && String(message || '').includes('知识库名称已存在')
+}
+
+function resolveKnowledgeBaseId(preferredId, list = knowledgeBases.value) {
+  const bases = Array.isArray(list) ? list : []
+  if (preferredId && bases.some((item) => item.id === preferredId)) {
+    return preferredId
+  }
+  return bases[0]?.id || null
+}
+
+async function refreshKnowledgeBasesPreserving(preferredBase) {
+  try {
+    const list = await fetchKnowledgeBases()
+    if (preferredBase?.id && !list.some((item) => item.id === preferredBase.id)) {
+      knowledgeStore.upsertKnowledgeBase(preferredBase)
+    }
+  } catch (error) {
+    if (preferredBase?.id) {
+      knowledgeStore.upsertKnowledgeBase(preferredBase)
+    }
+  }
+
+  currentKnowledgeBaseId.value = resolveKnowledgeBaseId(preferredBase?.id || currentKnowledgeBaseId.value)
 }
 
 function resetKnowledgeBaseDialog() {
@@ -515,6 +564,7 @@ function confirmCentered(message, title) {
     draggable: false,
     appendTo: 'body',
     customClass: 'center-delete-dialog',
+    showClose: false,
   })
 }
 
@@ -594,7 +644,188 @@ function formatTime(value) {
 
 <style>
 .center-delete-dialog {
-  margin: 0 auto;
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  margin: 0;
+  padding: 0;
+  transform: translate(-50%, -50%);
+  width: min(440px, calc(100vw - 32px));
+  overflow: hidden;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 20px 45px rgb(15 23 42 / 16%);
+}
+
+.center-delete-dialog .el-message-box__header {
+  padding: 22px 24px 0;
+}
+
+.center-delete-dialog .el-message-box__title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #0f172a;
+  font-size: 18px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.center-delete-dialog .el-message-box__title::before {
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: #fef2f2;
+  color: #dc2626;
+  content: "!";
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.center-delete-dialog .el-message-box__content {
+  padding: 14px 24px 0;
+  color: #475569;
+  font-size: 14px;
+  line-height: 1.75;
+}
+
+.center-delete-dialog .el-message-box__container {
+  display: block;
+}
+
+.center-delete-dialog .el-message-box__status {
+  display: none;
+}
+
+.center-delete-dialog .el-message-box__message {
+  margin: 0;
+}
+
+.center-delete-dialog .el-message-box__message p {
+  margin: 0;
+  word-break: break-word;
+}
+
+.center-delete-dialog .el-message-box__btns {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 22px 24px 24px;
+}
+
+.center-delete-dialog .el-button {
+  min-width: 76px;
+  height: 36px;
+  border-radius: 6px;
+  font-weight: 500;
+}
+
+.center-delete-dialog .el-button--primary {
+  border-color: #dc2626;
+  background: #dc2626;
+}
+
+.center-delete-dialog .el-button--primary:hover,
+.center-delete-dialog .el-button--primary:focus {
+  border-color: #b91c1c;
+  background: #b91c1c;
+}
+
+.knowledge-base-alert-dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  margin: 0;
+  padding: 0;
+  transform: translate(-50%, -50%);
+  width: min(380px, calc(100vw - 32px));
+  overflow: hidden;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 20px 45px rgb(15 23 42 / 16%);
+}
+
+.knowledge-base-alert-dialog .el-message-box__header {
+  padding: 22px 24px 0;
+}
+
+.knowledge-base-alert-dialog .el-message-box__title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #0f172a;
+  font-size: 18px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.knowledge-base-alert-dialog .el-message-box__title::before {
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: #eff6ff;
+  color: #2563eb;
+  content: "!";
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.knowledge-base-alert-dialog .el-message-box__content {
+  padding: 14px 24px 0;
+  color: #475569;
+  font-size: 14px;
+  line-height: 1.75;
+}
+
+.knowledge-base-alert-dialog .el-message-box__container {
+  display: block;
+}
+
+.knowledge-base-alert-dialog .el-message-box__status {
+  display: none;
+}
+
+.knowledge-base-alert-dialog .el-message-box__message {
+  margin: 0;
+}
+
+.knowledge-base-alert-dialog .el-message-box__message p {
+  margin: 0;
+  word-break: break-word;
+}
+
+.knowledge-base-alert-dialog .el-message-box__btns {
+  display: flex;
+  justify-content: flex-end;
+  padding: 22px 24px 24px;
+}
+
+.knowledge-base-alert-dialog .el-button {
+  min-width: 84px;
+  height: 36px;
+  border-radius: 6px;
+  font-weight: 500;
+}
+
+.knowledge-base-alert-dialog .el-button--primary {
+  border-color: #2563eb;
+  background: #2563eb;
+}
+
+.knowledge-base-alert-dialog .el-button--primary:hover,
+.knowledge-base-alert-dialog .el-button--primary:focus {
+  border-color: #1d4ed8;
+  background: #1d4ed8;
 }
 
 .knowledge-base-form-dialog {

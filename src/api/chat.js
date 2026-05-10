@@ -15,6 +15,12 @@ export const chatAPI = {
   renameConversation(id, title) {
     return request.put(`/chat/conversations/${id}`, { title })
   },
+  getTrace(traceId) {
+    return request.get(`/chat/traces/${traceId}`)
+  },
+  getMessageTrace(messageId) {
+    return request.get(`/chat/messages/${messageId}/trace`)
+  },
   uploadAttachment(file, onProgress) {
     const formData = new FormData()
     formData.append('file', file)
@@ -96,7 +102,7 @@ export async function streamChat({
           if (parsed.type === 'error') {
             throw new Error(parsed.message || parsed.content || '模型请求失败')
           }
-          if (parsed.type === 'sources' || parsed.type === 'conversation' || parsed.type === 'image_analysis') {
+          if (['sources', 'conversation', 'image_analysis', 'trace'].includes(parsed.type)) {
             onMessage?.('', parsed)
           } else {
             onMessage?.(parsed.content ?? '', parsed)

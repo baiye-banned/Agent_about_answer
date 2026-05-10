@@ -20,6 +20,10 @@
           <el-icon><FolderOpened /></el-icon>
           <span>知识库管理</span>
         </el-menu-item>
+        <el-menu-item index="/learn">
+          <el-icon><Reading /></el-icon>
+          <span>学习中心</span>
+        </el-menu-item>
       </el-menu>
 
       <div class="flex min-h-0 flex-1 flex-col border-t border-slate-200">
@@ -165,6 +169,7 @@ import {
   FolderOpened,
   Operation,
   Plus,
+  Reading,
 } from '@element-plus/icons-vue'
 import { ElMessageBox } from 'element-plus'
 import { useChatStore } from '@/stores/chat'
@@ -175,7 +180,11 @@ const router = useRouter()
 const chatStore = useChatStore()
 const userStore = useUserStore()
 
-const activeMenu = computed(() => (route.path.startsWith('/knowledge') ? '/knowledge' : '/chat'))
+const activeMenu = computed(() => {
+  if (route.path.startsWith('/learn')) return '/learn'
+  if (route.path.startsWith('/knowledge')) return '/knowledge'
+  return '/chat'
+})
 const avatarSrc = computed(() => normalizeAvatarUrl(userStore.avatarUrl))
 const allConversationsSelected = computed(() =>
   Boolean(chatStore.conversations.length) &&

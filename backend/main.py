@@ -1,4 +1,5 @@
-﻿import json
+﻿﻿import json
+import asyncio
 import logging
 import mimetypes
 import base64
@@ -23,6 +24,7 @@ import httpx
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from config import (
@@ -44,12 +46,25 @@ from config import (
     TEXT_FALLBACK_API_KEY,
     TEXT_FALLBACK_BASE_URL,
     TEXT_FALLBACK_MODEL,
+    MEMORY_RECENT_MAX_CHARS,
+    MEMORY_SUMMARY_MAX_CHARS,
+    MEMORY_SUMMARY_TRIGGER_TURNS,
+    MEMORY_WINDOW_TURNS,
 )
 from database import get_db, init_db, SessionLocal
-from models import User, Conversation, Message, KnowledgeFile, KnowledgeBase, _new_id
+from models import User, Conversation, Message, KnowledgeFile, KnowledgeBase, ChatTraceSession, _new_id
 from retrieval import deepseek_chat_url, normalize_deepseek_model, retrieve_knowledge
 from ragas_eval import schedule_ragas_evaluation
 from checkpointer import delete_thread_checkpoints, list_threads
+from learning_trace import (
+    TraceRecorder,
+    append_trace_event,
+    compact_trace_reference,
+    get_trace_snapshot,
+    serialize_trace_session as _serialize_trace_session,
+    summarize_messages,
+    summarize_text,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -309,6 +324,42 @@ def get_messages(cid: str, user: User = Depends(get_current_user),
     return [_serialize_message(m) for m in conv.messages]
 
 
+@app.get("/api/chat/traces/{trace_id}")
+def get_chat_trace(trace_id: str, user: User = Depends(get_current_user)):
+    trace = get_trace_snapshot(trace_id, user_id=user.id)
+    if not trace:
+        raise HTTPException(404, "Trace 不存在")
+    return trace
+
+
+@app.get("/api/chat/messages/{message_id}/trace")
+def get_message_trace(message_id: int, user: User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    message = (
+        db.query(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .filter(Message.id == message_id, Conversation.user_id == user.id)
+        .first()
+    )
+    if not message:
+        raise HTTPException(404, "消息不存在")
+
+    retrieval_trace = _loads_json(message.retrieval_trace, {})
+    learning_trace = retrieval_trace.get("learning_trace", {}) if isinstance(retrieval_trace, dict) else {}
+    trace_id = learning_trace.get("trace_id")
+    if trace_id:
+        trace = get_trace_snapshot(trace_id, user_id=user.id)
+        if trace:
+            return trace
+
+    trace_session = db.query(ChatTraceSession).filter_by(message_id=message_id, user_id=user.id).first()
+    if trace_session:
+        return _serialize_trace_session(trace_session)
+    if learning_trace:
+        return learning_trace
+    raise HTTPException(404, "该消息暂无流程 Trace")
+
+
 @app.delete("/api/chat/conversations/{cid}")
 def delete_conversation(cid: str, user: User = Depends(get_current_user),
                         db: Session = Depends(get_db)):
@@ -337,20 +388,21 @@ def rename_conversation(cid: str, body: RenameRequest, user: User = Depends(get_
     return {"message": "ok"}
 
 
+def _serialize_knowledge_base(item: KnowledgeBase) -> dict:
+    return {
+        "id": item.id,
+        "name": item.name,
+        "file_count": len(item.files),
+        "created_at": item.created_at.isoformat() if item.created_at else "",
+        "updated_at": item.updated_at.isoformat() if item.updated_at else "",
+    }
+
+
 @app.get("/api/knowledge-bases")
 def list_knowledge_bases(_user: User = Depends(get_current_user),
                          db: Session = Depends(get_db)):
     rows = db.query(KnowledgeBase).order_by(KnowledgeBase.created_at.asc()).all()
-    return [
-        {
-            "id": item.id,
-            "name": item.name,
-            "file_count": len(item.files),
-            "created_at": item.created_at.isoformat() if item.created_at else "",
-            "updated_at": item.updated_at.isoformat() if item.updated_at else "",
-        }
-        for item in rows
-    ]
+    return [_serialize_knowledge_base(item) for item in rows]
 
 
 @app.post("/api/knowledge-bases")
@@ -366,7 +418,7 @@ def create_knowledge_base(body: KnowledgeBaseRequest,
     db.add(entry)
     db.commit()
     db.refresh(entry)
-    return {"id": entry.id, "name": entry.name}
+    return _serialize_knowledge_base(entry)
 
 
 @app.put("/api/knowledge-bases/{kid}")
@@ -384,7 +436,8 @@ def rename_knowledge_base(kid: int, body: KnowledgeBaseRequest,
         raise HTTPException(400, "知识库名称已存在")
     entry.name = name
     db.commit()
-    return {"id": entry.id, "name": entry.name}
+    db.refresh(entry)
+    return _serialize_knowledge_base(entry)
 
 
 @app.delete("/api/knowledge-bases/{kid}")
@@ -448,22 +501,73 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
     if not user:
         db.close()
         raise HTTPException(401, "User not found")
+    trace = TraceRecorder(user_id=user.id)
     try:
+        trace.add(
+            "request_received",
+            "stream_chat",
+            creates={"trace_id": trace.trace_id},
+            params={
+                "conversation_id": body.conversation_id,
+                "knowledge_base_id": body.knowledge_base_id,
+                "question": body.question,
+                "attachments_count": len(body.attachments or []),
+            },
+            result={"username": username},
+            note="后端收到一次聊天请求，先建立 trace_id，后续所有步骤都会挂到这次请求下面。",
+        )
         cid = body.conversation_id
         knowledge_base = _resolve_knowledge_base(db, body.knowledge_base_id)
         raw_question = (body.question or "").strip()
         display_question = raw_question or ("请分析这张图片" if body.attachments else "")
         if not display_question:
+            trace.add(
+                "request_rejected",
+                "stream_chat",
+                uses={"raw_question": raw_question, "attachments_count": len(body.attachments or [])},
+                result={"error": "问题不能为空"},
+                note="没有文字问题，也没有图片附件，无法继续进入 RAG 流程。",
+            )
+            trace.finish("failed")
             raise HTTPException(400, "问题不能为空")
+        trace.add(
+            "input_normalized",
+            "stream_chat",
+            creates={"raw_question": raw_question, "display_question": display_question},
+            result={"knowledge_base_id": knowledge_base.id, "knowledge_base_name": knowledge_base.name},
+            note="系统整理用户输入，并确定本次请求要使用哪个知识库。",
+        )
 
         effective_question, image_analysis = await _build_effective_question(
             raw_question,
             body.attachments,
         )
+        trace.add(
+            "effective_question_built",
+            "_build_effective_question",
+            params={"raw_question": raw_question, "attachments_count": len(body.attachments or [])},
+            creates={
+                "effective_question": effective_question,
+                "image_analysis_status": image_analysis.get("status", ""),
+                "image_description": image_analysis.get("description", ""),
+            },
+            result={"image_analysis_error": image_analysis.get("error", "")},
+            note="如果有图片，系统会先把图片转成文字描述，再与用户问题合并为真正用于检索和生成的问题。",
+        )
         if body.attachments and image_analysis.get("status") == "failed" and not raw_question:
+            trace.add(
+                "image_failed_directly",
+                "_build_effective_question",
+                uses={"attachments_count": len(body.attachments or [])},
+                result={"error": image_analysis.get("error", "")},
+                note="用户只发了图片但图片识别失败，因此不会进入知识库检索和模型回答。",
+            )
+            trace.finish("failed")
             db.close()
 
             async def failure_stream():
+                for payload in _trace_sse_payloads(trace):
+                    yield payload
                 analysis_data = json.dumps(
                     {
                         "type": "image_analysis",
@@ -497,30 +601,100 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             )
             db.add(conv)
             db.commit()
+            trace.add(
+                "conversation_created",
+                "stream_chat",
+                creates={"conversation_id": cid, "title": title},
+                result={"knowledge_base_id": knowledge_base.id},
+                note="这是新对话，系统创建 conversation，并把它绑定到当前知识库。",
+            )
         else:
             knowledge_base = conv.knowledge_base or knowledge_base
+            trace.add(
+                "conversation_loaded",
+                "stream_chat",
+                uses={"conversation_id": cid},
+                result={"knowledge_base_id": knowledge_base.id, "title": conv.title},
+                note="这是已有对话，系统复用它原本绑定的知识库，避免会话中途串库。",
+            )
+        trace.attach(conversation_id=cid)
 
         # save user message
-        db.add(Message(
+        user_message = Message(
             conversation_id=cid,
             role="user",
             content=display_question,
             attachments=json.dumps(body.attachments, ensure_ascii=False),
-        ))
+        )
+        db.add(user_message)
         db.commit()
+        db.refresh(user_message)
+        trace.add(
+            "user_message_saved",
+            "Message",
+            creates={"user_message_id": user_message.id},
+            params={"content": display_question, "attachments_count": len(body.attachments or [])},
+            note="用户消息先写入数据库，后面的滑动窗口会排除这条当前消息，避免重复塞进 prompt。",
+        )
+
+        memory_context = _build_memory_context(
+            db,
+            conv,
+            current_message_id=user_message.id,
+        )
+        retrieval_question = _build_memory_aware_retrieval_question(effective_question, memory_context)
+        trace.add(
+            "memory_built",
+            "_build_memory_context",
+            uses={
+                "conversation_id": cid,
+                "memory_summary": conv.memory_summary or "",
+                "summary_upto_message_id": conv.memory_summary_upto_message_id or 0,
+            },
+            creates={
+                "memory_context": memory_context,
+                "retrieval_question": retrieval_question,
+            },
+            result={
+                "memory_used": bool(memory_context),
+                "used_for_retrieval": retrieval_question != effective_question,
+                "window_turns": MEMORY_WINDOW_TURNS,
+            },
+            note="系统构造短期滑动窗口和长期摘要记忆，并生成真正用于 RAG 检索的问题。",
+        )
 
         # retrieve relevant knowledge
         knowledge_chunks, retrieval_trace = await retrieve_knowledge(
-            effective_question,
+            retrieval_question,
             knowledge_base_id=knowledge_base.id,
             db=db,
         )
+        retrieval_trace = retrieval_trace or {}
+        retrieval_trace["memory"] = {
+            "used": bool(memory_context),
+            "used_for_retrieval": retrieval_question != effective_question,
+            "window_turns": MEMORY_WINDOW_TURNS,
+            "summary_available": bool(conv.memory_summary),
+            "summary_upto_message_id": conv.memory_summary_upto_message_id or 0,
+        }
         if body.attachments:
-            retrieval_trace = retrieval_trace or {}
             retrieval_trace["image_analysis_status"] = image_analysis.get("status", "")
             retrieval_trace["image_analysis_error"] = image_analysis.get("error", "")
             retrieval_trace["image_description"] = image_analysis.get("description", "")
             retrieval_trace["effective_question"] = effective_question
+        trace.add(
+            "retrieval_completed",
+            "retrieve_knowledge",
+            params={"question": retrieval_question, "knowledge_base_id": knowledge_base.id},
+            creates={
+                "query_plan": retrieval_trace.get("query_plan", {}),
+                "routes": retrieval_trace.get("routes", []),
+                "rrf": retrieval_trace.get("rrf", []),
+                "rerank": retrieval_trace.get("rerank", {}),
+            },
+            result={"final_chunks_count": len(knowledge_chunks)},
+            note="RAG 检索完成：包括问题规划、多路召回、RRF 融合、LLM rerank 和最终上下文选择。",
+        )
         context = ""
         sources = _build_sources(knowledge_chunks)
         retrieved_contexts = [c.get("content", "") for c in knowledge_chunks if c.get("content")]
@@ -529,10 +703,18 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 f"[鏉ユ簮: {c['file_name']}]\n{c['content']}"
                 for c in knowledge_chunks
             )
+        trace.add(
+            "context_built",
+            "_build_sources",
+            creates={"context": context, "sources": sources},
+            result={"sources_count": len(sources), "retrieved_contexts_count": len(retrieved_contexts)},
+            note="系统把最终选中的 chunk 拼成给大模型看的知识库上下文，并生成前端可展开的参考资料。",
+        )
 
         async def event_stream():
             full = ""
             failed = False
+            first_chunk_seen = False
             conversation_data = json.dumps({
                 "type": "conversation",
                 "conversation": {
@@ -550,15 +732,41 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                     },
                     ensure_ascii=False,
                 )
+                for payload in _trace_sse_payloads(trace):
+                    yield payload
                 yield f"data: {analysis_data}\n\n"
+            for payload in _trace_sse_payloads(trace):
+                yield payload
             yield f"data: {conversation_data}\n\n"
             if sources:
                 data = json.dumps({"type": "sources", "sources": sources}, ensure_ascii=False)
                 yield f"data: {data}\n\n"
-            async for event in _stream_deepseek_response(effective_question, context):
+            trace.add(
+                "generation_started",
+                "_stream_deepseek_response",
+                params={
+                    "question": effective_question,
+                    "memory_context": memory_context,
+                    "context": context,
+                },
+                note="开始调用文本模型。会话记忆只辅助理解指代，事实依据仍优先来自知识库上下文。",
+            )
+            for payload in _trace_sse_payloads(trace):
+                yield payload
+            async for event in _stream_deepseek_response(effective_question, context, memory_context, trace):
+                for payload in _trace_sse_payloads(trace):
+                    yield payload
                 if isinstance(event, dict):
                     if event.get("type") == "error":
                         failed = True
+                        trace.add(
+                            "generation_failed",
+                            "_stream_deepseek_response",
+                            result={"message": event.get("message") or event.get("content") or "DeepSeek 网络请求失败"},
+                            note="模型生成阶段失败，系统会返回错误事件，并且不会保存失败 assistant 消息。",
+                        )
+                        for payload in _trace_sse_payloads(trace):
+                            yield payload
                         data = json.dumps(
                             {
                                 "type": "error",
@@ -574,27 +782,135 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 data = json.dumps({"content": chunk}, ensure_ascii=False)
                 yield f"data: {data}\n\n"
                 if not failed:
+                    if chunk and not first_chunk_seen:
+                        first_chunk_seen = True
+                        trace.add(
+                            "first_content_chunk",
+                            "_stream_openai_chat_chunks",
+                            result={"chunk": chunk},
+                            note="大模型开始返回第一段流式内容，前端会逐步拼接为正在生成的回答。",
+                        )
+                        for payload in _trace_sse_payloads(trace):
+                            yield payload
                     full += chunk
 
             # save assistant message
             if full and not failed:
-                assistant_message = Message(
+                _safe_trace_add(
+                    trace,
+                    "assistant_ready_to_save",
+                    "Message",
+                    uses={"full_answer": full, "sources_count": len(sources)},
+                    note="模型完整回答成功，系统准备保存 assistant 消息，并启动 RAGAS 和摘要判断。",
+                )
+                retrieval_trace["learning_trace"] = compact_trace_reference(trace.snapshot())
+                assistant_message = None
+                try:
+                    assistant_message = Message(
+                        conversation_id=cid,
+                        role="assistant",
+                        content=full,
+                        sources=json.dumps(sources, ensure_ascii=False),
+                        ragas_status="pending",
+                        retrieval_trace=json.dumps(retrieval_trace, ensure_ascii=False),
+                    )
+                    db.add(assistant_message)
+                    db.commit()
+                    db.refresh(assistant_message)
+                except Exception as exc:
+                    db.rollback()
+                    logger.warning("Assistant message save failed after stream finished: %s", exc, exc_info=True)
+                    _safe_trace_add(
+                        trace,
+                        "assistant_save_failed",
+                        "Message",
+                        result={"error": str(exc)},
+                        note="模型回答已经生成完毕，但保存 assistant 消息失败。系统仍会结束流，避免前端误报 network error。",
+                    )
+
+                if assistant_message:
+                    _safe_trace_attach(trace, conversation_id=cid, message_id=assistant_message.id)
+                    _safe_trace_add(
+                        trace,
+                        "assistant_message_saved",
+                        "Message",
+                        creates={"assistant_message_id": assistant_message.id},
+                        result={"ragas_status": "pending"},
+                        note="assistant 消息保存成功，历史会话刷新后仍可从这条消息打开流程。",
+                    )
+                    try:
+                        schedule_ragas_evaluation(
+                            assistant_message.id,
+                            effective_question,
+                            full,
+                            retrieved_contexts,
+                            trace.trace_id,
+                        )
+                        _safe_trace_add(
+                            trace,
+                            "ragas_scheduled",
+                            "schedule_ragas_evaluation",
+                            params={
+                                "message_id": assistant_message.id,
+                                "question": effective_question,
+                                "answer_chars": len(full),
+                                "contexts_count": len(retrieved_contexts),
+                            },
+                            note="RAGAS 在 assistant 保存后异步启动，不阻塞用户看到答案。",
+                        )
+                    except Exception as exc:
+                        logger.warning("RAGAS schedule failed after stream finished: %s", exc, exc_info=True)
+                        _safe_trace_add(
+                            trace,
+                            "ragas_schedule_failed",
+                            "schedule_ragas_evaluation",
+                            result={"error": str(exc)},
+                            note="RAGAS 调度失败，但不影响主回答完成。",
+                        )
+                    try:
+                        _schedule_memory_summary_update(cid, trace.trace_id)
+                        _safe_trace_add(
+                            trace,
+                            "memory_summary_check_scheduled",
+                            "_schedule_memory_summary_update",
+                            params={"conversation_id": cid},
+                            note="系统异步检查是否满足摘要压缩条件：完整回答轮数超过 8 且未摘要轮数至少 4。",
+                        )
+                    except Exception as exc:
+                        logger.warning("Memory summary schedule failed after stream finished: %s", exc, exc_info=True)
+                        _safe_trace_add(
+                            trace,
+                            "memory_summary_schedule_failed",
+                            "_schedule_memory_summary_update",
+                            result={"error": str(exc)},
+                            note="摘要调度失败，但不影响主回答完成。",
+                        )
+                    try:
+                        retrieval_trace["learning_trace"] = compact_trace_reference(trace.snapshot())
+                        assistant_message.retrieval_trace = json.dumps(retrieval_trace, ensure_ascii=False)
+                        db.commit()
+                    except Exception as exc:
+                        db.rollback()
+                        logger.warning("Assistant trace reference update failed: %s", exc, exc_info=True)
+                _safe_trace_finish(
+                    trace,
+                    "done" if assistant_message else "partial",
                     conversation_id=cid,
-                    role="assistant",
-                    content=full,
-                    sources=json.dumps(sources, ensure_ascii=False),
-                    ragas_status="pending",
-                    retrieval_trace=json.dumps(retrieval_trace, ensure_ascii=False),
+                    message_id=assistant_message.id if assistant_message else None,
                 )
-                db.add(assistant_message)
-                db.commit()
-                db.refresh(assistant_message)
-                schedule_ragas_evaluation(
-                    assistant_message.id,
-                    effective_question,
-                    full,
-                    retrieved_contexts,
+                for payload in _trace_sse_payloads(trace):
+                    yield payload
+            elif failed:
+                _safe_trace_add(
+                    trace,
+                    "assistant_not_saved",
+                    "Message",
+                    result={"saved": False},
+                    note="回答生成失败，遵循项目规则：不把失败内容保存为正式 assistant 消息。",
                 )
+                _safe_trace_finish(trace, "failed", conversation_id=cid)
+                for payload in _trace_sse_payloads(trace):
+                    yield payload
             db.close()
             yield "data: [DONE]\n\n"
 
@@ -636,6 +952,35 @@ def _loads_json(value: str, default):
         return default
 
 
+def _trace_sse_payloads(trace: TraceRecorder) -> list[str]:
+    return [
+        f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        for payload in trace.drain_sse_payloads()
+    ]
+
+
+def _safe_trace_add(trace: TraceRecorder, *args, **kwargs):
+    try:
+        return trace.add(*args, **kwargs)
+    except Exception as exc:
+        logger.warning("Learning trace add failed: %s", exc, exc_info=True)
+        return {}
+
+
+def _safe_trace_finish(trace: TraceRecorder, *args, **kwargs):
+    try:
+        trace.finish(*args, **kwargs)
+    except Exception as exc:
+        logger.warning("Learning trace finish failed: %s", exc, exc_info=True)
+
+
+def _safe_trace_attach(trace: TraceRecorder, *args, **kwargs):
+    try:
+        trace.attach(*args, **kwargs)
+    except Exception as exc:
+        logger.warning("Learning trace attach failed: %s", exc, exc_info=True)
+
+
 def _serialize_message(message: Message) -> dict:
     retrieval_trace = _loads_json(message.retrieval_trace, {})
     if not isinstance(retrieval_trace, dict):
@@ -656,6 +1001,294 @@ def _serialize_message(message: Message) -> dict:
         "image_description": retrieval_trace.get("image_description", ""),
         "created_at": message.created_at.isoformat() if message.created_at else "",
     }
+
+
+def _build_memory_context(db: Session, conversation: Conversation, current_message_id: int) -> str:
+    summary = (conversation.memory_summary or "").strip()
+    summary_upto = conversation.memory_summary_upto_message_id or 0
+    recent_messages = (
+        db.query(Message)
+        .filter(
+            Message.conversation_id == conversation.id,
+            Message.id < current_message_id,
+            Message.id > summary_upto,
+        )
+        .order_by(Message.id.desc())
+        .limit(max(MEMORY_WINDOW_TURNS, 1) * 2)
+        .all()
+    )
+    recent_text = _format_recent_memory_messages(list(reversed(recent_messages)))
+
+    sections = []
+    if summary:
+        sections.append(f"长期摘要记忆：\n{_clip_text(summary, MEMORY_SUMMARY_MAX_CHARS)}")
+    if recent_text:
+        sections.append(f"最近对话窗口：\n{recent_text}")
+    return "\n\n".join(sections).strip()
+
+
+def _build_memory_aware_retrieval_question(question: str, memory_context: str) -> str:
+    if not memory_context:
+        return question
+    compact_memory = _clip_text(memory_context, 1500)
+    return (
+        "以下会话记忆仅用于消解当前问题中的指代和省略，不作为事实依据。\n"
+        f"{compact_memory}\n\n"
+        f"当前检索问题：{question}"
+    )
+
+
+def _format_recent_memory_messages(messages: list[Message]) -> str:
+    lines = []
+    for message in messages:
+        content = (message.content or "").strip()
+        if not content:
+            continue
+        role = "用户" if message.role == "user" else "助手"
+        lines.append(f"{role}：{content}")
+
+    selected = []
+    total = 0
+    for line in reversed(lines):
+        line_length = len(line)
+        if selected and total + line_length > MEMORY_RECENT_MAX_CHARS:
+            break
+        if line_length > MEMORY_RECENT_MAX_CHARS:
+            line = _clip_text(line, MEMORY_RECENT_MAX_CHARS)
+            line_length = len(line)
+        selected.append(line)
+        total += line_length
+    return "\n".join(reversed(selected))
+
+
+def _schedule_memory_summary_update(conversation_id: str, trace_id: str | None = None):
+    try:
+        asyncio.create_task(_maybe_update_memory_summary(conversation_id, trace_id))
+    except RuntimeError:
+        logger.warning("Unable to schedule memory summary update: conversation_id=%s", conversation_id)
+        append_trace_event(
+            trace_id,
+            "memory_summary_schedule_failed",
+            "_schedule_memory_summary_update",
+            result={"conversation_id": conversation_id},
+            note="当前事件循环不可用，摘要压缩检查没有成功启动。",
+        )
+
+
+async def _maybe_update_memory_summary(conversation_id: str, trace_id: str | None = None):
+    db = SessionLocal()
+    try:
+        conversation = db.query(Conversation).filter_by(id=conversation_id).first()
+        if not conversation:
+            append_trace_event(
+                trace_id,
+                "memory_summary_skipped",
+                "_maybe_update_memory_summary",
+                result={"reason": "conversation_not_found"},
+                note="摘要检查跳过：会话不存在。",
+            )
+            return
+
+        assistant_messages = (
+            db.query(Message)
+            .filter_by(conversation_id=conversation_id, role="assistant")
+            .order_by(Message.id.asc())
+            .all()
+        )
+        if len(assistant_messages) <= MEMORY_SUMMARY_TRIGGER_TURNS:
+            append_trace_event(
+                trace_id,
+                "memory_summary_skipped",
+                "_maybe_update_memory_summary",
+                result={
+                    "assistant_turns": len(assistant_messages),
+                    "trigger_turns": MEMORY_SUMMARY_TRIGGER_TURNS,
+                    "reason": "turns_not_enough",
+                },
+                note="摘要检查跳过：完整回答轮数还没有超过触发阈值。",
+            )
+            return
+
+        cutoff_index = len(assistant_messages) - max(MEMORY_WINDOW_TURNS, 1) - 1
+        if cutoff_index < 0:
+            append_trace_event(
+                trace_id,
+                "memory_summary_skipped",
+                "_maybe_update_memory_summary",
+                result={"reason": "no_window_outside_messages"},
+                note="摘要检查跳过：窗口外没有足够历史消息可压缩。",
+            )
+            return
+        cutoff_message = assistant_messages[cutoff_index]
+        summary_upto = conversation.memory_summary_upto_message_id or 0
+        unsummarized_turns = [
+            message for message in assistant_messages
+            if summary_upto < message.id <= cutoff_message.id
+        ]
+        if len(unsummarized_turns) < MEMORY_WINDOW_TURNS:
+            append_trace_event(
+                trace_id,
+                "memory_summary_skipped",
+                "_maybe_update_memory_summary",
+                result={
+                    "unsummarized_turns": len(unsummarized_turns),
+                    "required_turns": MEMORY_WINDOW_TURNS,
+                    "summary_upto_message_id": summary_upto,
+                },
+                note="摘要检查跳过：距离上次摘要之后新增的窗口外轮数不足，避免每轮都调用模型摘要。",
+            )
+            return
+
+        messages_to_summarize = (
+            db.query(Message)
+            .filter(
+                Message.conversation_id == conversation_id,
+                Message.id > summary_upto,
+                Message.id <= cutoff_message.id,
+            )
+            .order_by(Message.id.asc())
+            .all()
+        )
+        transcript = _format_messages_for_summary(messages_to_summarize)
+        if not transcript:
+            append_trace_event(
+                trace_id,
+                "memory_summary_skipped",
+                "_maybe_update_memory_summary",
+                result={"reason": "empty_transcript"},
+                note="摘要检查跳过：待摘要消息内容为空。",
+            )
+            return
+
+        append_trace_event(
+            trace_id,
+            "memory_summary_triggered",
+            "_maybe_update_memory_summary",
+            params={
+                "assistant_turns": len(assistant_messages),
+                "trigger_turns": MEMORY_SUMMARY_TRIGGER_TURNS,
+                "unsummarized_turns": len(unsummarized_turns),
+                "cutoff_message_id": cutoff_message.id,
+            },
+            creates={"transcript": transcript},
+            note="摘要条件满足，系统将窗口外历史和旧摘要合并压缩为新的长期记忆。",
+        )
+        next_summary = await _summarize_conversation_memory(
+            conversation.memory_summary or "",
+            transcript,
+        )
+        if not next_summary:
+            append_trace_event(
+                trace_id,
+                "memory_summary_failed",
+                "_summarize_conversation_memory",
+                result={"reason": "empty_summary_or_model_failed"},
+                note="摘要模型没有返回可用摘要，主回答不受影响，保留原摘要。",
+            )
+            return
+
+        conversation.memory_summary = _clip_text(next_summary, MEMORY_SUMMARY_MAX_CHARS)
+        conversation.memory_summary_upto_message_id = cutoff_message.id
+        conversation.memory_updated_at = datetime.now()
+        db.commit()
+        append_trace_event(
+            trace_id,
+            "memory_summary_updated",
+            "_summarize_conversation_memory",
+            creates={
+                "memory_summary": conversation.memory_summary,
+                "memory_summary_upto_message_id": cutoff_message.id,
+            },
+            note="长期摘要已更新。后续追问会同时使用这份摘要和最近 4 轮滑动窗口。",
+        )
+        logger.info(
+            "Conversation memory summary updated: conversation_id=%s upto_message_id=%s",
+            conversation_id,
+            cutoff_message.id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Conversation memory summary update failed: conversation_id=%s error=%s",
+            conversation_id,
+            exc,
+            exc_info=True,
+        )
+        append_trace_event(
+            trace_id,
+            "memory_summary_failed",
+            "_maybe_update_memory_summary",
+            result={"error": str(exc)},
+            note="摘要压缩发生异常，但它是异步辅助能力，不会影响本轮回答。",
+        )
+    finally:
+        db.close()
+
+
+def _format_messages_for_summary(messages: list[Message]) -> str:
+    lines = []
+    for message in messages:
+        content = _clip_text((message.content or "").strip(), 1200)
+        if not content:
+            continue
+        role = "用户" if message.role == "user" else "助手"
+        lines.append(f"{role}：{content}")
+    return "\n".join(lines)
+
+
+async def _summarize_conversation_memory(previous_summary: str, transcript: str) -> str:
+    if not DEEPSEEK_API_KEY:
+        logger.warning("Skip memory summary update because DeepSeek API Key is not configured")
+        return ""
+
+    system_prompt = (
+        "你是企业知识库问答系统的会话记忆压缩器。"
+        "请把旧摘要和新增对话压缩成可用于后续追问理解的中文摘要。"
+        "只保留用户目标、当前任务背景、用户明确确认过的事实、关键约束/偏好/口径、未解决问题或待办。"
+        "不要保存知识库原文大段内容，不要编造未确认事实，不要输出 Markdown 标题。"
+    )
+    user_prompt = (
+        f"摘要长度上限：{MEMORY_SUMMARY_MAX_CHARS} 字。\n\n"
+        f"旧摘要：\n{previous_summary or '（无）'}\n\n"
+        f"新增对话：\n{transcript}\n\n"
+        "请输出新的会话摘要："
+    )
+    payload = {
+        "model": normalize_deepseek_model(DEEPSEEK_MODEL),
+        "stream": False,
+        "temperature": 0.1,
+        "max_tokens": 900,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(deepseek_chat_url(), json=payload, headers=headers)
+        if response.status_code >= 400:
+            logger.warning(
+                "Memory summary call failed: status=%s detail=%s",
+                response.status_code,
+                response.text[:300],
+            )
+            return ""
+        content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        return _clip_text(content.strip(), MEMORY_SUMMARY_MAX_CHARS)
+    except Exception as exc:
+        logger.warning("Memory summary network request failed: %s", exc, exc_info=True)
+        return ""
+
+
+def _clip_text(text: str, max_chars: int) -> str:
+    value = (text or "").strip()
+    if max_chars <= 0 or len(value) <= max_chars:
+        return value
+    return value[:max_chars].rstrip() + "..."
+
 
 def _ensure_oss_config():
     if not all([OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET, OSS_BUCKET, OSS_ENDPOINT]):
@@ -924,8 +1557,20 @@ def _classify_image_analysis(description: str) -> tuple[str, str]:
     return "success", ""
 
 
-async def _stream_deepseek_response(question: str, context: str):
+async def _stream_deepseek_response(
+    question: str,
+    context: str,
+    memory_context: str = "",
+    trace: TraceRecorder | None = None,
+):
     if not DEEPSEEK_API_KEY:
+        if trace:
+            trace.add(
+                "deepseek_missing_config",
+                "_stream_deepseek_response",
+                result={"configured": False},
+                note="DeepSeek API Key 未配置，文本生成无法开始。",
+            )
         yield {"type": "error", "message": _model_missing_error(False)}
         return
 
@@ -933,15 +1578,28 @@ async def _stream_deepseek_response(question: str, context: str):
         "你是企业知识库智能问答助手。请优先基于提供的企业知识库上下文回答用户问题；"
         "如果知识库信息不足，请明确说明不足之处，并给出可验证的建议。"
         "回答使用中文，结构清晰，避免编造未在上下文中出现的事实。"
+        "信息优先级为：企业知识库上下文 > 当前用户问题 > 会话记忆。"
+        "会话记忆只能用于理解指代、延续任务和用户偏好，不能替代知识库事实依据。"
     )
     user_prompt = (
         f"用户问题：{question}\n\n"
+        f"会话记忆：\n{memory_context or '（无）'}\n\n"
         f"企业知识库上下文：\n{context or '（未检索到相关知识库内容）'}"
     )
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
+    if trace:
+        trace.add(
+            "generation_prompt_built",
+            "_stream_deepseek_response",
+            creates={
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+            },
+            note="系统构造最终给文本模型的 messages。注意：会话记忆和知识库上下文是分区放入 prompt 的。",
+        )
 
     async for event in _stream_openai_chat_chunks(
         deepseek_chat_url(),
@@ -951,13 +1609,31 @@ async def _stream_deepseek_response(question: str, context: str):
         "DeepSeek",
     ):
         if isinstance(event, dict) and event.get("type") == "error":
+            if trace:
+                trace.add(
+                    "deepseek_failed",
+                    "_stream_openai_chat_chunks",
+                    result={
+                        "reason": event.get("reason"),
+                        "status_code": event.get("status_code"),
+                        "detail": event.get("detail", ""),
+                    },
+                    note="DeepSeek 流式调用失败。若属于网络或 5xx 错误，系统会尝试文本后备模型。",
+                )
             if _should_use_text_fallback(event):
                 logger.warning(
                     "DeepSeek failed with retryable error, switching to text fallback: reason=%s status=%s",
                     event.get("reason"),
                     event.get("status_code"),
                 )
-                async for fallback_event in _stream_text_fallback_response(messages):
+                if trace:
+                    trace.add(
+                        "text_fallback_started",
+                        "_stream_text_fallback_response",
+                        params={"model": TEXT_FALLBACK_MODEL, "enabled": TEXT_FALLBACK_ENABLED},
+                        note="DeepSeek 暂不可用，系统尝试使用兼容文本后备模型继续回答。",
+                    )
+                async for fallback_event in _stream_text_fallback_response(messages, trace):
                     yield fallback_event
                 return
             yield {
@@ -973,14 +1649,28 @@ async def _stream_deepseek_response(question: str, context: str):
         yield event
 
 
-async def _stream_text_fallback_response(messages: list[dict]):
+async def _stream_text_fallback_response(messages: list[dict], trace: TraceRecorder | None = None):
     if not TEXT_FALLBACK_ENABLED:
+        if trace:
+            trace.add(
+                "text_fallback_disabled",
+                "_stream_text_fallback_response",
+                result={"enabled": False},
+                note="文本后备模型未启用，因此 DeepSeek 失败后无法继续生成。",
+            )
         yield {
             "type": "error",
             "message": "DeepSeek 网络请求失败，且文本后备模型未启用，请设置 TEXT_FALLBACK_ENABLED=true。",
         }
         return
     if not TEXT_FALLBACK_API_KEY:
+        if trace:
+            trace.add(
+                "text_fallback_missing_config",
+                "_stream_text_fallback_response",
+                result={"configured": False},
+                note="文本后备模型缺少 API Key，无法接管 DeepSeek 的失败请求。",
+            )
         yield {
             "type": "error",
             "message": "DeepSeek 网络请求失败，且文本后备模型未配置，请配置 TEXT_FALLBACK_API_KEY 或 DASHSCOPE_API_KEY。",
@@ -995,6 +1685,17 @@ async def _stream_text_fallback_response(messages: list[dict]):
         "百炼文本后备模型",
     ):
         if isinstance(event, dict) and event.get("type") == "error":
+            if trace:
+                trace.add(
+                    "text_fallback_failed",
+                    "_stream_openai_chat_chunks",
+                    result={
+                        "reason": event.get("reason"),
+                        "status_code": event.get("status_code"),
+                        "detail": event.get("detail", ""),
+                    },
+                    note="文本后备模型也调用失败，本轮回答会以错误结束。",
+                )
             yield {
                 "type": "error",
                 "message": _text_fallback_error_message(
@@ -1003,6 +1704,14 @@ async def _stream_text_fallback_response(messages: list[dict]):
                 ),
             }
             return
+        if trace:
+            trace.add(
+                "text_fallback_chunk",
+                "_stream_openai_chat_chunks",
+                result={"chunk": event},
+                note="文本后备模型开始返回内容，前端会继续按同一条流式回答展示。",
+            )
+            trace = None
         yield event
 
 
@@ -1175,7 +1884,12 @@ async def upload_knowledge(file: UploadFile = File(...),
         content=text,
     )
     db.add(entry)
-    db.commit()
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.warning("Knowledge file metadata save failed: filename=%s error=%s", file.filename, exc, exc_info=True)
+        raise HTTPException(500, _knowledge_file_save_error_message(exc))
     db.refresh(entry)
 
     chunks = _chunk_text(text, entry.id)
@@ -1194,7 +1908,16 @@ async def upload_knowledge(file: UploadFile = File(...),
                 exc_info=True,
             )
         db.delete(entry)
-        db.commit()
+        try:
+            db.commit()
+        except SQLAlchemyError as cleanup_commit_exc:
+            db.rollback()
+            logger.warning(
+                "Failed to rollback partially indexed knowledge file: file_id=%s error=%s",
+                entry.id,
+                cleanup_commit_exc,
+                exc_info=True,
+            )
         raise HTTPException(500, "文件索引失败，已取消本次上传，请稍后重试")
 
     return {
@@ -1284,7 +2007,7 @@ def _extract_pdf_text(content: bytes) -> str:
         raise HTTPException(500, "后端缺少 pypdf 依赖，无法解析 PDF")
 
     try:
-        reader = PdfReader(BytesIO(content))
+        reader = PdfReader(BytesIO(content), strict=False)
         parts = []
         for index, page in enumerate(reader.pages, start=1):
             page_text = (page.extract_text() or "").strip()
@@ -1293,6 +2016,19 @@ def _extract_pdf_text(content: bytes) -> str:
         return "\n\n".join(parts)
     except Exception as exc:
         raise HTTPException(400, f"PDF 解析失败：{exc}")
+
+
+def _knowledge_file_save_error_message(exc: SQLAlchemyError) -> str:
+    detail = str(exc)
+    if "Incorrect string value" in detail or "1366" in detail:
+        return (
+            "文件内容包含中文字符，但当前 MySQL 表或字段仍不是 utf8mb4。"
+            "请重启后端让启动迁移生效；如仍失败，请执行："
+            "ALTER DATABASE rag_system CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; "
+            "ALTER TABLE knowledge_files CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; "
+            "ALTER TABLE knowledge_files MODIFY COLUMN content LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        )
+    return "文件信息写入数据库失败，请稍后重试"
 
 
 def _chunk_text(text: str, file_id: int, chunk_size: int = 500, chunk_overlap: int = 50) -> list[dict]:

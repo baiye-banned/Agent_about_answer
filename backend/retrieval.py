@@ -83,7 +83,7 @@ async def build_query_plan(question: str) -> dict:
     return {
         "hyde_document": str(data.get("hyde_document") or "").strip(),
         "rewrites": _clean_list(data.get("rewrites"))[:3],
-        "keywords": (_clean_list(data.get("keywords")) or _fallback_keywords(question))[:8],
+        "keywords": _merge_keywords(_clean_list(data.get("keywords")), question)[:24],
         "error": "",
     }
 
@@ -120,16 +120,17 @@ async def retrieve_knowledge(question: str, knowledge_base_id: int, db: Session)
             "items": [_trace_chunk(item) for item in chunks[:5]],
         })
 
+    keyword_terms = _merge_keywords(query_plan.get("keywords") or [], question)
     keyword_chunks = keyword_recall(
         db,
         knowledge_base_id=knowledge_base_id,
-        keywords=query_plan.get("keywords") or [],
+        keywords=keyword_terms,
         top_k=RETRIEVAL_ROUTE_TOP_K,
     )
     route_results.append(("keyword", keyword_chunks))
     trace["routes"].append({
         "route": "keyword",
-        "query": " ".join(query_plan.get("keywords") or []),
+        "query": " ".join(keyword_terms),
         "count": len(keyword_chunks),
         "items": [_trace_chunk(item) for item in keyword_chunks[:5]],
     })
@@ -138,12 +139,12 @@ async def retrieve_knowledge(question: str, knowledge_base_id: int, db: Session)
     trace["rrf"] = [_trace_chunk(item) for item in fused[:10]]
     reranked, rerank_trace = await rerank_chunks(question, fused[:12])
     trace["rerank"] = rerank_trace
-    final_chunks = (reranked or fused)[:RETRIEVAL_RERANK_TOP_N]
+    final_chunks = _select_final_chunks(reranked or fused, keyword_chunks)
     return final_chunks, trace
 
 
 def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top_k: int) -> list[dict]:
-    clean_keywords = [keyword.lower() for keyword in keywords if keyword]
+    clean_keywords = _expand_keywords(keywords)
     if not clean_keywords:
         return []
 
@@ -151,12 +152,11 @@ def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top
     files = db.query(KnowledgeFile).filter_by(knowledge_base_id=knowledge_base_id).all()
     for file_entry in files:
         content = file_entry.content or ""
-        lower_content = content.lower()
-        if not any(keyword in lower_content for keyword in clean_keywords):
+        normalized_content = _normalize_for_match(content)
+        if not any(_normalize_for_match(keyword) in normalized_content for keyword in clean_keywords):
             continue
         for chunk in _split_keyword_chunks(content):
-            lower_chunk = chunk["content"].lower()
-            score = sum(lower_chunk.count(keyword) for keyword in clean_keywords)
+            score = _keyword_score(chunk["content"], clean_keywords)
             if score <= 0:
                 continue
             candidates.append({
@@ -244,13 +244,172 @@ def _clean_list(value) -> list[str]:
 
 
 def _fallback_keywords(question: str) -> list[str]:
-    tokens = re.findall(r"[\u4e00-\u9fffA-Za-z0-9_]{2,}", question or "")
-    return tokens[:8]
+    text = question or ""
+    keywords: list[str] = []
+
+    numeric_phrases = re.findall(
+        r"\d+\s*(?:\u5206\u949f|\u5143|\u6b21|\u5929|\u5c0f\u65f6)(?:\u4ee5\u5185|\u4ee5\u4e0a|\u4ee5\u4e0b|\u5185|\u5916)?",
+        text,
+    )
+    keywords.extend(numeric_phrases)
+
+    policy_terms = [
+        "\u8003\u52e4",
+        "\u8fdf\u5230",
+        "\u65e9\u9000",
+        "\u65f7\u5de5",
+        "\u5904\u7f5a",
+        "\u7f5a\u6b3e",
+        "\u5458\u5de5",
+        "\u5206\u949f",
+        "\u4ee5\u5185",
+        "\u4ee5\u4e0a",
+        "\u4e00\u6b21",
+        "\u4e8c\u6b21",
+        "\u4e09\u6b21",
+        "\u6708\u7d2f\u8ba1",
+        "\u964d\u804c",
+        "\u79bb\u804c",
+        "\u8bf7\u5047",
+        "\u5de5\u8d44",
+        "\u52a0\u73ed",
+        "\u62a5\u9500",
+        "\u5236\u5ea6",
+        "\u89c4\u5b9a",
+    ]
+    keywords.extend(term for term in policy_terms if term in text)
+
+    for token in re.findall(r"[\u4e00-\u9fffA-Za-z0-9_]{2,}", text):
+        keywords.append(token)
+        if re.search(r"[\u4e00-\u9fff]", token) and not re.search(r"\d", token) and len(token) <= 8:
+            keywords.extend(token[index:index + 2] for index in range(0, max(len(token) - 1, 0)))
+
+    return _dedupe_keywords(keywords)[:24]
 
 
-def _split_keyword_chunks(content: str, chunk_size: int = 500) -> list[dict]:
+def _merge_keywords(keywords: list[str], question: str) -> list[str]:
+    return _dedupe_keywords([*(keywords or []), *_fallback_keywords(question)])
+
+
+def _dedupe_keywords(keywords: list[str]) -> list[str]:
+    result = []
+    seen = set()
+    for keyword in keywords:
+        value = str(keyword or "").strip()
+        normalized = _normalize_for_match(value)
+        if len(normalized) < 2 or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(value)
+    return result
+
+
+def _expand_keywords(keywords: list[str]) -> list[str]:
+    expanded = []
+    for keyword in keywords:
+        value = str(keyword or "").strip()
+        if not value:
+            continue
+        expanded.append(value)
+        for phrase in re.findall(
+            r"\d+\s*(?:\u5206\u949f|\u5143|\u6b21|\u5929|\u5c0f\u65f6)(?:\u4ee5\u5185|\u4ee5\u4e0a|\u4ee5\u4e0b|\u5185|\u5916)?",
+            value,
+        ):
+            expanded.append(phrase)
+        if re.search(r"[\u4e00-\u9fff]", value) and not re.search(r"\d", value) and 2 < len(value) <= 8:
+            expanded.extend(value[index:index + 2] for index in range(0, len(value) - 1))
+    return _dedupe_keywords(expanded)
+
+
+def _keyword_score(content: str, keywords: list[str]) -> float:
+    normalized_content = _normalize_for_match(content)
+    score = 0.0
+    matched_positions = []
+    for keyword in keywords:
+        normalized_keyword = _normalize_for_match(keyword)
+        if len(normalized_keyword) < 2:
+            continue
+        count = normalized_content.count(normalized_keyword)
+        if count <= 0:
+            continue
+        weight = 1.0
+        if re.search(r"\d", normalized_keyword):
+            weight += 3.0
+        if len(normalized_keyword) >= 4:
+            weight += 2.0
+        if normalized_keyword in {
+            "\u8fdf\u5230",
+            "\u65e9\u9000",
+            "\u65f7\u5de5",
+            "\u7f5a\u6b3e",
+            "\u5904\u7f5a",
+            "\u8003\u52e4",
+        }:
+            weight += 4.0
+        score += count * weight
+        matched_positions.append(normalized_content.find(normalized_keyword))
+
+    if any(term in normalized_content for term in ("\u8003\u52e4", "\u4e0a\u4e0b\u73ed")):
+        score += 6.0
+    if "\u8fdf\u5230" in normalized_content and "\u65e9\u9000" in normalized_content:
+        score += 10.0
+    if re.search(r"30\u5206\u949f(?:\u4ee5\u5185|\u4ee5\u4e0a)", normalized_content):
+        score += 10.0
+    if "\u7f5a\u6b3e50\u5143" in normalized_content or "\u7f5a\u6b3e200\u5143" in normalized_content:
+        score += 10.0
+
+    unique_hits = len({pos for pos in matched_positions if pos >= 0})
+    score += unique_hits * 1.5
+    if _has_close_matches(normalized_content, keywords):
+        score += 8.0
+    return score
+
+
+def _has_close_matches(content: str, keywords: list[str], window: int = 120) -> bool:
+    positions = []
+    for keyword in keywords:
+        normalized_keyword = _normalize_for_match(keyword)
+        if len(normalized_keyword) < 2:
+            continue
+        pos = content.find(normalized_keyword)
+        if pos >= 0:
+            positions.append(pos)
+    if len(positions) < 3:
+        return False
+    positions.sort()
+    return any(positions[index + 2] - positions[index] <= window for index in range(len(positions) - 2))
+
+
+def _normalize_for_match(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or "").lower())
+
+
+def _select_final_chunks(ranked_chunks: list[dict], keyword_chunks: list[dict]) -> list[dict]:
+    selected = list(ranked_chunks[:RETRIEVAL_RERANK_TOP_N])
+    if not keyword_chunks:
+        return selected
+
+    best_keyword = keyword_chunks[0]
+    best_score = float(best_keyword.get("keyword_score") or 0)
+    already_selected = any(_chunk_key(chunk) == _chunk_key(best_keyword) for chunk in selected)
+    if best_score >= 10 and not already_selected:
+        selected = [best_keyword, *selected]
+
+    deduped = []
+    seen = set()
+    for chunk in selected:
+        key = _chunk_key(chunk)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(chunk)
+    return deduped[:RETRIEVAL_RERANK_TOP_N]
+
+
+def _split_keyword_chunks(content: str, chunk_size: int = 900, chunk_overlap: int = 180) -> list[dict]:
     chunks = []
-    for start in range(0, len(content), chunk_size):
+    step = max(chunk_size - chunk_overlap, 1)
+    for start in range(0, len(content), step):
         text = content[start:start + chunk_size].strip()
         if text:
             chunks.append({"chunk_id": str(start), "content": text})
@@ -271,5 +430,6 @@ def _trace_chunk(chunk: dict) -> dict:
         "rrf_score": chunk.get("rrf_score"),
         "rerank_score": chunk.get("rerank_score"),
         "rerank_reason": chunk.get("rerank_reason", ""),
+        "keyword_score": chunk.get("keyword_score"),
         "excerpt": (chunk.get("content") or "")[:120],
     }

@@ -57,8 +57,8 @@ EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
 # Online RAGAS evaluation.
 RAGAS_ENABLED = os.getenv("RAGAS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 RAGAS_LLM_MODEL = os.getenv("RAGAS_LLM_MODEL", DEEPSEEK_MODEL)
-RAGAS_TIMEOUT_SECONDS = int(os.getenv("RAGAS_TIMEOUT_SECONDS", "90"))
-RAGAS_METRIC_TIMEOUT_SECONDS = int(os.getenv("RAGAS_METRIC_TIMEOUT_SECONDS", "30"))
+RAGAS_TIMEOUT_SECONDS = int(os.getenv("RAGAS_TIMEOUT_SECONDS", "180"))
+RAGAS_METRIC_TIMEOUT_SECONDS = int(os.getenv("RAGAS_METRIC_TIMEOUT_SECONDS", "60"))
 RAGAS_MAX_CONTEXTS = int(os.getenv("RAGAS_MAX_CONTEXTS", "3"))
 RAGAS_MAX_CONTEXT_CHARS = int(os.getenv("RAGAS_MAX_CONTEXT_CHARS", "1500"))
 RAGAS_MAX_ANSWER_CHARS = int(os.getenv("RAGAS_MAX_ANSWER_CHARS", "2000"))
@@ -66,6 +66,16 @@ RAGAS_MAX_ANSWER_CHARS = int(os.getenv("RAGAS_MAX_ANSWER_CHARS", "2000"))
 # Multi-route retrieval.
 RETRIEVAL_ROUTE_TOP_K = int(os.getenv("RETRIEVAL_ROUTE_TOP_K", "8"))
 RETRIEVAL_RERANK_TOP_N = int(os.getenv("RETRIEVAL_RERANK_TOP_N", "5"))
+
+# Conversation memory.
+MEMORY_WINDOW_TURNS = int(os.getenv("MEMORY_WINDOW_TURNS", "4"))
+MEMORY_SUMMARY_TRIGGER_TURNS = int(os.getenv("MEMORY_SUMMARY_TRIGGER_TURNS", "8"))
+MEMORY_SUMMARY_MAX_CHARS = int(os.getenv("MEMORY_SUMMARY_MAX_CHARS", "1800"))
+MEMORY_RECENT_MAX_CHARS = int(os.getenv("MEMORY_RECENT_MAX_CHARS", "4000"))
+
+# Learning/debug trace.
+LEARNING_TRACE_ENABLED = os.getenv("LEARNING_TRACE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+LEARNING_TRACE_MAX_TEXT_CHARS = int(os.getenv("LEARNING_TRACE_MAX_TEXT_CHARS", "1200"))
 
 # Aliyun OSS for chat image attachments
 OSS_ACCESS_KEY_ID = os.getenv("oss_access_key_id") or os.getenv("OSS_ACCESS_KEY_ID", "")

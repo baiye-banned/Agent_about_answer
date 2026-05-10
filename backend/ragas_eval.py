@@ -20,6 +20,7 @@ from config import (
     RAGAS_TIMEOUT_SECONDS,
 )
 from database import SessionLocal
+from learning_trace import append_trace_event, summarize_text
 from models import Message
 from retrieval import normalize_deepseek_model
 
@@ -27,46 +28,127 @@ from retrieval import normalize_deepseek_model
 logger = logging.getLogger(__name__)
 
 
-async def evaluate_message_async(message_id: int, question: str, answer: str, contexts: list[str]):
+async def evaluate_message_async(
+    message_id: int,
+    question: str,
+    answer: str,
+    contexts: list[str],
+    trace_id: str | None = None,
+):
     if not RAGAS_ENABLED:
+        append_trace_event(
+            trace_id,
+            "ragas_disabled",
+            "evaluate_message_async",
+            result={"message_id": message_id},
+            note="RAGAS 已关闭，系统不会执行本轮质量评估。",
+        )
         _mark_message(message_id, "failed", {}, "RAGAS 已关闭")
         return
 
     logger.info("RAGAS evaluation started: message_id=%s contexts=%s", message_id, len(contexts or []))
+    append_trace_event(
+        trace_id,
+        "ragas_running",
+        "evaluate_message_async",
+        params={
+            "message_id": message_id,
+            "question": question,
+            "answer": summarize_text(answer, 500),
+            "contexts_count": len(contexts or []),
+        },
+        note="RAGAS 后台任务开始运行，消息状态从 pending 进入 running。",
+    )
     _mark_message(message_id, "running", {}, "")
     try:
         prepared_answer = _truncate_text(answer, RAGAS_MAX_ANSWER_CHARS)
         prepared_contexts = _prepare_contexts(contexts)
+        append_trace_event(
+            trace_id,
+            "ragas_inputs_prepared",
+            "evaluate_message_async",
+            creates={
+                "prepared_answer_chars": len(prepared_answer),
+                "prepared_contexts_count": len(prepared_contexts),
+                "max_contexts": RAGAS_MAX_CONTEXTS,
+            },
+            note="RAGAS 会先裁剪回答和上下文，避免评估请求过长。",
+        )
         scores = await asyncio.wait_for(
-            asyncio.to_thread(_evaluate_message_sync, question, prepared_answer, prepared_contexts),
+            asyncio.to_thread(_evaluate_message_sync, question, prepared_answer, prepared_contexts, trace_id),
             timeout=RAGAS_TIMEOUT_SECONDS,
         )
         errors = scores.pop("_errors", {})
         if scores:
             error_text = _format_metric_errors(errors)
             _mark_message(message_id, "done", scores, error_text)
+            append_trace_event(
+                trace_id,
+                "ragas_done",
+                "evaluate_message_async",
+                result={"scores": scores, "errors": errors},
+                status="done",
+                note="RAGAS 至少有一个指标评估成功，结果已写回 assistant 消息。",
+            )
             logger.info("RAGAS evaluation done: message_id=%s scores=%s errors=%s", message_id, scores, errors)
         else:
             error_text = _format_metric_errors(errors) or "RAGAS 评测失败：所有指标均未返回结果"
             _mark_message(message_id, "failed", {}, error_text)
+            append_trace_event(
+                trace_id,
+                "ragas_failed",
+                "evaluate_message_async",
+                result={"errors": errors, "message": error_text},
+                status="done",
+                note="RAGAS 所有指标都失败了；这不会影响已生成回答，但 UI 会展示评估失败。",
+            )
             logger.warning("RAGAS evaluation failed: message_id=%s errors=%s", message_id, errors)
     except asyncio.TimeoutError:
         message = f"RAGAS 评测超时：超过 {RAGAS_TIMEOUT_SECONDS} 秒未完成，请稍后重试"
         logger.warning("RAGAS evaluation timeout: message_id=%s timeout=%s", message_id, RAGAS_TIMEOUT_SECONDS)
         _mark_message(message_id, "failed", {}, message)
+        append_trace_event(
+            trace_id,
+            "ragas_timeout",
+            "evaluate_message_async",
+            result={"timeout_seconds": RAGAS_TIMEOUT_SECONDS},
+            status="done",
+            note="RAGAS 总耗时超过上限，系统将评估状态置为 failed。",
+        )
     except Exception as exc:
         logger.warning("RAGAS evaluation failed: message_id=%s error=%s", message_id, exc, exc_info=True)
         _mark_message(message_id, "failed", {}, f"RAGAS 评测失败：{_friendly_error(exc)}")
+        append_trace_event(
+            trace_id,
+            "ragas_failed",
+            "evaluate_message_async",
+            result={"error": _friendly_error(exc)},
+            status="done",
+            note="RAGAS 评估异常，错误信息已写回消息。",
+        )
 
 
-def schedule_ragas_evaluation(message_id: int, question: str, answer: str, contexts: list[str]):
+def schedule_ragas_evaluation(
+    message_id: int,
+    question: str,
+    answer: str,
+    contexts: list[str],
+    trace_id: str | None = None,
+):
     try:
-        asyncio.create_task(evaluate_message_async(message_id, question, answer, contexts))
+        asyncio.create_task(evaluate_message_async(message_id, question, answer, contexts, trace_id))
     except RuntimeError:
         _mark_message(message_id, "failed", {}, "当前事件循环不可用，无法启动 RAGAS 评测")
+        append_trace_event(
+            trace_id,
+            "ragas_schedule_failed",
+            "schedule_ragas_evaluation",
+            result={"message_id": message_id},
+            note="当前事件循环不可用，RAGAS 后台任务没有成功创建。",
+        )
 
 
-def _evaluate_message_sync(question: str, answer: str, contexts: list[str]) -> dict:
+def _evaluate_message_sync(question: str, answer: str, contexts: list[str], trace_id: str | None = None) -> dict:
     if not DEEPSEEK_API_KEY:
         raise RuntimeError("DeepSeek API Key 未配置")
     if not EMBEDDING_BASE_URL or not EMBEDDING_API_KEY:
@@ -109,9 +191,23 @@ def _evaluate_message_sync(question: str, answer: str, contexts: list[str]) -> d
         started_at = time.monotonic()
         try:
             scores[key] = _score_metric_with_timeout(metric, sample, RAGAS_METRIC_TIMEOUT_SECONDS)
+            append_trace_event(
+                trace_id,
+                "ragas_metric_done",
+                "_evaluate_message_sync",
+                result={"metric": key, "score": scores[key], "seconds": round(time.monotonic() - started_at, 2)},
+                note=f"RAGAS 指标 {key} 评估成功。",
+            )
             logger.info("RAGAS metric done: metric=%s seconds=%.2f", key, time.monotonic() - started_at)
         except Exception as exc:
             errors[key] = _friendly_error(exc)
+            append_trace_event(
+                trace_id,
+                "ragas_metric_failed",
+                "_evaluate_message_sync",
+                result={"metric": key, "error": errors[key], "seconds": round(time.monotonic() - started_at, 2)},
+                note=f"RAGAS 指标 {key} 评估失败，其他指标仍会继续。",
+            )
             logger.warning(
                 "RAGAS metric failed: metric=%s seconds=%.2f error=%s",
                 key,
