@@ -1,0 +1,2698 @@
+{
+  "version": "1.0.0",
+  "project": {
+    "name": "Enterprise Knowledge Base RAG QA System",
+    "languages": [
+      "css",
+      "development",
+      "example",
+      "html",
+      "iml",
+      "javascript",
+      "json",
+      "markdown",
+      "python",
+      "text",
+      "vue",
+      "xml"
+    ],
+    "frameworks": [
+      "Vue 3",
+      "Vite",
+      "Element Plus",
+      "Pinia",
+      "Vue Router",
+      "TailwindCSS",
+      "Axios",
+      "FastAPI",
+      "SQLAlchemy",
+      "MySQL",
+      "ChromaDB",
+      "DeepSeek",
+      "DashScope",
+      "RAGAS",
+      "Aliyun OSS"
+    ],
+    "description": "Full-stack enterprise knowledge-base RAG question-answering workspace with authenticated Vue frontend, FastAPI backend, multi-knowledge-base file management, SSE chat streaming, Chroma retrieval, DeepSeek generation/reranking, DashScope embeddings, RAGAS evaluation, OSS attachments, and learning trace visualization.",
+    "analyzedAt": "2026-05-11T02:43:42.508Z",
+    "gitCommitHash": "74d79304e3143b4876b7a7a8a88842c25a557567"
+  },
+  "nodes": [
+    {
+      "id": "config:.env.example",
+      "type": "config",
+      "name": ".env.example",
+      "filePath": ".env.example",
+      "summary": "Project configuration file .env.example.",
+      "tags": [
+        "project"
+      ],
+      "complexity": "simple",
+      "languageNotes": "example"
+    },
+    {
+      "id": "file:.gitignore",
+      "type": "file",
+      "name": ".gitignore",
+      "filePath": ".gitignore",
+      "summary": "Project source file .gitignore.",
+      "tags": [
+        "project"
+      ],
+      "complexity": "simple",
+      "languageNotes": "text"
+    },
+    {
+      "id": "document:AGENTS.md",
+      "type": "document",
+      "name": "AGENTS.md",
+      "filePath": "AGENTS.md",
+      "summary": "Project-level agent instructions and operational context for this RAG QA workspace.",
+      "tags": [
+        "documentation"
+      ],
+      "complexity": "moderate",
+      "languageNotes": "markdown"
+    },
+    {
+      "id": "file:backend/checkpointer.py",
+      "type": "file",
+      "name": "checkpointer.py",
+      "filePath": "backend/checkpointer.py",
+      "summary": "SQLite helper for legacy checkpoint thread listing and deletion.",
+      "tags": [
+        "backend"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "file:backend/chroma_client.py",
+      "type": "file",
+      "name": "chroma_client.py",
+      "filePath": "backend/chroma_client.py",
+      "summary": "ChromaDB persistent vector-store adapter with DashScope/OpenAI-compatible embeddings and hash fallback embedding mode.",
+      "tags": [
+        "backend",
+        "retrieval"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "file:backend/config.py",
+      "type": "file",
+      "name": "config.py",
+      "filePath": "backend/config.py",
+      "summary": "Environment-driven backend configuration for database, model providers, embeddings, RAGAS, retrieval, OSS, memory, and startup index rebuild behavior.",
+      "tags": [
+        "backend"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "file:backend/database.py",
+      "type": "file",
+      "name": "database.py",
+      "filePath": "backend/database.py",
+      "summary": "SQLAlchemy engine/session setup plus lightweight startup migrations and default knowledge-base backfill.",
+      "tags": [
+        "backend"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "file:backend/learning_trace.py",
+      "type": "file",
+      "name": "learning_trace.py",
+      "filePath": "backend/learning_trace.py",
+      "summary": "Trace recorder and summarization utilities for chat execution telemetry and memory compaction.",
+      "tags": [
+        "backend",
+        "learning-trace"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "file:backend/main.py",
+      "type": "file",
+      "name": "main.py",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI application containing auth, user, chat streaming, knowledge-base/file management, OSS upload/signing, multimodal helpers, memory summarization, trace APIs, and health endpoints.",
+      "tags": [
+        "backend"
+      ],
+      "complexity": "complex",
+      "languageNotes": "python"
+    },
+    {
+      "id": "file:backend/models.py",
+      "type": "file",
+      "name": "models.py",
+      "filePath": "backend/models.py",
+      "summary": "SQLAlchemy ORM models for users, knowledge bases, conversations, messages, knowledge files, and chat trace sessions.",
+      "tags": [
+        "backend"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "file:backend/ragas_eval.py",
+      "type": "file",
+      "name": "ragas_eval.py",
+      "filePath": "backend/ragas_eval.py",
+      "summary": "Asynchronous online RAGAS evaluation runner with timeout control, per-metric isolation, status persistence, and trace logging.",
+      "tags": [
+        "backend",
+        "ragas"
+      ],
+      "complexity": "moderate",
+      "languageNotes": "python"
+    },
+    {
+      "id": "config:backend/requirements.txt",
+      "type": "config",
+      "name": "requirements.txt",
+      "filePath": "backend/requirements.txt",
+      "summary": "Python dependency manifest for FastAPI, SQLAlchemy, ChromaDB, RAGAS, document extraction, auth, and HTTP integrations.",
+      "tags": [
+        "backend"
+      ],
+      "complexity": "simple",
+      "languageNotes": "text"
+    },
+    {
+      "id": "file:backend/retrieval.py",
+      "type": "file",
+      "name": "retrieval.py",
+      "filePath": "backend/retrieval.py",
+      "summary": "Multi-route retrieval pipeline with DeepSeek query planning, HyDE, rewrites, keyword recall, RRF fusion, and reranking.",
+      "tags": [
+        "backend",
+        "retrieval"
+      ],
+      "complexity": "moderate",
+      "languageNotes": "python"
+    },
+    {
+      "id": "document:CLAUDE.md",
+      "type": "document",
+      "name": "CLAUDE.md",
+      "filePath": "CLAUDE.md",
+      "summary": "Historical project prompt and requirement context.",
+      "tags": [
+        "documentation"
+      ],
+      "complexity": "simple",
+      "languageNotes": "markdown"
+    },
+    {
+      "id": "document:docs/PROJECT_ARCHITECTURE_FULL.md",
+      "type": "document",
+      "name": "PROJECT_ARCHITECTURE_FULL.md",
+      "filePath": "docs/PROJECT_ARCHITECTURE_FULL.md",
+      "summary": "Project documentation file PROJECT_ARCHITECTURE_FULL.md.",
+      "tags": [
+        "documentation"
+      ],
+      "complexity": "complex",
+      "languageNotes": "markdown"
+    },
+    {
+      "id": "document:docs/PROJECT_CODE_READING_ROADMAP.md",
+      "type": "document",
+      "name": "PROJECT_CODE_READING_ROADMAP.md",
+      "filePath": "docs/PROJECT_CODE_READING_ROADMAP.md",
+      "summary": "Project documentation file PROJECT_CODE_READING_ROADMAP.md.",
+      "tags": [
+        "documentation"
+      ],
+      "complexity": "moderate",
+      "languageNotes": "markdown"
+    },
+    {
+      "id": "config:feature_list.json",
+      "type": "config",
+      "name": "feature_list.json",
+      "filePath": "feature_list.json",
+      "summary": "Historical feature queue and status file for the five-agent harness.",
+      "tags": [
+        "project"
+      ],
+      "complexity": "simple",
+      "languageNotes": "json"
+    },
+    {
+      "id": "config:harness.json",
+      "type": "config",
+      "name": "harness.json",
+      "filePath": "harness.json",
+      "summary": "Historical five-agent harness scheduler state.",
+      "tags": [
+        "project"
+      ],
+      "complexity": "simple",
+      "languageNotes": "json"
+    },
+    {
+      "id": "config:index.html",
+      "type": "config",
+      "name": "index.html",
+      "filePath": "index.html",
+      "summary": "Vite HTML entry point for mounting the Vue app.",
+      "tags": [
+        "project"
+      ],
+      "complexity": "simple",
+      "languageNotes": "html"
+    },
+    {
+      "id": "config:package.json",
+      "type": "config",
+      "name": "package.json",
+      "filePath": "package.json",
+      "summary": "Frontend npm manifest defining Vue/Vite dependencies and dev/build scripts.",
+      "tags": [
+        "project"
+      ],
+      "complexity": "simple",
+      "languageNotes": "json"
+    },
+    {
+      "id": "config:postcss.config.js",
+      "type": "config",
+      "name": "postcss.config.js",
+      "filePath": "postcss.config.js",
+      "summary": "PostCSS plugin configuration for TailwindCSS and Autoprefixer.",
+      "tags": [
+        "project"
+      ],
+      "complexity": "simple",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "document:README.md",
+      "type": "document",
+      "name": "README.md",
+      "filePath": "README.md",
+      "summary": "Project overview, stack, workflows, environment variables, and verification commands.",
+      "tags": [
+        "documentation"
+      ],
+      "complexity": "simple",
+      "languageNotes": "markdown"
+    },
+    {
+      "id": "file:src/api/auth.js",
+      "type": "file",
+      "name": "auth.js",
+      "filePath": "src/api/auth.js",
+      "summary": "Frontend auth API client for login and logout requests.",
+      "tags": [
+        "frontend",
+        "api-client"
+      ],
+      "complexity": "simple",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "file:src/api/chat.js",
+      "type": "file",
+      "name": "chat.js",
+      "filePath": "src/api/chat.js",
+      "summary": "Chat API client and streaming Fetch reader for POST-based SSE chat generation.",
+      "tags": [
+        "frontend",
+        "api-client",
+        "chat"
+      ],
+      "complexity": "simple",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "file:src/api/knowledge.js",
+      "type": "file",
+      "name": "knowledge.js",
+      "filePath": "src/api/knowledge.js",
+      "summary": "Knowledge-base and knowledge-file API client for CRUD, upload, detail, and content operations.",
+      "tags": [
+        "frontend",
+        "api-client",
+        "knowledge-base"
+      ],
+      "complexity": "simple",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "file:src/api/request.js",
+      "type": "file",
+      "name": "request.js",
+      "filePath": "src/api/request.js",
+      "summary": "Axios wrapper that injects JWT bearer tokens, centralizes API base URL handling, and redirects on authentication failures.",
+      "tags": [
+        "frontend",
+        "api-client"
+      ],
+      "complexity": "simple",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "file:src/api/user.js",
+      "type": "file",
+      "name": "user.js",
+      "filePath": "src/api/user.js",
+      "summary": "Frontend user profile, password, and avatar API client.",
+      "tags": [
+        "frontend",
+        "api-client"
+      ],
+      "complexity": "simple",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "file:src/App.vue",
+      "type": "file",
+      "name": "App.vue",
+      "filePath": "src/App.vue",
+      "summary": "Minimal router shell that renders the active route view.",
+      "tags": [
+        "frontend"
+      ],
+      "complexity": "simple",
+      "languageNotes": "vue"
+    },
+    {
+      "id": "file:src/components/MarkdownRenderer.vue",
+      "type": "file",
+      "name": "MarkdownRenderer.vue",
+      "filePath": "src/components/MarkdownRenderer.vue",
+      "summary": "Markdown renderer backed by marked and highlight.js for assistant answers and code blocks.",
+      "tags": [
+        "frontend"
+      ],
+      "complexity": "simple",
+      "languageNotes": "vue"
+    },
+    {
+      "id": "file:src/components/TraceVariableFlow.vue",
+      "type": "file",
+      "name": "TraceVariableFlow.vue",
+      "filePath": "src/components/TraceVariableFlow.vue",
+      "summary": "Visual component for displaying trace variables and transitions in the learning trace experience.",
+      "tags": [
+        "frontend",
+        "learning-trace"
+      ],
+      "complexity": "moderate",
+      "languageNotes": "vue"
+    },
+    {
+      "id": "file:src/main.js",
+      "type": "file",
+      "name": "main.js",
+      "filePath": "src/main.js",
+      "summary": "Vue application bootstrap that installs Pinia, Vue Router, Element Plus styles, global CSS, and mounts the app.",
+      "tags": [
+        "frontend"
+      ],
+      "complexity": "simple",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "file:src/router/index.js",
+      "type": "file",
+      "name": "index.js",
+      "filePath": "src/router/index.js",
+      "summary": "Vue Router configuration with authenticated layout routes for chat, knowledge management, learning trace, and profile pages.",
+      "tags": [
+        "frontend"
+      ],
+      "complexity": "simple",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "file:src/stores/chat.js",
+      "type": "file",
+      "name": "chat.js",
+      "filePath": "src/stores/chat.js",
+      "summary": "Pinia chat store for conversations, messages, active streaming state, SSE chunk handling, source metadata, and RAGAS polling.",
+      "tags": [
+        "frontend",
+        "pinia",
+        "chat"
+      ],
+      "complexity": "moderate",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "file:src/stores/knowledge.js",
+      "type": "file",
+      "name": "knowledge.js",
+      "filePath": "src/stores/knowledge.js",
+      "summary": "Pinia knowledge store for knowledge-base selection, list loading, creation, rename, deletion, and active base state.",
+      "tags": [
+        "frontend",
+        "pinia",
+        "knowledge-base"
+      ],
+      "complexity": "simple",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "file:src/stores/user.js",
+      "type": "file",
+      "name": "user.js",
+      "filePath": "src/stores/user.js",
+      "summary": "Pinia user store for token persistence, login/logout, profile loading, avatar upload, and password updates.",
+      "tags": [
+        "frontend",
+        "pinia"
+      ],
+      "complexity": "simple",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "file:src/styles/global.css",
+      "type": "file",
+      "name": "global.css",
+      "filePath": "src/styles/global.css",
+      "summary": "Project source file global.css.",
+      "tags": [
+        "frontend"
+      ],
+      "complexity": "simple",
+      "languageNotes": "css"
+    },
+    {
+      "id": "file:src/utils/index.js",
+      "type": "file",
+      "name": "index.js",
+      "filePath": "src/utils/index.js",
+      "summary": "Project source file index.js.",
+      "tags": [
+        "frontend"
+      ],
+      "complexity": "simple",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "file:src/views/Chat.vue",
+      "type": "file",
+      "name": "Chat.vue",
+      "filePath": "src/views/Chat.vue",
+      "summary": "Primary chat workspace with knowledge-base selector, file/image attachments, streaming answer rendering, sources drawer, trace panel, and RAG evaluation state.",
+      "tags": [
+        "frontend",
+        "view",
+        "chat"
+      ],
+      "complexity": "moderate",
+      "languageNotes": "vue"
+    },
+    {
+      "id": "file:src/views/Knowledge.vue",
+      "type": "file",
+      "name": "Knowledge.vue",
+      "filePath": "src/views/Knowledge.vue",
+      "summary": "Knowledge-base administration page for base CRUD, file upload, search, sort, pagination, preview, detail, and deletion workflows.",
+      "tags": [
+        "frontend",
+        "view"
+      ],
+      "complexity": "moderate",
+      "languageNotes": "vue"
+    },
+    {
+      "id": "file:src/views/Layout.vue",
+      "type": "file",
+      "name": "Layout.vue",
+      "filePath": "src/views/Layout.vue",
+      "summary": "Authenticated application shell with sidebar navigation, conversation history, user menu, and route outlet.",
+      "tags": [
+        "frontend",
+        "view"
+      ],
+      "complexity": "moderate",
+      "languageNotes": "vue"
+    },
+    {
+      "id": "file:src/views/Learn.vue",
+      "type": "file",
+      "name": "Learn.vue",
+      "filePath": "src/views/Learn.vue",
+      "summary": "Interactive learning page that visualizes the chat/RAG execution path and fetches trace data from backend APIs.",
+      "tags": [
+        "frontend",
+        "view"
+      ],
+      "complexity": "moderate",
+      "languageNotes": "vue"
+    },
+    {
+      "id": "file:src/views/LearnCanvas.vue",
+      "type": "file",
+      "name": "LearnCanvas.vue",
+      "filePath": "src/views/LearnCanvas.vue",
+      "summary": "Canvas-style renderer for the learning flow graph.",
+      "tags": [
+        "frontend",
+        "view"
+      ],
+      "complexity": "simple",
+      "languageNotes": "vue"
+    },
+    {
+      "id": "file:src/views/learnFlowSpec.js",
+      "type": "file",
+      "name": "learnFlowSpec.js",
+      "filePath": "src/views/learnFlowSpec.js",
+      "summary": "Static specification of the learning/RAG flow nodes, branches, and demo path metadata.",
+      "tags": [
+        "frontend",
+        "view",
+        "learning-trace"
+      ],
+      "complexity": "moderate",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "file:src/views/LearnTracePanel.vue",
+      "type": "file",
+      "name": "LearnTracePanel.vue",
+      "filePath": "src/views/LearnTracePanel.vue",
+      "summary": "Trace detail panel for inspecting learning-flow events and variables.",
+      "tags": [
+        "frontend",
+        "view",
+        "learning-trace"
+      ],
+      "complexity": "simple",
+      "languageNotes": "vue"
+    },
+    {
+      "id": "file:src/views/Login.vue",
+      "type": "file",
+      "name": "Login.vue",
+      "filePath": "src/views/Login.vue",
+      "summary": "Login screen that authenticates through the user store and respects redirect query state.",
+      "tags": [
+        "frontend",
+        "view"
+      ],
+      "complexity": "simple",
+      "languageNotes": "vue"
+    },
+    {
+      "id": "file:src/views/UserProfile.vue",
+      "type": "file",
+      "name": "UserProfile.vue",
+      "filePath": "src/views/UserProfile.vue",
+      "summary": "User profile page for avatar, account details, and password management.",
+      "tags": [
+        "frontend",
+        "view"
+      ],
+      "complexity": "simple",
+      "languageNotes": "vue"
+    },
+    {
+      "id": "config:tailwind.config.js",
+      "type": "config",
+      "name": "tailwind.config.js",
+      "filePath": "tailwind.config.js",
+      "summary": "TailwindCSS content and design token configuration.",
+      "tags": [
+        "project"
+      ],
+      "complexity": "simple",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "document:tests/.test.md",
+      "type": "document",
+      "name": ".test.md",
+      "filePath": "tests/.test.md",
+      "summary": "Markdown test-spec artifact generated by the project harness.",
+      "tags": [
+        "documentation"
+      ],
+      "complexity": "simple",
+      "languageNotes": "markdown"
+    },
+    {
+      "id": "config:vite.config.js",
+      "type": "config",
+      "name": "vite.config.js",
+      "filePath": "vite.config.js",
+      "summary": "Vite configuration for Vue plugin, alias resolution, dev server host/port, and proxying /api to the FastAPI backend.",
+      "tags": [
+        "project"
+      ],
+      "complexity": "simple",
+      "languageNotes": "javascript"
+    },
+    {
+      "id": "endpoint:backend/main.py:GET /",
+      "type": "endpoint",
+      "name": "GET /",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI GET endpoint handled by root().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:GET /health",
+      "type": "endpoint",
+      "name": "GET /health",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI GET endpoint handled by health().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:POST /api/auth/login",
+      "type": "endpoint",
+      "name": "POST /api/auth/login",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI POST endpoint handled by login().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:POST /api/auth/logout",
+      "type": "endpoint",
+      "name": "POST /api/auth/logout",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI POST endpoint handled by logout().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:GET /api/user/profile",
+      "type": "endpoint",
+      "name": "GET /api/user/profile",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI GET endpoint handled by get_profile().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:PUT /api/user/password",
+      "type": "endpoint",
+      "name": "PUT /api/user/password",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI PUT endpoint handled by update_password().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:POST /api/user/avatar",
+      "type": "endpoint",
+      "name": "POST /api/user/avatar",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI POST endpoint handled by upload_avatar().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:GET /api/chat/conversations",
+      "type": "endpoint",
+      "name": "GET /api/chat/conversations",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI GET endpoint handled by list_conversations().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:GET /api/chat/conversations/{cid}",
+      "type": "endpoint",
+      "name": "GET /api/chat/conversations/{cid}",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI GET endpoint handled by get_messages().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:GET /api/chat/traces/{trace_id}",
+      "type": "endpoint",
+      "name": "GET /api/chat/traces/{trace_id}",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI GET endpoint handled by get_chat_trace().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:GET /api/chat/messages/{message_id}/trace",
+      "type": "endpoint",
+      "name": "GET /api/chat/messages/{message_id}/trace",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI GET endpoint handled by get_message_trace().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:DELETE /api/chat/conversations/{cid}",
+      "type": "endpoint",
+      "name": "DELETE /api/chat/conversations/{cid}",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI DELETE endpoint handled by delete_conversation().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:PUT /api/chat/conversations/{cid}",
+      "type": "endpoint",
+      "name": "PUT /api/chat/conversations/{cid}",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI PUT endpoint handled by rename_conversation().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:GET /api/knowledge-bases",
+      "type": "endpoint",
+      "name": "GET /api/knowledge-bases",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI GET endpoint handled by list_knowledge_bases().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:POST /api/knowledge-bases",
+      "type": "endpoint",
+      "name": "POST /api/knowledge-bases",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI POST endpoint handled by create_knowledge_base().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:PUT /api/knowledge-bases/{kid}",
+      "type": "endpoint",
+      "name": "PUT /api/knowledge-bases/{kid}",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI PUT endpoint handled by rename_knowledge_base().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:DELETE /api/knowledge-bases/{kid}",
+      "type": "endpoint",
+      "name": "DELETE /api/knowledge-bases/{kid}",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI DELETE endpoint handled by delete_knowledge_base().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:POST /api/chat/attachments",
+      "type": "endpoint",
+      "name": "POST /api/chat/attachments",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI POST endpoint handled by upload_chat_attachment().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:POST /api/chat/stream",
+      "type": "endpoint",
+      "name": "POST /api/chat/stream",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI POST endpoint handled by stream_chat().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:GET /api/knowledge",
+      "type": "endpoint",
+      "name": "GET /api/knowledge",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI GET endpoint handled by list_knowledge().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:POST /api/knowledge/upload",
+      "type": "endpoint",
+      "name": "POST /api/knowledge/upload",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI POST endpoint handled by upload_knowledge().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:DELETE /api/knowledge/{fid}",
+      "type": "endpoint",
+      "name": "DELETE /api/knowledge/{fid}",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI DELETE endpoint handled by delete_knowledge().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:GET /api/knowledge/{fid}",
+      "type": "endpoint",
+      "name": "GET /api/knowledge/{fid}",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI GET endpoint handled by get_knowledge_detail().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:GET /api/knowledge/{fid}/content",
+      "type": "endpoint",
+      "name": "GET /api/knowledge/{fid}/content",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI GET endpoint handled by get_knowledge_content().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "endpoint:backend/main.py:GET /api/checkpointer/threads",
+      "type": "endpoint",
+      "name": "GET /api/checkpointer/threads",
+      "filePath": "backend/main.py",
+      "summary": "FastAPI GET endpoint handled by list_checkpointer_threads().",
+      "tags": [
+        "backend",
+        "api",
+        "fastapi"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "table:backend/models.py:users",
+      "type": "table",
+      "name": "users",
+      "filePath": "backend/models.py",
+      "summary": "SQLAlchemy table mapped by User for users records.",
+      "tags": [
+        "backend",
+        "database",
+        "sqlalchemy"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "table:backend/models.py:knowledge_bases",
+      "type": "table",
+      "name": "knowledge_bases",
+      "filePath": "backend/models.py",
+      "summary": "SQLAlchemy table mapped by KnowledgeBase for knowledge bases records.",
+      "tags": [
+        "backend",
+        "database",
+        "sqlalchemy"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "table:backend/models.py:conversations",
+      "type": "table",
+      "name": "conversations",
+      "filePath": "backend/models.py",
+      "summary": "SQLAlchemy table mapped by Conversation for conversations records.",
+      "tags": [
+        "backend",
+        "database",
+        "sqlalchemy"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "table:backend/models.py:messages",
+      "type": "table",
+      "name": "messages",
+      "filePath": "backend/models.py",
+      "summary": "SQLAlchemy table mapped by Message for messages records.",
+      "tags": [
+        "backend",
+        "database",
+        "sqlalchemy"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "table:backend/models.py:knowledge_files",
+      "type": "table",
+      "name": "knowledge_files",
+      "filePath": "backend/models.py",
+      "summary": "SQLAlchemy table mapped by KnowledgeFile for knowledge files records.",
+      "tags": [
+        "backend",
+        "database",
+        "sqlalchemy"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    },
+    {
+      "id": "table:backend/models.py:chat_trace_sessions",
+      "type": "table",
+      "name": "chat_trace_sessions",
+      "filePath": "backend/models.py",
+      "summary": "SQLAlchemy table mapped by ChatTraceSession for chat trace sessions records.",
+      "tags": [
+        "backend",
+        "database",
+        "sqlalchemy"
+      ],
+      "complexity": "simple",
+      "languageNotes": "python"
+    }
+  ],
+  "edges": [
+    {
+      "source": "file:backend/checkpointer.py",
+      "target": "file:backend/config.py",
+      "type": "imports",
+      "label": "imports config",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/chroma_client.py",
+      "target": "file:backend/config.py",
+      "type": "imports",
+      "label": "imports config",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/database.py",
+      "target": "file:backend/config.py",
+      "type": "imports",
+      "label": "imports config",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/database.py",
+      "target": "file:backend/models.py",
+      "type": "imports",
+      "label": "imports models",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/learning_trace.py",
+      "target": "file:backend/config.py",
+      "type": "imports",
+      "label": "imports config",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/learning_trace.py",
+      "target": "file:backend/database.py",
+      "type": "imports",
+      "label": "imports database",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/learning_trace.py",
+      "target": "file:backend/models.py",
+      "type": "imports",
+      "label": "imports models",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/config.py",
+      "type": "imports",
+      "label": "imports config",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/database.py",
+      "type": "imports",
+      "label": "imports database",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/models.py",
+      "type": "imports",
+      "label": "imports models",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/retrieval.py",
+      "type": "imports",
+      "label": "imports retrieval",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/ragas_eval.py",
+      "type": "imports",
+      "label": "imports ragas_eval",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/checkpointer.py",
+      "type": "imports",
+      "label": "imports checkpointer",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/learning_trace.py",
+      "type": "imports",
+      "label": "imports learning_trace",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/chroma_client.py",
+      "type": "imports",
+      "label": "imports chroma_client",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/models.py",
+      "target": "file:backend/database.py",
+      "type": "imports",
+      "label": "imports database",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/ragas_eval.py",
+      "target": "file:backend/config.py",
+      "type": "imports",
+      "label": "imports config",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/ragas_eval.py",
+      "target": "file:backend/database.py",
+      "type": "imports",
+      "label": "imports database",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/ragas_eval.py",
+      "target": "file:backend/learning_trace.py",
+      "type": "imports",
+      "label": "imports learning_trace",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/ragas_eval.py",
+      "target": "file:backend/models.py",
+      "type": "imports",
+      "label": "imports models",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/ragas_eval.py",
+      "target": "file:backend/retrieval.py",
+      "type": "imports",
+      "label": "imports retrieval",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/retrieval.py",
+      "target": "file:backend/chroma_client.py",
+      "type": "imports",
+      "label": "imports chroma_client",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/retrieval.py",
+      "target": "file:backend/config.py",
+      "type": "imports",
+      "label": "imports config",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/retrieval.py",
+      "target": "file:backend/models.py",
+      "type": "imports",
+      "label": "imports models",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/api/auth.js",
+      "target": "file:src/api/request.js",
+      "type": "imports",
+      "label": "imports ./request",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/api/chat.js",
+      "target": "file:src/api/request.js",
+      "type": "imports",
+      "label": "imports ./request",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/api/knowledge.js",
+      "target": "file:src/api/request.js",
+      "type": "imports",
+      "label": "imports ./request",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/api/request.js",
+      "target": "file:src/router/index.js",
+      "type": "imports",
+      "label": "imports @/router",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/api/user.js",
+      "target": "file:src/api/request.js",
+      "type": "imports",
+      "label": "imports ./request",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/main.js",
+      "target": "file:src/App.vue",
+      "type": "imports",
+      "label": "imports ./App.vue",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/main.js",
+      "target": "file:src/router/index.js",
+      "type": "imports",
+      "label": "imports ./router",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/router/index.js",
+      "target": "file:src/stores/user.js",
+      "type": "imports",
+      "label": "imports @/stores/user",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/stores/chat.js",
+      "target": "file:src/api/chat.js",
+      "type": "imports",
+      "label": "imports @/api/chat",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/stores/knowledge.js",
+      "target": "file:src/api/knowledge.js",
+      "type": "imports",
+      "label": "imports @/api/knowledge",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/stores/user.js",
+      "target": "file:src/api/auth.js",
+      "type": "imports",
+      "label": "imports @/api/auth",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/stores/user.js",
+      "target": "file:src/api/user.js",
+      "type": "imports",
+      "label": "imports @/api/user",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/Chat.vue",
+      "target": "file:src/components/MarkdownRenderer.vue",
+      "type": "imports",
+      "label": "imports @/components/MarkdownRenderer.vue",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/Chat.vue",
+      "target": "file:src/components/TraceVariableFlow.vue",
+      "type": "imports",
+      "label": "imports @/components/TraceVariableFlow.vue",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/Chat.vue",
+      "target": "file:src/stores/chat.js",
+      "type": "imports",
+      "label": "imports @/stores/chat",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/Chat.vue",
+      "target": "file:src/stores/knowledge.js",
+      "type": "imports",
+      "label": "imports @/stores/knowledge",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/Chat.vue",
+      "target": "file:src/api/chat.js",
+      "type": "imports",
+      "label": "imports @/api/chat",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/Knowledge.vue",
+      "target": "file:src/api/knowledge.js",
+      "type": "imports",
+      "label": "imports @/api/knowledge",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/Knowledge.vue",
+      "target": "file:src/stores/knowledge.js",
+      "type": "imports",
+      "label": "imports @/stores/knowledge",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/Layout.vue",
+      "target": "file:src/stores/chat.js",
+      "type": "imports",
+      "label": "imports @/stores/chat",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/Layout.vue",
+      "target": "file:src/stores/user.js",
+      "type": "imports",
+      "label": "imports @/stores/user",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/Learn.vue",
+      "target": "file:src/views/LearnCanvas.vue",
+      "type": "imports",
+      "label": "imports ./LearnCanvas.vue",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/Learn.vue",
+      "target": "file:src/views/LearnTracePanel.vue",
+      "type": "imports",
+      "label": "imports ./LearnTracePanel.vue",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/Learn.vue",
+      "target": "file:src/views/learnFlowSpec.js",
+      "type": "imports",
+      "label": "imports ./learnFlowSpec",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/Learn.vue",
+      "target": "file:src/api/chat.js",
+      "type": "imports",
+      "label": "imports @/api/chat",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/Login.vue",
+      "target": "file:src/stores/user.js",
+      "type": "imports",
+      "label": "imports @/stores/user",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/UserProfile.vue",
+      "target": "file:src/stores/user.js",
+      "type": "imports",
+      "label": "imports @/stores/user",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/views/UserProfile.vue",
+      "target": "file:src/api/user.js",
+      "type": "imports",
+      "label": "imports @/api/user",
+      "weight": 0.7
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:GET /",
+      "type": "contains",
+      "label": "defines GET /",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:GET /health",
+      "type": "contains",
+      "label": "defines GET /health",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:POST /api/auth/login",
+      "type": "contains",
+      "label": "defines POST /api/auth/login",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:POST /api/auth/logout",
+      "type": "contains",
+      "label": "defines POST /api/auth/logout",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:GET /api/user/profile",
+      "type": "contains",
+      "label": "defines GET /api/user/profile",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:PUT /api/user/password",
+      "type": "contains",
+      "label": "defines PUT /api/user/password",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:POST /api/user/avatar",
+      "type": "contains",
+      "label": "defines POST /api/user/avatar",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:GET /api/chat/conversations",
+      "type": "contains",
+      "label": "defines GET /api/chat/conversations",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:GET /api/chat/conversations/{cid}",
+      "type": "contains",
+      "label": "defines GET /api/chat/conversations/{cid}",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:GET /api/chat/traces/{trace_id}",
+      "type": "contains",
+      "label": "defines GET /api/chat/traces/{trace_id}",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:GET /api/chat/messages/{message_id}/trace",
+      "type": "contains",
+      "label": "defines GET /api/chat/messages/{message_id}/trace",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:DELETE /api/chat/conversations/{cid}",
+      "type": "contains",
+      "label": "defines DELETE /api/chat/conversations/{cid}",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:PUT /api/chat/conversations/{cid}",
+      "type": "contains",
+      "label": "defines PUT /api/chat/conversations/{cid}",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:GET /api/knowledge-bases",
+      "type": "contains",
+      "label": "defines GET /api/knowledge-bases",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:POST /api/knowledge-bases",
+      "type": "contains",
+      "label": "defines POST /api/knowledge-bases",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:PUT /api/knowledge-bases/{kid}",
+      "type": "contains",
+      "label": "defines PUT /api/knowledge-bases/{kid}",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:DELETE /api/knowledge-bases/{kid}",
+      "type": "contains",
+      "label": "defines DELETE /api/knowledge-bases/{kid}",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:POST /api/chat/attachments",
+      "type": "contains",
+      "label": "defines POST /api/chat/attachments",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:POST /api/chat/stream",
+      "type": "contains",
+      "label": "defines POST /api/chat/stream",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:GET /api/knowledge",
+      "type": "contains",
+      "label": "defines GET /api/knowledge",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:POST /api/knowledge/upload",
+      "type": "contains",
+      "label": "defines POST /api/knowledge/upload",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:DELETE /api/knowledge/{fid}",
+      "type": "contains",
+      "label": "defines DELETE /api/knowledge/{fid}",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:GET /api/knowledge/{fid}",
+      "type": "contains",
+      "label": "defines GET /api/knowledge/{fid}",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:GET /api/knowledge/{fid}/content",
+      "type": "contains",
+      "label": "defines GET /api/knowledge/{fid}/content",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "endpoint:backend/main.py:GET /api/checkpointer/threads",
+      "type": "contains",
+      "label": "defines GET /api/checkpointer/threads",
+      "weight": 1
+    },
+    {
+      "source": "file:backend/models.py",
+      "target": "table:backend/models.py:users",
+      "type": "defines_schema",
+      "label": "defines users",
+      "weight": 0.8
+    },
+    {
+      "source": "file:backend/models.py",
+      "target": "table:backend/models.py:knowledge_bases",
+      "type": "defines_schema",
+      "label": "defines knowledge_bases",
+      "weight": 0.8
+    },
+    {
+      "source": "file:backend/models.py",
+      "target": "table:backend/models.py:conversations",
+      "type": "defines_schema",
+      "label": "defines conversations",
+      "weight": 0.8
+    },
+    {
+      "source": "file:backend/models.py",
+      "target": "table:backend/models.py:messages",
+      "type": "defines_schema",
+      "label": "defines messages",
+      "weight": 0.8
+    },
+    {
+      "source": "file:backend/models.py",
+      "target": "table:backend/models.py:knowledge_files",
+      "type": "defines_schema",
+      "label": "defines knowledge_files",
+      "weight": 0.8
+    },
+    {
+      "source": "file:backend/models.py",
+      "target": "table:backend/models.py:chat_trace_sessions",
+      "type": "defines_schema",
+      "label": "defines chat_trace_sessions",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/main.js",
+      "target": "file:src/App.vue",
+      "type": "calls",
+      "label": "mounts app shell",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/main.js",
+      "target": "file:src/router/index.js",
+      "type": "configures",
+      "label": "installs router",
+      "weight": 0.6
+    },
+    {
+      "source": "file:src/main.js",
+      "target": "file:src/styles/global.css",
+      "type": "configures",
+      "label": "loads global styles",
+      "weight": 0.6
+    },
+    {
+      "source": "file:src/router/index.js",
+      "target": "file:src/views/Layout.vue",
+      "type": "routes",
+      "label": "authenticated layout",
+      "weight": 0.5
+    },
+    {
+      "source": "file:src/router/index.js",
+      "target": "file:src/views/Login.vue",
+      "type": "routes",
+      "label": "login route",
+      "weight": 0.5
+    },
+    {
+      "source": "file:src/router/index.js",
+      "target": "file:src/views/Chat.vue",
+      "type": "routes",
+      "label": "chat routes",
+      "weight": 0.5
+    },
+    {
+      "source": "file:src/router/index.js",
+      "target": "file:src/views/Knowledge.vue",
+      "type": "routes",
+      "label": "knowledge route",
+      "weight": 0.5
+    },
+    {
+      "source": "file:src/router/index.js",
+      "target": "file:src/views/Learn.vue",
+      "type": "routes",
+      "label": "learning route",
+      "weight": 0.5
+    },
+    {
+      "source": "file:src/router/index.js",
+      "target": "file:src/views/UserProfile.vue",
+      "type": "routes",
+      "label": "profile route",
+      "weight": 0.5
+    },
+    {
+      "source": "file:src/views/Layout.vue",
+      "target": "file:src/stores/chat.js",
+      "type": "calls",
+      "label": "loads conversation history",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/views/Layout.vue",
+      "target": "file:src/stores/user.js",
+      "type": "calls",
+      "label": "uses current user",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/views/Login.vue",
+      "target": "file:src/stores/user.js",
+      "type": "calls",
+      "label": "performs login",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/views/UserProfile.vue",
+      "target": "file:src/stores/user.js",
+      "type": "calls",
+      "label": "updates profile",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/views/Chat.vue",
+      "target": "file:src/stores/chat.js",
+      "type": "calls",
+      "label": "drives chat state",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/views/Chat.vue",
+      "target": "file:src/stores/knowledge.js",
+      "type": "calls",
+      "label": "uses active knowledge base",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/views/Chat.vue",
+      "target": "file:src/components/MarkdownRenderer.vue",
+      "type": "depends_on",
+      "label": "renders assistant markdown",
+      "weight": 0.6
+    },
+    {
+      "source": "file:src/views/Chat.vue",
+      "target": "file:src/components/TraceVariableFlow.vue",
+      "type": "depends_on",
+      "label": "renders trace variables",
+      "weight": 0.6
+    },
+    {
+      "source": "file:src/views/Knowledge.vue",
+      "target": "file:src/stores/knowledge.js",
+      "type": "calls",
+      "label": "manages knowledge base state",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/views/Learn.vue",
+      "target": "file:src/views/LearnCanvas.vue",
+      "type": "depends_on",
+      "label": "renders flow canvas",
+      "weight": 0.6
+    },
+    {
+      "source": "file:src/views/Learn.vue",
+      "target": "file:src/views/LearnTracePanel.vue",
+      "type": "depends_on",
+      "label": "renders trace details",
+      "weight": 0.6
+    },
+    {
+      "source": "file:src/views/Learn.vue",
+      "target": "file:src/views/learnFlowSpec.js",
+      "type": "depends_on",
+      "label": "uses flow spec",
+      "weight": 0.6
+    },
+    {
+      "source": "file:src/views/Learn.vue",
+      "target": "file:src/api/chat.js",
+      "type": "calls",
+      "label": "loads trace APIs",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/stores/user.js",
+      "target": "file:src/api/auth.js",
+      "type": "calls",
+      "label": "auth requests",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/stores/user.js",
+      "target": "file:src/api/user.js",
+      "type": "calls",
+      "label": "profile requests",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/stores/chat.js",
+      "target": "file:src/api/chat.js",
+      "type": "calls",
+      "label": "chat requests and stream",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/stores/knowledge.js",
+      "target": "file:src/api/knowledge.js",
+      "type": "calls",
+      "label": "knowledge-base requests",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/auth.js",
+      "target": "file:src/api/request.js",
+      "type": "depends_on",
+      "label": "uses axios wrapper",
+      "weight": 0.6
+    },
+    {
+      "source": "file:src/api/user.js",
+      "target": "file:src/api/request.js",
+      "type": "depends_on",
+      "label": "uses axios wrapper",
+      "weight": 0.6
+    },
+    {
+      "source": "file:src/api/chat.js",
+      "target": "file:src/api/request.js",
+      "type": "depends_on",
+      "label": "uses axios wrapper",
+      "weight": 0.6
+    },
+    {
+      "source": "file:src/api/knowledge.js",
+      "target": "file:src/api/request.js",
+      "type": "depends_on",
+      "label": "uses axios wrapper",
+      "weight": 0.6
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/retrieval.py",
+      "type": "calls",
+      "label": "retrieves context for chat",
+      "weight": 0.8
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/ragas_eval.py",
+      "type": "calls",
+      "label": "schedules RAGAS evaluation",
+      "weight": 0.8
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/chroma_client.py",
+      "type": "calls",
+      "label": "indexes knowledge chunks",
+      "weight": 0.8
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/learning_trace.py",
+      "type": "calls",
+      "label": "records and summarizes traces",
+      "weight": 0.8
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/checkpointer.py",
+      "type": "calls",
+      "label": "exposes checkpoint threads",
+      "weight": 0.8
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/database.py",
+      "type": "depends_on",
+      "label": "uses DB sessions",
+      "weight": 0.6
+    },
+    {
+      "source": "file:backend/main.py",
+      "target": "file:backend/models.py",
+      "type": "depends_on",
+      "label": "persists domain models",
+      "weight": 0.6
+    },
+    {
+      "source": "file:backend/retrieval.py",
+      "target": "file:backend/chroma_client.py",
+      "type": "calls",
+      "label": "queries vector routes",
+      "weight": 0.8
+    },
+    {
+      "source": "file:backend/retrieval.py",
+      "target": "file:backend/models.py",
+      "type": "reads_from",
+      "label": "keyword recall reads files",
+      "weight": 0.5
+    },
+    {
+      "source": "file:backend/ragas_eval.py",
+      "target": "file:backend/models.py",
+      "type": "writes_to",
+      "label": "updates message evaluation fields",
+      "weight": 0.5
+    },
+    {
+      "source": "file:backend/ragas_eval.py",
+      "target": "file:backend/database.py",
+      "type": "depends_on",
+      "label": "uses session factory",
+      "weight": 0.6
+    },
+    {
+      "source": "file:backend/database.py",
+      "target": "file:backend/config.py",
+      "type": "configures",
+      "label": "uses database URL",
+      "weight": 0.6
+    },
+    {
+      "source": "file:backend/chroma_client.py",
+      "target": "file:backend/config.py",
+      "type": "configures",
+      "label": "uses embedding and Chroma settings",
+      "weight": 0.6
+    },
+    {
+      "source": "file:backend/retrieval.py",
+      "target": "file:backend/config.py",
+      "type": "configures",
+      "label": "uses retrieval/model settings",
+      "weight": 0.6
+    },
+    {
+      "source": "file:backend/ragas_eval.py",
+      "target": "file:backend/config.py",
+      "type": "configures",
+      "label": "uses RAGAS settings",
+      "weight": 0.6
+    },
+    {
+      "source": "file:backend/learning_trace.py",
+      "target": "file:backend/config.py",
+      "type": "configures",
+      "label": "uses trace settings",
+      "weight": 0.6
+    },
+    {
+      "source": "config:vite.config.js",
+      "target": "file:src/main.js",
+      "type": "configures",
+      "label": "bundles frontend entry",
+      "weight": 0.6
+    },
+    {
+      "source": "config:tailwind.config.js",
+      "target": "file:src/styles/global.css",
+      "type": "configures",
+      "label": "scans and styles app",
+      "weight": 0.6
+    },
+    {
+      "source": "config:package.json",
+      "target": "file:src/main.js",
+      "type": "configures",
+      "label": "declares frontend runtime",
+      "weight": 0.6
+    },
+    {
+      "source": "config:backend/requirements.txt",
+      "target": "file:backend/main.py",
+      "type": "configures",
+      "label": "declares backend runtime",
+      "weight": 0.6
+    },
+    {
+      "source": "document:README.md",
+      "target": "file:backend/main.py",
+      "type": "documents",
+      "label": "documents backend workflow",
+      "weight": 0.5
+    },
+    {
+      "source": "document:README.md",
+      "target": "file:src/main.js",
+      "type": "documents",
+      "label": "documents frontend workflow",
+      "weight": 0.5
+    },
+    {
+      "source": "document:AGENTS.md",
+      "target": "file:backend/main.py",
+      "type": "documents",
+      "label": "agent context documents backend",
+      "weight": 0.5
+    },
+    {
+      "source": "document:AGENTS.md",
+      "target": "file:src/views/Chat.vue",
+      "type": "documents",
+      "label": "agent context documents chat UI",
+      "weight": 0.5
+    },
+    {
+      "source": "config:harness.json",
+      "target": "config:feature_list.json",
+      "type": "depends_on",
+      "label": "scheduler references feature queue",
+      "weight": 0.6
+    },
+    {
+      "source": "document:tests/.test.md",
+      "target": "config:feature_list.json",
+      "type": "tested_by",
+      "label": "markdown test spec covers feature queue",
+      "weight": 0.5
+    },
+    {
+      "source": "file:src/api/auth.js",
+      "target": "endpoint:backend/main.py:POST /api/auth/login",
+      "type": "calls",
+      "label": "calls POST /api/auth/login",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/auth.js",
+      "target": "endpoint:backend/main.py:POST /api/auth/logout",
+      "type": "calls",
+      "label": "calls POST /api/auth/logout",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/user.js",
+      "target": "endpoint:backend/main.py:GET /api/user/profile",
+      "type": "calls",
+      "label": "calls GET /api/user/profile",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/user.js",
+      "target": "endpoint:backend/main.py:PUT /api/user/password",
+      "type": "calls",
+      "label": "calls PUT /api/user/password",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/user.js",
+      "target": "endpoint:backend/main.py:POST /api/user/avatar",
+      "type": "calls",
+      "label": "calls POST /api/user/avatar",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/chat.js",
+      "target": "endpoint:backend/main.py:GET /api/chat/conversations",
+      "type": "calls",
+      "label": "calls GET /api/chat/conversations",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/chat.js",
+      "target": "endpoint:backend/main.py:GET /api/chat/conversations/{cid}",
+      "type": "calls",
+      "label": "calls GET /api/chat/conversations/{cid}",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/chat.js",
+      "target": "endpoint:backend/main.py:DELETE /api/chat/conversations/{cid}",
+      "type": "calls",
+      "label": "calls DELETE /api/chat/conversations/{cid}",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/chat.js",
+      "target": "endpoint:backend/main.py:PUT /api/chat/conversations/{cid}",
+      "type": "calls",
+      "label": "calls PUT /api/chat/conversations/{cid}",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/chat.js",
+      "target": "endpoint:backend/main.py:POST /api/chat/attachments",
+      "type": "calls",
+      "label": "calls POST /api/chat/attachments",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/chat.js",
+      "target": "endpoint:backend/main.py:POST /api/chat/stream",
+      "type": "calls",
+      "label": "calls POST /api/chat/stream",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/chat.js",
+      "target": "endpoint:backend/main.py:GET /api/chat/traces/{trace_id}",
+      "type": "calls",
+      "label": "calls GET /api/chat/traces/{trace_id}",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/chat.js",
+      "target": "endpoint:backend/main.py:GET /api/chat/messages/{message_id}/trace",
+      "type": "calls",
+      "label": "calls GET /api/chat/messages/{message_id}/trace",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/knowledge.js",
+      "target": "endpoint:backend/main.py:GET /api/knowledge-bases",
+      "type": "calls",
+      "label": "calls GET /api/knowledge-bases",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/knowledge.js",
+      "target": "endpoint:backend/main.py:POST /api/knowledge-bases",
+      "type": "calls",
+      "label": "calls POST /api/knowledge-bases",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/knowledge.js",
+      "target": "endpoint:backend/main.py:PUT /api/knowledge-bases/{kid}",
+      "type": "calls",
+      "label": "calls PUT /api/knowledge-bases/{kid}",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/knowledge.js",
+      "target": "endpoint:backend/main.py:DELETE /api/knowledge-bases/{kid}",
+      "type": "calls",
+      "label": "calls DELETE /api/knowledge-bases/{kid}",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/knowledge.js",
+      "target": "endpoint:backend/main.py:GET /api/knowledge",
+      "type": "calls",
+      "label": "calls GET /api/knowledge",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/knowledge.js",
+      "target": "endpoint:backend/main.py:POST /api/knowledge/upload",
+      "type": "calls",
+      "label": "calls POST /api/knowledge/upload",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/knowledge.js",
+      "target": "endpoint:backend/main.py:DELETE /api/knowledge/{fid}",
+      "type": "calls",
+      "label": "calls DELETE /api/knowledge/{fid}",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/knowledge.js",
+      "target": "endpoint:backend/main.py:GET /api/knowledge/{fid}",
+      "type": "calls",
+      "label": "calls GET /api/knowledge/{fid}",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api/knowledge.js",
+      "target": "endpoint:backend/main.py:GET /api/knowledge/{fid}/content",
+      "type": "calls",
+      "label": "calls GET /api/knowledge/{fid}/content",
+      "weight": 0.8
+    },
+    {
+      "source": "endpoint:backend/main.py:POST /api/auth/login",
+      "target": "table:backend/models.py:users",
+      "type": "reads_from",
+      "label": "reads users",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:POST /api/auth/logout",
+      "target": "table:backend/models.py:users",
+      "type": "reads_from",
+      "label": "reads users",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:GET /api/user/profile",
+      "target": "table:backend/models.py:users",
+      "type": "reads_from",
+      "label": "reads users",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:PUT /api/user/password",
+      "target": "table:backend/models.py:users",
+      "type": "reads_from",
+      "label": "reads users",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:PUT /api/user/password",
+      "target": "table:backend/models.py:users",
+      "type": "writes_to",
+      "label": "updates users",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:POST /api/user/avatar",
+      "target": "table:backend/models.py:users",
+      "type": "reads_from",
+      "label": "reads users",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:POST /api/user/avatar",
+      "target": "table:backend/models.py:users",
+      "type": "writes_to",
+      "label": "updates users",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:GET /api/chat/conversations",
+      "target": "table:backend/models.py:conversations",
+      "type": "reads_from",
+      "label": "uses conversations",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:GET /api/chat/conversations/{cid}",
+      "target": "table:backend/models.py:conversations",
+      "type": "reads_from",
+      "label": "uses conversations",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:GET /api/chat/traces/{trace_id}",
+      "target": "table:backend/models.py:chat_trace_sessions",
+      "type": "reads_from",
+      "label": "reads trace sessions",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:DELETE /api/chat/conversations/{cid}",
+      "target": "table:backend/models.py:conversations",
+      "type": "writes_to",
+      "label": "uses conversations",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:PUT /api/chat/conversations/{cid}",
+      "target": "table:backend/models.py:conversations",
+      "type": "writes_to",
+      "label": "uses conversations",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:GET /api/knowledge-bases",
+      "target": "table:backend/models.py:knowledge_bases",
+      "type": "reads_from",
+      "label": "uses knowledge bases",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:GET /api/knowledge-bases",
+      "target": "table:backend/models.py:knowledge_files",
+      "type": "reads_from",
+      "label": "uses knowledge files",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:POST /api/knowledge-bases",
+      "target": "table:backend/models.py:knowledge_bases",
+      "type": "writes_to",
+      "label": "uses knowledge bases",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:POST /api/knowledge-bases",
+      "target": "table:backend/models.py:knowledge_files",
+      "type": "writes_to",
+      "label": "uses knowledge files",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:PUT /api/knowledge-bases/{kid}",
+      "target": "table:backend/models.py:knowledge_bases",
+      "type": "writes_to",
+      "label": "uses knowledge bases",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:PUT /api/knowledge-bases/{kid}",
+      "target": "table:backend/models.py:knowledge_files",
+      "type": "writes_to",
+      "label": "uses knowledge files",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:DELETE /api/knowledge-bases/{kid}",
+      "target": "table:backend/models.py:knowledge_bases",
+      "type": "writes_to",
+      "label": "uses knowledge bases",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:DELETE /api/knowledge-bases/{kid}",
+      "target": "table:backend/models.py:knowledge_files",
+      "type": "writes_to",
+      "label": "uses knowledge files",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:POST /api/chat/stream",
+      "target": "table:backend/models.py:conversations",
+      "type": "writes_to",
+      "label": "binds conversation",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:POST /api/chat/stream",
+      "target": "table:backend/models.py:messages",
+      "type": "writes_to",
+      "label": "writes user and assistant messages",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:POST /api/chat/stream",
+      "target": "file:backend/retrieval.py",
+      "type": "calls",
+      "label": "runs retrieval",
+      "weight": 0.8
+    },
+    {
+      "source": "endpoint:backend/main.py:GET /api/knowledge",
+      "target": "table:backend/models.py:knowledge_files",
+      "type": "reads_from",
+      "label": "uses knowledge files",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:POST /api/knowledge/upload",
+      "target": "table:backend/models.py:knowledge_files",
+      "type": "writes_to",
+      "label": "uses knowledge files",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:DELETE /api/knowledge/{fid}",
+      "target": "table:backend/models.py:knowledge_files",
+      "type": "writes_to",
+      "label": "uses knowledge files",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:GET /api/knowledge/{fid}",
+      "target": "table:backend/models.py:knowledge_files",
+      "type": "reads_from",
+      "label": "uses knowledge files",
+      "weight": 0.5
+    },
+    {
+      "source": "endpoint:backend/main.py:GET /api/knowledge/{fid}/content",
+      "target": "table:backend/models.py:knowledge_files",
+      "type": "reads_from",
+      "label": "uses knowledge files",
+      "weight": 0.5
+    },
+    {
+      "source": "config:.env.example",
+      "target": "file:backend/config.py",
+      "type": "configures",
+      "label": "documents backend environment variables",
+      "weight": 0.6
+    },
+    {
+      "source": "file:.gitignore",
+      "target": "document:README.md",
+      "type": "documents",
+      "label": "defines repository hygiene described by README",
+      "weight": 0.5
+    },
+    {
+      "source": "document:CLAUDE.md",
+      "target": "document:AGENTS.md",
+      "type": "documents",
+      "label": "historical requirements inform agent context",
+      "weight": 0.5
+    },
+    {
+      "source": "document:docs/PROJECT_ARCHITECTURE_FULL.md",
+      "target": "file:backend/main.py",
+      "type": "documents",
+      "label": "documents backend architecture",
+      "weight": 0.5
+    },
+    {
+      "source": "document:docs/PROJECT_CODE_READING_ROADMAP.md",
+      "target": "file:src/router/index.js",
+      "type": "documents",
+      "label": "documents frontend reading path",
+      "weight": 0.5
+    },
+    {
+      "source": "config:index.html",
+      "target": "file:src/main.js",
+      "type": "configures",
+      "label": "mounts Vue entry element",
+      "weight": 0.6
+    },
+    {
+      "source": "config:postcss.config.js",
+      "target": "config:tailwind.config.js",
+      "type": "configures",
+      "label": "loads Tailwind through PostCSS",
+      "weight": 0.6
+    },
+    {
+      "source": "config:postcss.config.js",
+      "target": "file:src/styles/global.css",
+      "type": "configures",
+      "label": "processes global CSS",
+      "weight": 0.6
+    },
+    {
+      "source": "file:src/utils/index.js",
+      "target": "file:src/stores/user.js",
+      "type": "related",
+      "label": "shared localStorage utility pattern",
+      "weight": 0.5
+    }
+  ],
+  "layers": [
+    {
+      "id": "layer:project-context-and-config",
+      "name": "Project Context & Configuration",
+      "description": "Documentation, harness state, dependency manifests, and frontend build configuration.",
+      "nodeIds": [
+        "config:.env.example",
+        "document:AGENTS.md",
+        "document:CLAUDE.md",
+        "document:docs/PROJECT_ARCHITECTURE_FULL.md",
+        "document:docs/PROJECT_CODE_READING_ROADMAP.md",
+        "config:feature_list.json",
+        "config:harness.json",
+        "config:index.html",
+        "config:package.json",
+        "config:postcss.config.js",
+        "document:README.md",
+        "config:tailwind.config.js",
+        "document:tests/.test.md",
+        "config:vite.config.js",
+        "file:.gitignore",
+        "file:src/utils/index.js"
+      ]
+    },
+    {
+      "id": "layer:frontend-shell-and-routing",
+      "name": "Frontend Shell & Routing",
+      "description": "Vue bootstrapping, router, app layout, global styles, login, profile, and navigation shell.",
+      "nodeIds": [
+        "file:src/App.vue",
+        "file:src/main.js",
+        "file:src/router/index.js",
+        "file:src/styles/global.css",
+        "file:src/views/Layout.vue",
+        "file:src/views/Login.vue",
+        "file:src/views/UserProfile.vue"
+      ]
+    },
+    {
+      "id": "layer:frontend-state-and-api",
+      "name": "Frontend State & API Clients",
+      "description": "Pinia stores and API wrapper modules that coordinate auth, chat, knowledge bases, and user profile calls.",
+      "nodeIds": [
+        "file:src/api/auth.js",
+        "file:src/api/chat.js",
+        "file:src/api/knowledge.js",
+        "file:src/api/request.js",
+        "file:src/api/user.js",
+        "file:src/stores/chat.js",
+        "file:src/stores/knowledge.js",
+        "file:src/stores/user.js"
+      ]
+    },
+    {
+      "id": "layer:frontend-chat-knowledge-learning-ui",
+      "name": "Frontend Chat, Knowledge & Learning UI",
+      "description": "Feature views and reusable components for chat, knowledge management, markdown rendering, source traces, and learning-flow visualization.",
+      "nodeIds": [
+        "file:src/components/MarkdownRenderer.vue",
+        "file:src/components/TraceVariableFlow.vue",
+        "file:src/views/Chat.vue",
+        "file:src/views/Knowledge.vue",
+        "file:src/views/Learn.vue",
+        "file:src/views/LearnCanvas.vue",
+        "file:src/views/learnFlowSpec.js",
+        "file:src/views/LearnTracePanel.vue"
+      ]
+    },
+    {
+      "id": "layer:backend-api-and-runtime",
+      "name": "Backend API & Runtime",
+      "description": "FastAPI application, endpoint surface, request streaming, OSS attachment flow, auth, and runtime entry behavior.",
+      "nodeIds": [
+        "file:backend/main.py",
+        "endpoint:backend/main.py:GET /",
+        "endpoint:backend/main.py:GET /health",
+        "endpoint:backend/main.py:POST /api/auth/login",
+        "endpoint:backend/main.py:POST /api/auth/logout",
+        "endpoint:backend/main.py:GET /api/user/profile",
+        "endpoint:backend/main.py:PUT /api/user/password",
+        "endpoint:backend/main.py:POST /api/user/avatar",
+        "endpoint:backend/main.py:GET /api/chat/conversations",
+        "endpoint:backend/main.py:GET /api/chat/conversations/{cid}",
+        "endpoint:backend/main.py:GET /api/chat/traces/{trace_id}",
+        "endpoint:backend/main.py:GET /api/chat/messages/{message_id}/trace",
+        "endpoint:backend/main.py:DELETE /api/chat/conversations/{cid}",
+        "endpoint:backend/main.py:PUT /api/chat/conversations/{cid}",
+        "endpoint:backend/main.py:GET /api/knowledge-bases",
+        "endpoint:backend/main.py:POST /api/knowledge-bases",
+        "endpoint:backend/main.py:PUT /api/knowledge-bases/{kid}",
+        "endpoint:backend/main.py:DELETE /api/knowledge-bases/{kid}",
+        "endpoint:backend/main.py:POST /api/chat/attachments",
+        "endpoint:backend/main.py:POST /api/chat/stream",
+        "endpoint:backend/main.py:GET /api/knowledge",
+        "endpoint:backend/main.py:POST /api/knowledge/upload",
+        "endpoint:backend/main.py:DELETE /api/knowledge/{fid}",
+        "endpoint:backend/main.py:GET /api/knowledge/{fid}",
+        "endpoint:backend/main.py:GET /api/knowledge/{fid}/content",
+        "endpoint:backend/main.py:GET /api/checkpointer/threads"
+      ]
+    },
+    {
+      "id": "layer:backend-rag-and-evaluation",
+      "name": "Backend RAG & Evaluation",
+      "description": "Vector indexing, retrieval planning, reranking, RAGAS evaluation, checkpoint helpers, and learning trace utilities.",
+      "nodeIds": [
+        "file:backend/checkpointer.py",
+        "file:backend/chroma_client.py",
+        "file:backend/learning_trace.py",
+        "file:backend/ragas_eval.py",
+        "file:backend/retrieval.py"
+      ]
+    },
+    {
+      "id": "layer:backend-data-and-settings",
+      "name": "Backend Data & Settings",
+      "description": "SQLAlchemy models, table schemas, database initialization/migration, requirements, and backend environment configuration.",
+      "nodeIds": [
+        "file:backend/config.py",
+        "file:backend/database.py",
+        "file:backend/models.py",
+        "config:backend/requirements.txt",
+        "table:backend/models.py:users",
+        "table:backend/models.py:knowledge_bases",
+        "table:backend/models.py:conversations",
+        "table:backend/models.py:messages",
+        "table:backend/models.py:knowledge_files",
+        "table:backend/models.py:chat_trace_sessions"
+      ]
+    }
+  ],
+  "tour": [
+    {
+      "order": 1,
+      "title": "Project Context",
+      "description": "Start with the project documentation and agent context to understand the enterprise knowledge-base RAG product and current operating constraints.",
+      "nodeIds": [
+        "document:AGENTS.md",
+        "document:README.md"
+      ]
+    },
+    {
+      "order": 2,
+      "title": "Frontend Entry And Routing",
+      "description": "Follow the Vue bootstrap into the router and authenticated layout to see how users enter chat, knowledge management, learning, and profile pages.",
+      "nodeIds": [
+        "file:src/main.js",
+        "file:src/router/index.js",
+        "file:src/views/Layout.vue"
+      ]
+    },
+    {
+      "order": 3,
+      "title": "Chat User Experience",
+      "description": "Inspect how the chat page combines knowledge-base selection, streaming messages, markdown rendering, sources, trace visualization, and RAG evaluation state.",
+      "nodeIds": [
+        "file:src/views/Chat.vue",
+        "file:src/stores/chat.js",
+        "file:src/api/chat.js",
+        "file:src/components/MarkdownRenderer.vue"
+      ]
+    },
+    {
+      "order": 4,
+      "title": "Knowledge Management Flow",
+      "description": "Trace knowledge-base CRUD and file upload/list/detail/delete workflows from the Vue page through the API client to backend endpoints.",
+      "nodeIds": [
+        "file:src/views/Knowledge.vue",
+        "file:src/stores/knowledge.js",
+        "file:src/api/knowledge.js",
+        "endpoint:backend/main.py:POST /api/knowledge/upload"
+      ]
+    },
+    {
+      "order": 5,
+      "title": "Backend API Runtime",
+      "description": "Read the FastAPI app to understand auth, conversation lifecycle, SSE streaming, OSS attachments, memory updates, and knowledge endpoints.",
+      "nodeIds": [
+        "file:backend/main.py",
+        "file:backend/config.py",
+        "file:backend/database.py"
+      ]
+    },
+    {
+      "order": 6,
+      "title": "Retrieval And Evaluation Pipeline",
+      "description": "Follow the RAG path through Chroma embeddings, multi-route retrieval, DeepSeek reranking, answer generation, and asynchronous RAGAS scoring.",
+      "nodeIds": [
+        "file:backend/chroma_client.py",
+        "file:backend/retrieval.py",
+        "file:backend/ragas_eval.py"
+      ]
+    },
+    {
+      "order": 7,
+      "title": "Persistent Data Model",
+      "description": "Review SQLAlchemy table mappings and startup migrations to see how users, knowledge bases, conversations, messages, files, and traces are stored.",
+      "nodeIds": [
+        "file:backend/models.py",
+        "file:backend/database.py",
+        "table:backend/models.py:messages",
+        "table:backend/models.py:knowledge_files",
+        "table:backend/models.py:conversations"
+      ]
+    },
+    {
+      "order": 8,
+      "title": "Learning Trace Experience",
+      "description": "Connect backend trace recording with the frontend learning flow and trace components used to explain RAG execution.",
+      "nodeIds": [
+        "file:backend/learning_trace.py",
+        "file:src/views/Learn.vue",
+        "file:src/views/learnFlowSpec.js",
+        "file:src/components/TraceVariableFlow.vue"
+      ]
+    }
+  ]
+}

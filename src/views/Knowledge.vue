@@ -1,4 +1,4 @@
-﻿﻿<template>
+﻿﻿﻿﻿﻿﻿<template>
   <div class="h-full overflow-y-auto bg-slate-50 p-6">
     <div class="mx-auto max-w-7xl">
       <div class="mb-5 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">

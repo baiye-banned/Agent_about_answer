@@ -1,0 +1,13 @@
+{
+  "lastAnalyzedAt": "2026-05-11T02:43:42.508Z",
+  "gitCommitHash": "74d79304e3143b4876b7a7a8a88842c25a557567",
+  "version": "1.0.0",
+  "analyzedFiles": 49,
+  "warnings": [
+    "understand-anything plugin core was not built because pnpm is unavailable in this environment; generated graph uses deterministic local scanning and fingerprints were skipped."
+  ],
+  "validation": {
+    "issues": 0,
+    "warnings": 0
+  }
+}

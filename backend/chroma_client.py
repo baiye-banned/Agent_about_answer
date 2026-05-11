@@ -1,4 +1,5 @@
 import hashlib
+import logging
 from typing import Optional
 
 import chromadb
@@ -18,6 +19,7 @@ from config import (
 
 _client = None
 _semantic_collection = None
+logger = logging.getLogger(__name__)
 
 LEGACY_COLLECTION_NAME = "knowledge_chunks"
 
@@ -28,6 +30,11 @@ def _collection_name() -> str:
 
 
 COLLECTION_NAME = _collection_name()
+
+try:
+    import posthog as _posthog  # type: ignore
+except Exception:  # pragma: no cover - optional dependency behavior only
+    _posthog = None
 
 
 class _HashEmbeddingFunction(EmbeddingFunction):
@@ -86,6 +93,20 @@ _hash_embedding_fn = _HashEmbeddingFunction()
 _embedding_fn = _OpenAICompatibleEmbeddingFunction()
 
 
+def _suppress_chroma_telemetry_noise():
+    logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.ERROR)
+    logging.getLogger("posthog").setLevel(logging.ERROR)
+    if _posthog is not None:
+        try:
+            _posthog.disabled = True
+            _posthog.capture = lambda *args, **kwargs: None
+        except Exception:
+            pass
+
+
+_suppress_chroma_telemetry_noise()
+
+
 def embedding_backend_status() -> dict:
     configured = bool(EMBEDDING_BASE_URL and EMBEDDING_API_KEY)
     return {
@@ -119,6 +140,7 @@ def get_collection():
 
 def add_chunks(chunks: list[dict], file_id: int, file_name: str, knowledge_base_id: int):
     if not chunks:
+        logger.info("Chroma upsert skipped: file_id=%s chunks_count=0 action=none", file_id)
         return
     collection = get_collection()
     ids = [f"{file_id}_{chunk['id']}" for chunk in chunks]
@@ -132,14 +154,28 @@ def add_chunks(chunks: list[dict], file_id: int, file_name: str, knowledge_base_
         }
         for chunk in chunks
     ]
-    collection.add(ids=ids, documents=documents, metadatas=metadatas)
+    collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+    logger.info(
+        "Chroma upsert completed: file_id=%s chunks_count=%s knowledge_base_id=%s action=upsert",
+        file_id,
+        len(ids),
+        knowledge_base_id,
+    )
 
 
 def delete_file_chunks(file_id: int):
     collection = get_collection()
     results = collection.get(where={"file_id": file_id})
-    if results["ids"]:
-        collection.delete(ids=results["ids"])
+    ids = results.get("ids") or []
+    if not ids:
+        logger.info("Chroma delete skipped: file_id=%s chunks_count=0 action=none", file_id)
+        return
+    collection.delete(where={"file_id": file_id})
+    logger.info(
+        "Chroma delete completed: file_id=%s chunks_count=%s action=delete",
+        file_id,
+        len(ids),
+    )
 
 
 def query_vectors(

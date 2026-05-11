@@ -1,9 +1,8 @@
-import json
 from datetime import datetime
 from uuid import uuid4
 
 from config import LEARNING_TRACE_ENABLED, LEARNING_TRACE_MAX_TEXT_CHARS
-from database import SessionLocal
+from crud import trace as crud_trace
 from models import ChatTraceSession
 
 
@@ -135,21 +134,14 @@ class TraceRecorder:
         return payloads
 
     def _persist(self, conversation_id: str | None = None, message_id: int | None = None):
-        db = SessionLocal()
-        try:
-            session = db.query(ChatTraceSession).filter_by(id=self.trace_id).first()
-            if not session:
-                session = ChatTraceSession(id=self.trace_id, user_id=self.user_id)
-                db.add(session)
-            if conversation_id is not None:
-                session.conversation_id = conversation_id
-            if message_id is not None:
-                session.message_id = message_id
-            session.status = self.status
-            session.events = json.dumps(self.events, ensure_ascii=False)
-            db.commit()
-        finally:
-            db.close()
+        crud_trace.persist_trace_session(
+            self.trace_id,
+            user_id=self.user_id,
+            status=self.status,
+            events=self.events,
+            conversation_id=conversation_id,
+            message_id=message_id,
+        )
 
     def _safe_persist(self, **kwargs):
         try:
@@ -162,58 +154,25 @@ class TraceRecorder:
 def append_trace_event(trace_id: str | None, stage: str, function: str, **kwargs):
     if not trace_id or not LEARNING_TRACE_ENABLED:
         return
-    db = SessionLocal()
-    try:
-        session = db.query(ChatTraceSession).filter_by(id=trace_id).first()
-        if not session:
-            return
-        events = json.loads(session.events or "[]")
-        event = {
-            "index": len(events) + 1,
-            "time": _now_iso(),
-            "stage": stage,
-            "function": function,
-            "creates": sanitize_trace_value(kwargs.get("creates") or {}),
-            "uses": sanitize_trace_value(kwargs.get("uses") or {}),
-            "params": sanitize_trace_value(kwargs.get("params") or {}),
-            "result": sanitize_trace_value(kwargs.get("result") or {}),
-            "note": kwargs.get("note", ""),
-        }
-        events.append(event)
-        session.events = json.dumps(events, ensure_ascii=False)
-        if kwargs.get("status"):
-            session.status = kwargs["status"]
-        db.commit()
-    finally:
-        db.close()
+    snapshot = crud_trace.get_trace_snapshot(trace_id)
+    events = snapshot.get("events", []) if snapshot else []
+    event = {
+        "index": len(events) + 1,
+        "time": _now_iso(),
+        "stage": stage,
+        "function": function,
+        "creates": sanitize_trace_value(kwargs.get("creates") or {}),
+        "uses": sanitize_trace_value(kwargs.get("uses") or {}),
+        "params": sanitize_trace_value(kwargs.get("params") or {}),
+        "result": sanitize_trace_value(kwargs.get("result") or {}),
+        "note": kwargs.get("note", ""),
+    }
+    crud_trace.append_trace_event(trace_id, event, status=kwargs.get("status"))
 
 
 def get_trace_snapshot(trace_id: str, user_id: int | None = None) -> dict | None:
-    db = SessionLocal()
-    try:
-        query = db.query(ChatTraceSession).filter_by(id=trace_id)
-        if user_id is not None:
-            query = query.filter_by(user_id=user_id)
-        session = query.first()
-        if not session:
-            return None
-        return serialize_trace_session(session)
-    finally:
-        db.close()
+    return crud_trace.get_trace_snapshot(trace_id, user_id=user_id)
 
 
 def serialize_trace_session(session: ChatTraceSession) -> dict:
-    try:
-        events = json.loads(session.events or "[]")
-    except json.JSONDecodeError:
-        events = []
-    return {
-        "trace_id": session.id,
-        "user_id": session.user_id,
-        "conversation_id": session.conversation_id,
-        "message_id": session.message_id,
-        "status": session.status,
-        "events": events,
-        "created_at": session.created_at.isoformat() if session.created_at else "",
-        "updated_at": session.updated_at.isoformat() if session.updated_at else "",
-    }
+    return crud_trace.serialize_trace_session(session)

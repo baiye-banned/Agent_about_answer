@@ -185,6 +185,7 @@ export const useChatStore = defineStore('chat', () => {
 
   async function handleStreamDone() {
     const targetConversationId = streamingConversationId.value
+    const shouldTrackEvaluation = shouldTrackEvaluationFromTrace()
     const shouldShowLocalMessage = streamContent.value && currentId.value === targetConversationId
     if (shouldShowLocalMessage) {
       addMessage({
@@ -193,7 +194,7 @@ export const useChatStore = defineStore('chat', () => {
         sources: streamSources.value,
         learning_trace: cloneTrace(streamTrace.value),
         ...streamImageAnalysisFields(),
-        ragas_status: 'pending',
+        ragas_status: shouldTrackEvaluation ? 'pending' : '',
         isLocal: true,
       })
     }
@@ -206,8 +207,12 @@ export const useChatStore = defineStore('chat', () => {
       setCurrentId(targetConversationId)
     }
     if (targetConversationId && currentId.value === targetConversationId) {
-      await refreshMessages(targetConversationId)
-      startEvaluationPolling(targetConversationId)
+      const nextMessages = await refreshMessages(targetConversationId)
+      if (hasPendingEvaluation(nextMessages)) {
+        startEvaluationPolling(targetConversationId)
+      } else {
+        stopEvaluationPolling()
+      }
     }
   }
 
@@ -308,6 +313,12 @@ export const useChatStore = defineStore('chat', () => {
       status: trace.status || '',
       events: Array.isArray(trace.events) ? trace.events.map((event) => ({ ...event })) : [],
     }
+  }
+
+  function shouldTrackEvaluationFromTrace(trace = streamTrace.value) {
+    const events = Array.isArray(trace?.events) ? trace.events : []
+    return events.some((event) => event?.stage === 'retrieval_completed') ||
+      events.some((event) => event?.stage === 'rag_gate_decided' && event?.result?.need_rag !== false)
   }
 
   async function deleteConversation(id) {
@@ -438,6 +449,8 @@ export const useChatStore = defineStore('chat', () => {
       stream_error: message.stream_error || '',
       retrieval_trace: retrievalTrace,
       learning_trace: learningTrace,
+      rag_gate: retrievalTrace.rag_gate || {},
+      route_mode: retrievalTrace.mode || '',
       trace_id: message.trace_id || learningTrace.trace_id || '',
       image_analysis_status: message.image_analysis_status || retrievalTrace.image_analysis_status || '',
       image_analysis_error: message.image_analysis_error || retrievalTrace.image_analysis_error || '',

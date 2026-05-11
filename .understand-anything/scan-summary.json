@@ -1,0 +1,299 @@
+{
+  "files": [
+    {
+      "path": ".env.example",
+      "language": "example",
+      "fileCategory": "config",
+      "sizeLines": 62
+    },
+    {
+      "path": ".gitignore",
+      "language": "text",
+      "fileCategory": "file",
+      "sizeLines": 60
+    },
+    {
+      "path": "AGENTS.md",
+      "language": "markdown",
+      "fileCategory": "document",
+      "sizeLines": 688
+    },
+    {
+      "path": "backend/checkpointer.py",
+      "language": "python",
+      "fileCategory": "file",
+      "sizeLines": 68
+    },
+    {
+      "path": "backend/chroma_client.py",
+      "language": "python",
+      "fileCategory": "file",
+      "sizeLines": 188
+    },
+    {
+      "path": "backend/config.py",
+      "language": "python",
+      "fileCategory": "file",
+      "sizeLines": 90
+    },
+    {
+      "path": "backend/database.py",
+      "language": "python",
+      "fileCategory": "file",
+      "sizeLines": 244
+    },
+    {
+      "path": "backend/learning_trace.py",
+      "language": "python",
+      "fileCategory": "file",
+      "sizeLines": 220
+    },
+    {
+      "path": "backend/main.py",
+      "language": "python",
+      "fileCategory": "file",
+      "sizeLines": 2066
+    },
+    {
+      "path": "backend/models.py",
+      "language": "python",
+      "fileCategory": "file",
+      "sizeLines": 101
+    },
+    {
+      "path": "backend/ragas_eval.py",
+      "language": "python",
+      "fileCategory": "file",
+      "sizeLines": 319
+    },
+    {
+      "path": "backend/requirements.txt",
+      "language": "text",
+      "fileCategory": "config",
+      "sizeLines": 17
+    },
+    {
+      "path": "backend/retrieval.py",
+      "language": "python",
+      "fileCategory": "file",
+      "sizeLines": 436
+    },
+    {
+      "path": "CLAUDE.md",
+      "language": "markdown",
+      "fileCategory": "document",
+      "sizeLines": 121
+    },
+    {
+      "path": "docs/PROJECT_ARCHITECTURE_FULL.md",
+      "language": "markdown",
+      "fileCategory": "document",
+      "sizeLines": 914
+    },
+    {
+      "path": "docs/PROJECT_CODE_READING_ROADMAP.md",
+      "language": "markdown",
+      "fileCategory": "document",
+      "sizeLines": 743
+    },
+    {
+      "path": "feature_list.json",
+      "language": "json",
+      "fileCategory": "config",
+      "sizeLines": 66
+    },
+    {
+      "path": "harness.json",
+      "language": "json",
+      "fileCategory": "config",
+      "sizeLines": 6
+    },
+    {
+      "path": "index.html",
+      "language": "html",
+      "fileCategory": "config",
+      "sizeLines": 13
+    },
+    {
+      "path": "package.json",
+      "language": "json",
+      "fileCategory": "config",
+      "sizeLines": 32
+    },
+    {
+      "path": "postcss.config.js",
+      "language": "javascript",
+      "fileCategory": "config",
+      "sizeLines": 7
+    },
+    {
+      "path": "README.md",
+      "language": "markdown",
+      "fileCategory": "document",
+      "sizeLines": 186
+    },
+    {
+      "path": "src/api/auth.js",
+      "language": "javascript",
+      "fileCategory": "file",
+      "sizeLines": 11
+    },
+    {
+      "path": "src/api/chat.js",
+      "language": "javascript",
+      "fileCategory": "file",
+      "sizeLines": 124
+    },
+    {
+      "path": "src/api/knowledge.js",
+      "language": "javascript",
+      "fileCategory": "file",
+      "sizeLines": 44
+    },
+    {
+      "path": "src/api/request.js",
+      "language": "javascript",
+      "fileCategory": "file",
+      "sizeLines": 46
+    },
+    {
+      "path": "src/api/user.js",
+      "language": "javascript",
+      "fileCategory": "file",
+      "sizeLines": 18
+    },
+    {
+      "path": "src/App.vue",
+      "language": "vue",
+      "fileCategory": "file",
+      "sizeLines": 4
+    },
+    {
+      "path": "src/components/MarkdownRenderer.vue",
+      "language": "vue",
+      "fileCategory": "file",
+      "sizeLines": 117
+    },
+    {
+      "path": "src/components/TraceVariableFlow.vue",
+      "language": "vue",
+      "fileCategory": "file",
+      "sizeLines": 498
+    },
+    {
+      "path": "src/main.js",
+      "language": "javascript",
+      "fileCategory": "file",
+      "sizeLines": 11
+    },
+    {
+      "path": "src/router/index.js",
+      "language": "javascript",
+      "fileCategory": "file",
+      "sizeLines": 71
+    },
+    {
+      "path": "src/stores/chat.js",
+      "language": "javascript",
+      "fileCategory": "file",
+      "sizeLines": 486
+    },
+    {
+      "path": "src/stores/knowledge.js",
+      "language": "javascript",
+      "fileCategory": "file",
+      "sizeLines": 82
+    },
+    {
+      "path": "src/stores/user.js",
+      "language": "javascript",
+      "fileCategory": "file",
+      "sizeLines": 68
+    },
+    {
+      "path": "src/styles/global.css",
+      "language": "css",
+      "fileCategory": "file",
+      "sizeLines": 25
+    },
+    {
+      "path": "src/utils/index.js",
+      "language": "javascript",
+      "fileCategory": "file",
+      "sizeLines": 23
+    },
+    {
+      "path": "src/views/Chat.vue",
+      "language": "vue",
+      "fileCategory": "file",
+      "sizeLines": 776
+    },
+    {
+      "path": "src/views/Knowledge.vue",
+      "language": "vue",
+      "fileCategory": "file",
+      "sizeLines": 855
+    },
+    {
+      "path": "src/views/Layout.vue",
+      "language": "vue",
+      "fileCategory": "file",
+      "sizeLines": 279
+    },
+    {
+      "path": "src/views/Learn.vue",
+      "language": "vue",
+      "fileCategory": "file",
+      "sizeLines": 444
+    },
+    {
+      "path": "src/views/LearnCanvas.vue",
+      "language": "vue",
+      "fileCategory": "file",
+      "sizeLines": 216
+    },
+    {
+      "path": "src/views/learnFlowSpec.js",
+      "language": "javascript",
+      "fileCategory": "file",
+      "sizeLines": 369
+    },
+    {
+      "path": "src/views/LearnTracePanel.vue",
+      "language": "vue",
+      "fileCategory": "file",
+      "sizeLines": 123
+    },
+    {
+      "path": "src/views/Login.vue",
+      "language": "vue",
+      "fileCategory": "file",
+      "sizeLines": 103
+    },
+    {
+      "path": "src/views/UserProfile.vue",
+      "language": "vue",
+      "fileCategory": "file",
+      "sizeLines": 212
+    },
+    {
+      "path": "tailwind.config.js",
+      "language": "javascript",
+      "fileCategory": "config",
+      "sizeLines": 22
+    },
+    {
+      "path": "tests/.test.md",
+      "language": "markdown",
+      "fileCategory": "document",
+      "sizeLines": 38
+    },
+    {
+      "path": "vite.config.js",
+      "language": "javascript",
+      "fileCategory": "config",
+      "sizeLines": 36
+    }
+  ],
+  "filteredByIgnore": "node_modules, .git, dist, chroma_data, uploads, logs, pid/db runtime files, lockfiles, .env/.env.development, .idea, .claude"
+}

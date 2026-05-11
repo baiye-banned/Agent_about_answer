@@ -182,7 +182,7 @@
               <el-icon><Loading /></el-icon>
               <span>AI 正在生成</span>
             </div>
-            <MarkdownRenderer :content="chatStore.streamContent || '正在检索知识库...'" />
+            <MarkdownRenderer :content="chatStore.streamContent || '正在分析问题并生成答案...'" />
             <button
               v-if="chatStore.streamSources.length"
               type="button"
@@ -312,7 +312,7 @@
       <el-empty v-else description="暂无参考资料" />
     </el-drawer>
 
-    <el-drawer v-model="traceVisible" title="本次回答执行流程" size="720px" append-to-body>
+    <el-drawer v-model="traceVisible" title="本次回答执行流程" size="min(1100px, 96vw)" append-to-body>
       <div v-loading="traceLoading" class="space-y-4">
         <div class="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
           Trace ID：{{ activeTrace.trace_id || '--' }} · 状态：{{ activeTrace.status || '--' }}
@@ -339,11 +339,7 @@
           </el-tab-pane>
 
           <el-tab-pane label="变量流" name="variables">
-            <el-table :data="traceVariableRows" size="small" border>
-              <el-table-column prop="name" label="变量" width="180" />
-              <el-table-column prop="stage" label="创建/使用位置" width="180" />
-              <el-table-column prop="value" label="值摘要" />
-            </el-table>
+            <TraceVariableFlow :trace="activeTrace" />
           </el-tab-pane>
 
           <el-tab-pane label="检索过程" name="retrieval">
@@ -426,6 +422,7 @@ import {
 } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import MarkdownRenderer from '@/components/MarkdownRenderer.vue'
+import TraceVariableFlow from '@/components/TraceVariableFlow.vue'
 import { useChatStore } from '@/stores/chat'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import { chatAPI } from '@/api/chat'
@@ -479,23 +476,6 @@ const ragasMetrics = [
 ]
 
 const traceEvents = computed(() => activeTrace.value?.events || [])
-
-const traceVariableRows = computed(() => {
-  const rows = []
-  for (const event of traceEvents.value) {
-    for (const groupName of ['creates', 'uses', 'params', 'result']) {
-      const group = event[groupName] || {}
-      for (const [name, value] of Object.entries(group)) {
-        rows.push({
-          name,
-          stage: `${event.stage} / ${groupName}`,
-          value: stringifyBrief(value),
-        })
-      }
-    }
-  }
-  return rows
-})
 
 const retrievalRoutes = computed(() => {
   const event = [...traceEvents.value].reverse().find((item) => item.stage === 'retrieval_completed')
@@ -707,11 +687,6 @@ function formatJson(value) {
   } catch {
     return String(value || '')
   }
-}
-
-function stringifyBrief(value) {
-  const text = typeof value === 'string' ? value : formatJson(value)
-  return text.length > 220 ? `${text.slice(0, 220)}...` : text
 }
 
 function formatScore(score) {
