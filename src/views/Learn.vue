@@ -5,7 +5,7 @@
         <div class="min-w-0">
           <div class="text-2xl font-semibold text-slate-900">真实符号驱动的学习中心</div>
           <p class="mt-2 max-w-4xl text-sm leading-6 text-slate-500">
-            这里不讲抽象概念，只把项目里真实存在的变量名、函数名、API 字段名和 trace 字段串成一条完整链路。
+            这里不讲抽象概念，只把项目里真实存在的变量名、函数名、API 字段名和 trace 字段串成当前真实链路。
           </p>
         </div>
 
@@ -43,7 +43,7 @@
             {{ mode === 'demo' ? '示例演示' : '真实回放' }}
           </div>
           <div class="mt-1 text-xs leading-5 text-slate-500">
-            {{ mode === 'demo' ? '默认播放固定流程链路' : '输入 trace_id 后加载真实事件' }}
+            {{ mode === 'demo' ? '播放当前 RAG 主链路' : '输入 trace_id 后加载真实事件' }}
           </div>
         </div>
       </div>

@@ -69,9 +69,8 @@ RETRIEVAL_RERANK_TOP_N = int(os.getenv("RETRIEVAL_RERANK_TOP_N", "5"))
 
 # Conversation memory.
 MEMORY_WINDOW_TURNS = int(os.getenv("MEMORY_WINDOW_TURNS", "4"))
-MEMORY_SUMMARY_TRIGGER_TURNS = int(os.getenv("MEMORY_SUMMARY_TRIGGER_TURNS", "8"))
-MEMORY_SUMMARY_MAX_CHARS = int(os.getenv("MEMORY_SUMMARY_MAX_CHARS", "1800"))
-MEMORY_RECENT_MAX_CHARS = int(os.getenv("MEMORY_RECENT_MAX_CHARS", "4000"))
+MEMORY_SUMMARY_MAX_CHARS = int(os.getenv("MEMORY_SUMMARY_MAX_CHARS", "15000"))
+MEMORY_RECENT_MAX_CHARS = int(os.getenv("MEMORY_RECENT_MAX_CHARS", "8000"))
 
 # Learning/debug trace.
 LEARNING_TRACE_ENABLED = os.getenv("LEARNING_TRACE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}

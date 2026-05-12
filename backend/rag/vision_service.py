@@ -5,8 +5,8 @@ from typing import Optional
 import httpx
 
 from config import VISION_API_KEY, VISION_BASE_URL, VISION_MODEL
-from services.base.oss_service import _public_oss_url
-from services.engine.llm_service import _openai_chat_url
+from service.oss_service import _public_oss_url
+from rag.llm_service import _openai_chat_url
 
 
 logger = logging.getLogger(__name__)

@@ -218,7 +218,7 @@ def _get_mysql_column_info(table_name: str, column_name: str):
 def _ensure_default_knowledge_base():
     if "knowledge_bases" not in inspect(engine).get_table_names():
         return
-    from models import KnowledgeBase
+    from model.models import KnowledgeBase
 
     db = SessionLocal()
     try:

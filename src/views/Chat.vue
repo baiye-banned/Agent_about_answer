@@ -367,17 +367,36 @@
 
           <el-tab-pane label="记忆管理" name="memory">
             <div class="space-y-3 text-xs leading-5 text-slate-600">
-              <p>滑动窗口：最近 4 轮；摘要触发：完整回答轮数 &gt; 8 且未摘要轮数 &gt;= 4。</p>
+              <p>滑动窗口：最近 4 轮；滑出窗口的完整问答轮次会合并进长期记忆；短期记忆超出 MEMORY_RECENT_MAX_CHARS 时压缩；长期记忆超出 MEMORY_SUMMARY_MAX_CHARS 时二次摘要。</p>
+              <div v-if="memoryFocusVariables.length" class="grid gap-3 lg:grid-cols-2">
+                <div
+                  v-for="variable in memoryFocusVariables"
+                  :key="variable.key"
+                  class="rounded-md border border-brand-100 bg-brand-50/40 p-3"
+                >
+                  <div class="flex items-start justify-between gap-3">
+                    <div>
+                      <p class="text-xs font-medium text-slate-500">{{ variable.label }}</p>
+                      <p class="mt-0.5 font-mono text-[13px] font-semibold text-slate-900">{{ variable.name }}</p>
+                    </div>
+                    <span class="rounded bg-white px-2 py-0.5 text-[11px] text-slate-500">
+                      {{ memoryValueSize(variable.value) }}
+                    </span>
+                  </div>
+                  <p class="mt-2 text-slate-500">{{ variable.description }}</p>
+                  <pre class="mt-3 max-h-72 overflow-auto whitespace-pre-wrap rounded bg-white p-3 text-[12px] leading-5 text-slate-700">{{ formatMemoryValue(variable.value) }}</pre>
+                </div>
+              </div>
               <div
-                v-for="event in memoryEvents"
-                :key="event.index"
+                v-for="variable in memoryVariables"
+                :key="variable.key"
                 class="rounded-md border border-slate-200 bg-white p-3"
               >
-                <p class="font-medium text-slate-800">{{ event.stage }}</p>
-                <p class="mt-1">{{ event.note }}</p>
-                <pre class="mt-2 max-h-56 overflow-auto rounded bg-slate-50 p-2">{{ formatJson(event.creates || event.result || event.params) }}</pre>
+                <p class="font-mono text-[13px] font-semibold text-slate-800">{{ variable.name }}</p>
+                <p class="mt-1 text-slate-500">{{ variable.description }}</p>
+                <pre class="mt-2 max-h-56 overflow-auto whitespace-pre-wrap rounded bg-slate-50 p-2">{{ formatMemoryValue(variable.value) }}</pre>
               </div>
-              <el-empty v-if="!memoryEvents.length" description="暂无记忆事件" />
+              <el-empty v-if="!memoryVariables.length && !memoryFocusVariables.length" description="暂无记忆变量" />
             </div>
           </el-tab-pane>
 
@@ -485,6 +504,47 @@ const retrievalRoutes = computed(() => {
 const memoryEvents = computed(() =>
   traceEvents.value.filter((event) => event.stage?.includes('memory'))
 )
+
+const memoryVariableDescriptions = {
+  recent_text: '短期记忆变量。本轮从 messages 表按最近窗口实时读取并格式化生成，不单独持久化。',
+  'conv.memory_summary': '长期记忆摘要，持久化在 conversations.memory_summary 字段中。',
+  'conv.memory_summary_upto_message_id': '长期记忆已摘要到的消息 ID，避免近期窗口重复包含已摘要消息。',
+  memory_context: '本轮实际注入回答链路的会话记忆，由长期摘要和最近对话窗口拼接生成。',
+  retrieval_question: '结合 memory_context 改写后的检索问题，用于 RAG 检索时消解指代和省略。',
+  memory_used: '本轮是否存在可用的会话记忆上下文。',
+  used_for_retrieval: '本轮检索问题是否因为记忆上下文而不同于原始问题。',
+  window_turns: '近期记忆滑动窗口保留的对话轮数。',
+  summary_length: '当前长期记忆摘要的字符长度。',
+  summary_limit: '长期记忆摘要允许保留的最大字符数。',
+  reason: '本次长期记忆更新或压缩被跳过、失败的原因。',
+  memory_summary: '长期记忆摘要变量，持久化在 conversations.memory_summary 字段中。',
+}
+
+const memoryVariables = computed(() =>
+  memoryEvents.value
+    .flatMap((event) => buildMemoryVariables(event))
+    .filter((variable) => !['recent_text', 'conv.memory_summary'].includes(variable.name))
+)
+
+const memoryFocusVariables = computed(() => {
+  const variables = memoryEvents.value.flatMap((event) => buildMemoryVariables(event))
+  return [
+    {
+      key: 'short-term-recent-text',
+      label: '短期记忆',
+      name: 'recent_text',
+      description: memoryVariableDescriptions.recent_text,
+      value: findLatestMemoryValue(variables, 'recent_text'),
+    },
+    {
+      key: 'long-term-memory-summary',
+      label: '长期记忆',
+      name: 'conv.memory_summary',
+      description: memoryVariableDescriptions['conv.memory_summary'],
+      value: findLatestMemoryValue(variables, 'conv.memory_summary'),
+    },
+  ]
+})
 
 const ragasEvents = computed(() =>
   traceEvents.value.filter((event) => event.stage?.includes('ragas'))
@@ -687,6 +747,58 @@ function formatJson(value) {
   } catch {
     return String(value || '')
   }
+}
+
+function formatMemoryValue(value) {
+  if (value === null || value === undefined || value === '') return '（空）'
+  if (typeof value === 'string') return value
+  return formatJson(value)
+}
+
+function memoryValueSize(value) {
+  if (value === null || value === undefined || value === '') return '0 字'
+  if (typeof value === 'string') return `${value.length} 字`
+  return `${formatJson(value).length} 字`
+}
+
+function findLatestMemoryValue(variables, name) {
+  const variable = [...variables].reverse().find((item) => item.name === name)
+  return variable?.value || ''
+}
+
+function buildMemoryVariables(event) {
+  const variables = []
+  const addGroup = (group, prefix = '') => {
+    if (!group || typeof group !== 'object') return
+    Object.entries(group).forEach(([name, value]) => {
+      const variableName = prefix ? `${prefix}.${name}` : name
+      variables.push({
+        key: `${event.index}-${prefix || 'value'}-${name}`,
+        name: memoryVariableName(variableName),
+        description: memoryVariableDescription(variableName),
+        value,
+      })
+    })
+  }
+
+  addGroup(event.uses, 'uses')
+  addGroup(event.creates, 'creates')
+  addGroup(event.result, 'result')
+  addGroup(event.params, 'params')
+  return variables
+}
+
+function memoryVariableName(name) {
+  const cleanName = name.replace(/^(uses|creates|result|params)\./, '')
+  const nameMap = {
+    memory_summary: 'conv.memory_summary',
+    summary_upto_message_id: 'conv.memory_summary_upto_message_id',
+  }
+  return nameMap[cleanName] || cleanName
+}
+
+function memoryVariableDescription(name) {
+  return memoryVariableDescriptions[memoryVariableName(name)] || '记忆管理链路中的真实运行时变量。'
 }
 
 function formatScore(score) {

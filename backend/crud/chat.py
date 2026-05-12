@@ -2,7 +2,7 @@ import json
 
 from sqlalchemy.orm import Session
 
-from models import ChatTraceSession, Conversation, Message
+from model.models import ChatTraceSession, Conversation, Message
 
 
 def serialize_message(message: Message) -> dict:

@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from services.base.trace_service import list_checkpointer_threads
+from service.trace_service import list_checkpointer_threads
 
 
 router = APIRouter()

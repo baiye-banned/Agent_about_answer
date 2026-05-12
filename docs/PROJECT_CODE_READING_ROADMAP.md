@@ -1,6 +1,6 @@
 # 从 0 读懂这个项目所有代码
 
-> 配套阅读：[PROJECT_ARCHITECTURE_FULL.md](./PROJECT_ARCHITECTURE_FULL.md)  
+> 配套阅读：[PROJECT_ARCHITECTURE_FULL.md](./PROJECT_ARCHITECTURE_FULL.md) / [PROJECT_FLOW_DIAGRAM.md](./PROJECT_FLOW_DIAGRAM.md)  
 > 这份文档不是“源码目录说明”，而是一条学习路线：按一次真实请求的数据流，把前端、后端、数据库、RAG、Trace、RAGAS 串起来读。
 
 ## 0. 先建立正确读法
@@ -27,13 +27,14 @@
 
 ## 1. 全局地图：先看 20 分钟
 
-先打开 `docs/PROJECT_ARCHITECTURE_FULL.md`，只看这些章节：
+先打开 `docs/PROJECT_ARCHITECTURE_FULL.md`，再打开 `docs/PROJECT_FLOW_DIAGRAM.md`，只看这些章节：
 
 1. `总览架构图`
 2. `前端架构图`
 3. `后端架构图`
 4. `数据库 ER 图`
 5. `聊天 SSE、检索、RAGAS 与 Trace`
+6. `PROJECT_FLOW_DIAGRAM.md` 的五条场景流程图
 
 第一遍不要纠结每个函数内部，只要记住：
 
@@ -339,7 +340,7 @@ flowchart TD
 
 ### 4.4 `Learn.vue`
 
-这是学习中心，用来帮助你看懂主流程。
+这是学习中心，用来帮助你看懂主流程和真实 Trace 回放。
 
 重点变量：
 
@@ -351,7 +352,7 @@ flowchart TD
 | `traceIdInput` | 用户输入的 trace_id |
 | `normalizedTrace` | 后端返回的真实 trace |
 
-如果你刚开始读代码，`Learn.vue` 可以当“可视化目录”用，不要先钻它的 UI 细节。
+如果你刚开始读代码，`Learn.vue` 可以当“可视化目录”用，但它展示的是当前真实节点与事件，不是抽象示意图。
 
 ## 5. 第四轮：读后端入口、模型、数据库
 
@@ -360,9 +361,9 @@ flowchart TD
 阅读顺序：
 
 1. `backend/config.py`
-2. `backend/models.py`
-3. `backend/database.py`
-4. `backend/main.py` 的前 500 行
+2. `backend/model/models.py`
+3. `backend/database/session.py`
+4. `backend/main.py` 的入口壳 + `backend/service/*.py` / `backend/rag/*.py`
 
 ### 5.1 `config.py`
 
@@ -418,17 +419,19 @@ erDiagram
 
 ### 5.4 `main.py` 前半部分
 
-先不要读完 2000 行，按路由读。
+先不要读完 2000 行，先看它如何把路由挂到各个业务服务，再回头读 `chat_service.py / knowledge_service.py / vision_service.py`。
 
 | 区域 | 你要看什么 |
 |---|---|
 | `lifespan()` | 启动时做什么 |
+| `app.include_router(...)` | 路由如何汇聚到聊天、知识库、用户、checkpointer |
+| `root()` / `health()` | 基础健康检查 |
 | `create_token()` / `get_current_user()` | 登录鉴权 |
 | `login()` / `logout()` | 登录退出 |
 | `list_conversations()` / `get_messages()` | 会话读取 |
 | `create_knowledge_base()` | 知识库创建 |
 | `upload_chat_attachment()` | 聊天图片上传 |
-| `stream_chat()` | 聊天主入口 |
+| `chat_service.stream_chat()` | 聊天主入口 |
 
 ## 6. 第五轮：读知识库上传链路
 
@@ -449,7 +452,7 @@ sequenceDiagram
   A->>B: FormData
   B->>E: 根据文件类型提取文本
   B->>M: 保存 KnowledgeFile
-  B->>B: _chunk_text()
+  B->>B: chunk_text()
   B->>C: 写入 Chroma
 ```
 
@@ -457,10 +460,10 @@ sequenceDiagram
 
 1. `Knowledge.vue` 的 `handleUpload()`
 2. `knowledgeAPI.upload()`
-3. `backend/main.py` 的 `upload_knowledge()`
-4. `_extract_file_text()`
-5. `_extract_docx_text()` / `_extract_pdf_text()`
-6. `_chunk_text()`
+3. `backend/service/knowledge_service.py` 的 `upload_knowledge()`
+4. `backend/crud/knowledge_file.py` 的 `extract_file_text()`
+5. `extract_docx_text()` / `extract_pdf_text()`
+6. `chunk_text()`
 7. `chroma_client.add_chunks()`
 
 关键变量追踪：
@@ -470,7 +473,7 @@ sequenceDiagram
 | `file` | 用户选择的文件 | `FormData` |
 | `knowledge_base_id` | 当前知识库 ID | 后端绑定文件 |
 | `text` / `content` | 文件提取结果 | `KnowledgeFile.content` |
-| `chunks` | `_chunk_text()` | `add_chunks()` |
+| `chunks` | `chunk_text()` | `add_chunks()` |
 | `file_id` | MySQL 插入后生成 | Chroma metadata |
 
 读完要能回答：
@@ -496,23 +499,25 @@ sequenceDiagram
   participant C as Chat.vue
   participant Store as chatStore
   participant API as streamChat()
-  participant B as stream_chat()
-  participant R as retrieve_knowledge()
-  participant V as query_vectors()
-  participant K as keyword_recall()
+  participant B as chat_service.stream_chat()
+  participant A as langchain_rag.agent.py
+  participant R as langchain_rag.tools.retrieve_knowledge()
+  participant V as chroma_client.query_vectors()
   participant L as DeepSeek
   participant DB as MySQL
 
   C->>Store: sendMessage()
   Store->>API: streamChat()
   API->>B: ChatRequest
-  B->>R: retrieval_question + knowledge_base_id
+  B->>B: _build_effective_question / memory / decide_need_rag
+  B->>A: retrieval_question + knowledge_base_id
+  A->>R: LangChain tool retrieve_knowledge()
   R->>L: build_query_plan()
   R->>V: original / hyde / rewrite routes
-  R->>K: keyword route
+  R->>R: keyword_recall()
   R->>R: rrf_fuse()
   R->>L: rerank_chunks()
-  B->>L: _stream_deepseek_response()
+  B->>L: stream_rag_answer()
   B->>DB: 保存 user / assistant messages
 ```
 
@@ -521,19 +526,22 @@ sequenceDiagram
 1. `Chat.vue` 的 `sendMessage()`
 2. `chatStore.sendMessage()`
 3. `streamChat()`
-4. `backend/main.py` 的 `stream_chat()`
-5. `_build_effective_question()`
-6. `_build_memory_context()`
-7. `retrieve_knowledge()`
-8. `build_query_plan()`
-9. `query_vectors()`
-10. `keyword_recall()`
-11. `rrf_fuse()`
-12. `rerank_chunks()`
-13. `_build_sources()`
-14. `_stream_deepseek_response()`
-15. assistant message 保存逻辑
-16. `schedule_ragas_evaluation()`
+4. `backend/service/chat_service.py` 的 `stream_chat()`
+5. `backend/rag/vision_service.py` 的 `_build_effective_question()`
+6. `backend/rag/memory_service.py` 的 `_build_memory_context()`
+7. `backend/rag/memory_service.py` 的 `_build_memory_aware_retrieval_question()`
+8. `backend/tool/tools.py` 的 `decide_need_rag()`
+9. `backend/agent/agent.py` 的 `agentic_retrieve_knowledge() / create_agent()`
+10. `backend/tool/tools.py` 的 `retrieve_knowledge()`
+11. `backend/tool/tools.py` 的 `build_query_plan()`
+12. `backend/rag/chroma_client.py` 的 `query_vectors()`
+13. `backend/tool/tools.py` 的 `keyword_recall()`
+14. `backend/tool/tools.py` 的 `rrf_fuse()`
+15. `backend/tool/tools.py` 的 `rerank_chunks()`
+16. `backend/service/utils_service.py` 的 `_build_sources()`
+17. `backend/rag/llm_service.py` 的 `stream_rag_answer()`
+18. assistant message 保存逻辑
+19. `schedule_ragas_evaluation()`
 
 最重要的变量：
 
@@ -561,9 +569,9 @@ sequenceDiagram
 
 读：
 
-1. `backend/learning_trace.py`
-2. `backend/main.py` 里的 `_safe_trace_add()`
-3. `stream_chat()` 中所有 `trace.add(...)`
+1. `backend/rag/learning_trace.py`
+2. `backend/service/chat_service.py` 里的 `trace.add(...)`
+3. `chat_service.stream_chat()` 中所有 trace 事件
 4. `src/views/Learn.vue`
 5. `src/views/LearnTracePanel.vue`
 
@@ -612,7 +620,7 @@ flowchart LR
 | `streamContent` | `src/stores/chat.js` | SSE content chunk | Chat 页面正在生成回答 |
 | `streamSources` | `src/stores/chat.js` | SSE sources event | 参考资料按钮 |
 | `streamTrace` | `src/stores/chat.js` | SSE trace event | 流程按钮 / 学习中心 |
-| `retrieval_trace` | `backend/main.py` / `messages` | `retrieve_knowledge()` 返回 | Message 表、Trace 回放 |
+| `retrieval_trace` | `backend/service/chat_service.py` / `messages` | `retrieve_knowledge()` 返回 | Message 表、Trace 回放 |
 | `ragas_status` | `messages` | assistant 保存时 pending，RAGAS 后更新 | RAG Evaluation 面板 |
 | `knowledge_base_id` | 前后端请求体/数据库 | 知识库选择 | 多知识库隔离 |
 
@@ -663,7 +671,7 @@ flowchart LR
 | 第 2 天 | 2 小时 | 看懂 API 封装和三个 Store |
 | 第 3 天 | 2-3 小时 | 看懂 Chat 主页面和 SSE 前端处理 |
 | 第 4 天 | 2 小时 | 看懂 models、database、知识库上传 |
-| 第 5 天 | 3 小时 | 看懂 `stream_chat()` 主链路 |
+| 第 5 天 | 3 小时 | 看懂 `chat_service.stream_chat()` 主链路 |
 | 第 6 天 | 2-3 小时 | 看懂 retrieval、Chroma、关键词增强 |
 | 第 7 天 | 2 小时 | 看懂 Trace、RAGAS、学习中心 |
 
@@ -720,10 +728,14 @@ flowchart TD
   Q["question"] --> CS["Chat.vue sendMessage()"]
   CS --> Store["chatStore.sendMessage()"]
   Store --> Fetch["streamChat() fetch"]
-  Fetch --> Backend["backend stream_chat()"]
+  Fetch --> Backend["chat_service.stream_chat()"]
   Backend --> EQ["_build_effective_question()"]
-  EQ --> RQ["retrieval_question"]
-  RQ --> Retrieve["retrieve_knowledge()"]
+  EQ --> Memory["_build_memory_context()"]
+  Memory --> Gate["decide_need_rag()"]
+  Memory --> RQ["retrieval_question"]
+  Gate --> Agentic["agentic_retrieve_knowledge() / create_agent()"]
+  RQ --> Agentic
+  Agentic --> Retrieve["langchain_rag.tools.retrieve_knowledge()"]
   Retrieve --> Plan["build_query_plan()"]
   Retrieve --> Vector["query_vectors()"]
   Retrieve --> Keyword["keyword_recall()"]
@@ -731,7 +743,7 @@ flowchart TD
   Keyword --> RRF
   RRF --> Rerank["rerank_chunks()"]
   Rerank --> Context["context + sources"]
-  Context --> Model["_stream_deepseek_response()"]
+  Context --> Model["stream_rag_answer()"]
   Model --> SSE["SSE content"]
   SSE --> UI["streamContent"]
   Model --> Save["assistant_message"]
@@ -739,4 +751,3 @@ flowchart TD
 ```
 
 如果这张图你能自己解释清楚，这个项目的主干你就真正掌握了。
-

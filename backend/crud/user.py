@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
 
-from models import User
+from model.models import User
 
 
 def serialize_user_profile(user: User) -> dict:

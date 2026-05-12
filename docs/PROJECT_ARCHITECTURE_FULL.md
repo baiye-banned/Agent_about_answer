@@ -30,17 +30,25 @@ flowchart LR
 
   subgraph Backend["FastAPI 后端"]
     direction TB
-    MainPy["backend/main.py<br/>路由 + 聊天编排 + 上传 + Trace"]
-    DB["backend/database.py<br/>建表 / 迁移 / 默认知识库"]
-    Models["backend/models.py<br/>SQLAlchemy 模型"]
-    Retrieval["backend/retrieval.py<br/>Query plan / Recall / RRF / Rerank"]
-    Chroma["backend/chroma_client.py<br/>向量库 + Embedding"]
-    Ragas["backend/ragas_eval.py<br/>在线 RAGAS"]
-    Trace["backend/learning_trace.py<br/>TraceRecorder"]
-    Checkpointer["backend/checkpointer.py<br/>SQLite checkpoint"]
+    MainPy["backend/main.py<br/>路由注册 / lifespan / CORS / static"]
+    DB["backend/database/session.py<br/>建表 / 迁移 / 默认知识库"]
+    Models["backend/model/models.py<br/>SQLAlchemy 模型"]
+    ChatSvc["backend/service/chat_service.py<br/>聊天编排 / SSE / Trace / RAGAS"]
+    KnowledgeSvc["backend/service/knowledge_service.py<br/>知识库 CRUD / 上传 / 索引"]
+    VisionSvc["backend/rag/vision_service.py<br/>图片分析"]
+    LangChainAgent["backend/agent/agent.py<br/>受限检索规划"]
+    Tool["backend/tool/tools.py<br/>路由判断 / 检索工具 / 重排"]
+    Chroma["backend/rag/chroma_client.py<br/>向量库 + Embedding"]
+    Ragas["backend/rag/ragas_eval.py<br/>在线 RAGAS"]
+    Trace["backend/rag/learning_trace.py<br/>TraceRecorder"]
+    Checkpointer["backend/database/checkpointer.py<br/>SQLite checkpoint"]
     MainPy --> DB
     MainPy --> Models
-    MainPy --> Retrieval
+    MainPy --> ChatSvc
+    MainPy --> KnowledgeSvc
+    MainPy --> VisionSvc
+    MainPy --> LangChainAgent
+    MainPy --> Tool
     MainPy --> Chroma
     MainPy --> Ragas
     MainPy --> Trace
@@ -63,10 +71,19 @@ flowchart LR
 
   APIs --> MainPy
   MainPy --> MySQL
-  Retrieval --> ChromaDB
-  Retrieval --> DeepSeek
+  ChatSvc --> MySQL
+  KnowledgeSvc --> MySQL
+  ChatSvc --> VisionSvc
+  ChatSvc --> LangChainAgent
+  ChatSvc --> Tool
+  LangChainAgent --> Tool
+  KnowledgeSvc --> Chroma
+  Tool --> ChromaDB
+  Tool --> DeepSeek
+  LangChainAgent --> DeepSeek
   Chroma --> DashScope
-  MainPy --> OSS
+  ChatSvc --> OSS
+  VisionSvc --> OSS
   Trace --> MySQL
   Checkpointer --> SQLite
   Ragas --> DeepSeek
@@ -113,6 +130,7 @@ flowchart TD
     FlowSpec["src/views/learnFlowSpec.js<br/>flowSpec / demoPath / branchSpecs"]
     Canvas["src/views/LearnCanvas.vue"]
     TracePanel["src/views/LearnTracePanel.vue"]
+    FlowDoc["docs/PROJECT_FLOW_DIAGRAM.md<br/>五条主线流程图"]
   end
 
   MainJS --> AppVue --> Router --> LayoutVue
@@ -139,6 +157,7 @@ flowchart TD
   Learn --> FlowSpec
   Learn --> Canvas
   Learn --> TracePanel
+  Learn --> FlowDoc
   Learn --> ChatAPI
 ```
 
@@ -156,13 +175,17 @@ flowchart LR
   end
 
   subgraph Core["业务核心"]
-    DB["backend/database.py<br/>init_db / schema migration"]
-    Models["backend/models.py<br/>ORM models"]
-    Retrieval["backend/retrieval.py<br/>build_query_plan / retrieve_knowledge / rerank"]
-    Chroma["backend/chroma_client.py<br/>query_vectors / add_chunks"]
-    Trace["backend/learning_trace.py<br/>TraceRecorder / snapshot"]
-    Ragas["backend/ragas_eval.py<br/>evaluate_message_async"]
-    Checkpointer["backend/checkpointer.py"]
+    DB["backend/database/session.py<br/>init_db / schema migration"]
+    Models["backend/model/models.py<br/>ORM models"]
+    ChatSvc["backend/service/chat_service.py<br/>stream_chat / upload_chat_attachment / trace"]
+    KnowledgeSvc["backend/service/knowledge_service.py<br/>knowledge CRUD / upload / rollback"]
+    VisionSvc["backend/rag/vision_service.py<br/>_build_effective_question / image analysis"]
+    LangChainAgent["backend/agent/agent.py<br/>agentic_retrieve_knowledge / create_agent"]
+    Tool["backend/tool/tools.py<br/>@tool decide_need_rag / retrieve_knowledge / rerank"]
+    Chroma["backend/rag/chroma_client.py<br/>query_vectors / add_chunks"]
+    Trace["backend/rag/learning_trace.py<br/>TraceRecorder / snapshot"]
+    Ragas["backend/rag/ragas_eval.py<br/>evaluate_message_async"]
+    Checkpointer["backend/database/checkpointer.py"]
   end
 
   subgraph Services["外部 / 存储"]
@@ -176,19 +199,27 @@ flowchart LR
 
   Auth --> Models
   User --> Models
-  Chat --> Retrieval
+  Chat --> ChatSvc
+  KB --> KnowledgeSvc
+  Files --> KnowledgeSvc
+  ChatSvc --> VisionSvc
+  ChatSvc --> LangChainAgent
+  ChatSvc --> Tool
+  KnowledgeSvc --> Chroma
+  KnowledgeSvc --> DB
+  LangChainAgent --> Tool
+  Tool --> Chroma
   Chat --> Trace
   Chat --> Ragas
   Chat --> DB
-  KB --> DB
-  Files --> DB
-  Files --> Chroma
   Tools --> Checkpointer
 
   DB --> MySQL
   Models --> MySQL
-  Retrieval --> ChromaDB
-  Retrieval --> DeepSeek
+  ChatSvc --> MySQL
+  KnowledgeSvc --> MySQL
+  Tool --> DeepSeek
+  LangChainAgent --> DeepSeek
   Chroma --> DashScope
   Trace --> MySQL
   Ragas --> DeepSeek
@@ -325,9 +356,11 @@ sequenceDiagram
   participant C as Chat.vue
   participant S as chatStore.sendMessage()
   participant X as streamChat()
-  participant B as FastAPI / stream_chat()
-  participant R as retrieval.py
-  participant V as chroma_client.py
+  participant B as chat_service.stream_chat()
+  participant K as knowledge_service.py
+  participant E as vision_service.py / memory_service.py / langchain_rag.tools.py
+  participant V as langchain_rag.tools.py / chroma_client.py
+  participant A as langchain_rag.agent.py
   participant D as DeepSeek
   participant T as TraceRecorder
   participant M as MySQL
@@ -338,11 +371,11 @@ sequenceDiagram
   S->>X: fetch /api/chat/stream
   X->>B: ChatRequest(conversation_id, knowledge_base_id, question)
   B->>T: TraceRecorder.add(request_received)
-  B->>R: retrieve_knowledge()
-  R->>D: build_query_plan()
-  R->>V: query_vectors()
-  R->>R: keyword_recall / rrf_fuse / rerank_chunks
-  B->>D: _stream_deepseek_response()
+  B->>K: resolve_knowledge_base()
+  B->>E: _build_effective_question() / _build_memory_context() / decide_need_rag()
+  B->>A: agentic_retrieve_knowledge() / create_agent()
+  A->>V: LangChain tool retrieve_knowledge() / query_vectors() / keyword_recall / rrf_fuse / rerank_chunks
+  B->>D: stream_rag_answer() / ChatOpenAI.astream()
   D-->>B: SSE content chunks
   B-->>X: SSE conversation / sources / trace / [DONE]
   B->>M: 保存 assistant_message
@@ -610,6 +643,8 @@ flowchart LR
 | `handleTraceEventSelect()` | 方法 | 时间线点选同步 |
 | `isBranchRelevant()` | 方法 | 分支槽高亮判断 |
 
+> `Learn.vue` 现在是“真实符号回放页”：demo 模式播放 `learnFlowSpec.js` 里的当前链路，trace 模式读取后端真实事件。
+
 ### `src/views/learnFlowSpec.js`
 
 | 符号 | 类型 | 作用 |
@@ -684,7 +719,7 @@ flowchart LR
 | `OSS_*` | 常量 | 阿里云 OSS |
 | `SECRET_KEY` / `ALGORITHM` / `ACCESS_TOKEN_EXPIRE_MINUTES` | 常量 | JWT |
 
-### `backend/models.py`
+### `backend/model/models.py`
 
 | 符号 | 类型 | 作用 |
 |---|---|---|
@@ -696,7 +731,7 @@ flowchart LR
 | `KnowledgeFile` | ORM 模型 | 知识文件表 |
 | `ChatTraceSession` | ORM 模型 | 学习 Trace 会话表 |
 
-### `backend/database.py`
+### `backend/database/session.py`
 
 | 符号 | 类型 | 作用 |
 |---|---|---|
@@ -711,7 +746,7 @@ flowchart LR
 | `_get_mysql_column_info()` | 方法 | 读取 information_schema |
 | `_ensure_default_knowledge_base()` | 方法 | 初始化默认知识库 |
 
-### `backend/chroma_client.py`
+### `backend/rag/chroma_client.py`
 
 | 符号 | 类型 | 作用 |
 |---|---|---|
@@ -728,33 +763,18 @@ flowchart LR
 | `query_vectors()` | 方法 | 向量召回 |
 | `search_knowledge()` | 方法 | 旧接口风格召回 |
 
-### `backend/retrieval.py`
+### `backend/agent + backend/tool + backend/rag`
 
-| 符号 | 类型 | 作用 |
-|---|---|---|
-| `normalize_deepseek_model()` | 方法 | 别名归一化 |
-| `deepseek_chat_url()` | 方法 | 拼接 DeepSeek 接口地址 |
-| `call_deepseek_json()` | 方法 | 调 DeepSeek 返回 JSON |
-| `build_query_plan()` | 方法 | HyDE / rewrites / keywords 规划 |
-| `retrieve_knowledge()` | 方法 | 总检索入口 |
-| `keyword_recall()` | 方法 | 关键词回召 |
-| `rrf_fuse()` | 方法 | 多路结果融合 |
-| `rerank_chunks()` | 方法 | DeepSeek 重排 |
-| `_parse_json_object()` | 方法 | 从模型文本中解析 JSON |
-| `_clean_list()` | 方法 | 清洗字符串数组 |
-| `_fallback_keywords()` | 方法 | 规划失败时兜底关键词 |
-| `_merge_keywords()` | 方法 | 合并模型关键词与兜底关键词 |
-| `_dedupe_keywords()` | 方法 | 去重 |
-| `_expand_keywords()` | 方法 | 扩展关键词 |
-| `_keyword_score()` | 方法 | chunk 关键词打分 |
-| `_has_close_matches()` | 方法 | 判断关键短语是否近邻出现 |
-| `_normalize_for_match()` | 方法 | 匹配归一化 |
-| `_select_final_chunks()` | 方法 | 最终 chunk 选择 |
-| `_split_keyword_chunks()` | 方法 | 按窗口切块 |
-| `_chunk_key()` | 方法 | chunk 去重 key |
-| `_trace_chunk()` | 方法 | 检索 trace 摘要 |
+> LangChain RAG ????????? `agentic_rag.py`?`tool.py`?`retrieval.py`?`rag_gate.py` ??????
 
-### `backend/learning_trace.py`
+| ?? | ?? |
+|---|---|
+| `agent.py` | `create_agent()` ????????? 2 ??? |
+| `tools.py` | LangChain `@tool`??????????????????RRF??? |
+| `chains.py` | ?????????? `stream_rag_answer()` |
+| `llm.py` | `ChatOpenAI`?DeepSeek????????JSON ????????? |
+
+### `backend/rag/learning_trace.py`
 
 | 符号 | 类型 | 作用 |
 |---|---|---|
@@ -774,7 +794,7 @@ flowchart LR
 | `get_trace_snapshot()` | 方法 | 读取 trace |
 | `serialize_trace_session()` | 方法 | 序列化 trace session |
 
-### `backend/ragas_eval.py`
+### `backend/rag/ragas_eval.py`
 
 | 符号 | 类型 | 作用 |
 |---|---|---|
@@ -792,7 +812,7 @@ flowchart LR
 | `_prepare_contexts()` | 方法 | 上下文裁剪 |
 | `_truncate_text()` | 方法 | 文本裁剪 |
 
-### `backend/checkpointer.py`
+### `backend/database/checkpointer.py`
 
 | 符号 | 类型 | 作用 |
 |---|---|---|
@@ -802,7 +822,9 @@ flowchart LR
 | `delete_thread_checkpoints()` | 方法 | 删除线程相关 checkpoint |
 | `list_threads()` | 方法 | 列出 checkpoint 线程 |
 
-### `backend/main.py`
+### `backend/main.py` / `backend/router/*.py`
+
+> `backend/main.py` 负责应用启动、CORS、静态资源和 `include_router`；具体接口处理函数由 `backend/router/*.py` 挂载到 `backend/service/*.py`。
 
 #### 启动与基础依赖
 
@@ -811,10 +833,10 @@ flowchart LR
 | `lifespan()` | 异步生命周期 | 启动时建库 / 索引初始化 |
 | `root()` | 路由 | `/` |
 | `health()` | 路由 | `/health` |
-| `_seed_default_users()` | 方法 | 初始化默认用户 |
-| `_get_default_knowledge_base()` | 方法 | 兜底知识库 |
-| `_resolve_knowledge_base()` | 方法 | 选择知识库 |
-| `_rebuild_existing_knowledge_index()` | 方法 | 重建 Chroma 索引 |
+| `app.include_router(...)` | 调用 | 把认证、用户、聊天、知识库、checkpointer 路由挂进应用 |
+| `init_db()` | 调用 | 初始化表结构与轻量迁移 |
+| `seed_default_users()` | 调用 | 初始化默认用户 |
+| `rebuild_existing_knowledge_index()` | 调用 | 在显式开启配置时重建 Chroma 索引 |
 
 #### 认证与用户
 
@@ -846,13 +868,17 @@ flowchart LR
 | `rename_conversation()` | 路由 | 重命名会话 |
 | `_serialize_message()` | 方法 | 消息序列化 |
 | `_trace_sse_payloads()` | 方法 | Trace SSE payload |
-| `_safe_trace_add()` / `_safe_trace_finish()` / `_safe_trace_attach()` | 方法 | 保护 Trace 的安全封装 |
-| `stream_chat()` | 路由 | `/api/chat/stream` SSE 主链路 |
+| `trace_service._safe_trace_add()` / `_safe_trace_finish()` / `_safe_trace_attach()` | 方法 | 保护 Trace 的安全封装 |
+| `chat_service.stream_chat()` | 路由 | `/api/chat/stream` SSE 主链路 |
 | `_build_memory_context()` | 方法 | 会话记忆上下文 |
 | `_build_memory_aware_retrieval_question()` | 方法 | 记忆增强检索问题 |
-| `_format_recent_memory_messages()` | 方法 | 最近消息格式化 |
-| `_schedule_memory_summary_update()` / `_maybe_update_memory_summary()` | 方法 | 记忆摘要异步更新 |
-| `_format_messages_for_summary()` / `_summarize_conversation_memory()` | 方法 | 记忆摘要生成 |
+| `_format_recent_memory_messages()` / `_summarize_recent_memory()` | 方法 | 最近窗口按轮格式化；超出 `MEMORY_RECENT_MAX_CHARS` 时语义压缩为一条近期记忆 |
+| `_schedule_memory_summary_update()` / `_update_memory_summary_from_sliding_window()` | 方法 | assistant 保存后检查滑窗，滑出窗口的完整问答轮次合并进长期记忆 |
+| `_format_messages_for_summary()` / `_summarize_conversation_memory()` | 方法 | 记忆压缩文本构造与模型摘要 |
+
+> 当前记忆策略：`MEMORY_WINDOW_TURNS` 控制最近窗口大小；assistant 保存后如果窗口发生滑动，滑出的完整问答轮次会合并进长期记忆。短期窗口文本超 `MEMORY_RECENT_MAX_CHARS` 时压缩成一条近期记忆；长期记忆超 `MEMORY_SUMMARY_MAX_CHARS` 时先做二次摘要，摘要失败才兜底裁剪。
+
+> 聊天主逻辑现在主要在 `backend/service/chat_service.py`，`main.py` 负责暴露路由和承接少量入口级依赖。
 
 #### 知识库与知识文件
 
@@ -865,15 +891,17 @@ flowchart LR
 | `rename_knowledge_base()` | 路由 | 重命名知识库 |
 | `delete_knowledge_base()` | 路由 | 删除知识库 |
 | `list_knowledge()` | 路由 | `/api/knowledge` |
-| `upload_knowledge()` | 路由 | `/api/knowledge/upload` |
+| `knowledge_service.upload_knowledge()` | 路由 | `/api/knowledge/upload` |
 | `delete_knowledge()` | 路由 | 删除知识文件 |
 | `get_knowledge_detail()` | 路由 | 知识文件详情 |
 | `get_knowledge_content()` | 路由 | 文件内容预览 |
-| `_extract_file_text()` | 方法 | 总提取入口 |
-| `_extract_docx_text()` | 方法 | DOCX 提取 |
-| `_extract_pdf_text()` | 方法 | PDF 提取 |
-| `_knowledge_file_save_error_message()` | 方法 | 知识文件保存错误文案 |
-| `_chunk_text()` | 方法 | 切块 |
+| `extract_file_text()` | 方法 | 总提取入口 |
+| `extract_docx_text()` | 方法 | DOCX 提取 |
+| `extract_pdf_text()` | 方法 | PDF 提取 |
+| `knowledge_file_save_error_message()` | 方法 | 知识文件保存错误文案 |
+| `chunk_text()` | 方法 | 切块 |
+
+> 知识库 CRUD 与上传回滚逻辑已经下沉到 `backend/service/knowledge_service.py` 和 `backend/crud/knowledge_file.py`。
 
 #### OSS、图片与模型回退
 
@@ -885,12 +913,14 @@ flowchart LR
 | `_build_effective_question()` | 方法 | question + 图片描述 |
 | `_analyze_image_attachments()` | 方法 | 图片分析编排 |
 | `_image_analysis_prompts()` / `_request_image_description()` / `_classify_image_analysis()` | 方法 | 视觉分析 |
-| `_stream_deepseek_response()` | 方法 | 模型流式回答 |
+| `stream_rag_answer()` | 方法 | 模型流式回答 |
 | `_stream_text_fallback_response()` | 方法 | 文本兜底 |
 | `_stream_openai_chat_chunks()` | 方法 | OpenAI 兼容流读取 |
 | `_should_use_text_fallback()` | 方法 | 是否走兜底 |
 | `_text_fallback_error_message()` / `_model_missing_error()` / `_model_error_message()` | 方法 | 模型异常文案 |
 | `_build_image_urls()` | 方法 | 附件 URL 提取 |
+
+> 图片预处理主要在 `backend/rag/vision_service.py`，`main.py` 只保留路由入口和编排调用。
 
 #### Trace / 评估 / 工具
 
@@ -904,8 +934,8 @@ flowchart LR
 
 1. 先找页面入口：`src/main.js -> src/App.vue -> src/router/index.js -> src/views/Layout.vue`。
 2. 再看状态流：`src/stores/*.js` 负责数据，`src/api/*.js` 负责请求。
-3. 再回到后端：`backend/main.py` 是所有 HTTP 入口，业务细节分散到 `retrieval.py / chroma_client.py / ragas_eval.py / learning_trace.py`。
-4. 看数据库时，优先对照 `backend/models.py`，再回看 `database.py` 的字符集迁移逻辑。
+3. 再回到后端：`backend/main.py` 主要负责路由汇聚和启动，业务细节分散到 `service/*.py`、`rag/*.py`、`agent/tool/rag/tools.py`、`chroma_client.py`、`ragas_eval.py`、`learning_trace.py`。
+4. 看数据库时，优先对照 `backend/model/models.py`，再回看 `database.py` 的字符集迁移逻辑。
 
 ## 10. 一句话总结
 

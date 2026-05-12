@@ -4,7 +4,7 @@ from fastapi import HTTPException
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from models import KnowledgeFile
+from model.models import KnowledgeFile
 
 
 def serialize_knowledge_file(file_entry: KnowledgeFile) -> dict:

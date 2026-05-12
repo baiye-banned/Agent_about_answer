@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
 
-from models import Conversation, KnowledgeBase, KnowledgeFile
+from model.models import Conversation, KnowledgeBase, KnowledgeFile
 
 
 def serialize_knowledge_base(item: KnowledgeBase) -> dict:

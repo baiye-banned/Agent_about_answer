@@ -1,120 +1,77 @@
-from dataclasses import dataclass
-import inspect
+from __future__ import annotations
+
 import json
 import re
-from typing import Any, Callable
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Any
 
-import httpx
+from langchain.tools import tool
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from chroma_client import embedding_backend_status, query_vectors
-from config import (
-    DEEPSEEK_API_KEY,
-    DEEPSEEK_BASE_URL,
-    DEEPSEEK_MODEL,
-    RETRIEVAL_RERANK_TOP_N,
-    RETRIEVAL_ROUTE_TOP_K,
-    TEXT_FALLBACK_API_KEY,
-    TEXT_FALLBACK_BASE_URL,
-    TEXT_FALLBACK_MODEL,
-)
-from models import KnowledgeFile
+from rag.chroma_client import embedding_backend_status, query_vectors
+from config import RETRIEVAL_RERANK_TOP_N, RETRIEVAL_ROUTE_TOP_K
+from model.models import KnowledgeFile
+from rag.llm import call_chat_json, call_router_json
 
 
 ROUTE_CONFIDENCE_THRESHOLD = 0.55
 ROUTE_TIMEOUT_SECONDS = 20
-DEEPSEEK_TIMEOUT_SECONDS = 60
 
 
-@dataclass(frozen=True)
-class ToolSpec:
-    name: str
-    description: str
-    func: Callable[..., Any]
+@dataclass
+class RetrievalRuntime:
+    db: Session
+    knowledge_base_id: int
+    trace_recorder: Any = None
 
 
-_TOOL_REGISTRY: dict[str, ToolSpec] = {}
+class RAGDecisionInput(BaseModel):
+    question: str
+    memory_context: str = ""
+    knowledge_base_name: str = ""
+    attachments: list[dict] = Field(default_factory=list)
 
 
-def tool(name: str | None = None, description: str = ""):
-    def decorator(func: Callable[..., Any]):
-        spec = ToolSpec(
-            name=name or func.__name__,
-            description=description or (func.__doc__ or "").strip(),
-            func=func,
-        )
-        _TOOL_REGISTRY[spec.name] = spec
-        setattr(func, "__tool_spec__", spec)
-        return func
-
-    return decorator
+class QueryPlanInput(BaseModel):
+    question: str
 
 
-def get_tool(name: str) -> ToolSpec:
-    return _TOOL_REGISTRY[name]
+class RetrieveKnowledgeInput(BaseModel):
+    question: str
 
 
-def list_tools() -> list[ToolSpec]:
-    return list(_TOOL_REGISTRY.values())
+class KeywordRecallInput(BaseModel):
+    keywords: list[str]
+    top_k: int = RETRIEVAL_ROUTE_TOP_K
 
 
-async def call_tool(name: str, *args, **kwargs):
-    result = get_tool(name).func(*args, **kwargs)
-    if inspect.isawaitable(result):
-        return await result
-    return result
+class RerankInput(BaseModel):
+    question: str
+    chunks: list[dict]
 
 
-def normalize_deepseek_model(model: str) -> str:
-    aliases = {
-        "deepseekv4flash": "deepseek-v4-flash",
-        "deepseekv4pro": "deepseek-v4-pro",
-    }
-    return aliases.get((model or "").lower(), model)
+@tool("decide_need_rag", args_schema=RAGDecisionInput)
+async def decide_need_rag_tool(
+    question: str,
+    memory_context: str = "",
+    knowledge_base_name: str = "",
+    attachments: list[dict] | None = None,
+) -> str:
+    """Decide whether a user question should use enterprise knowledge-base retrieval."""
+    return json.dumps(
+        await decide_need_rag(question, memory_context, knowledge_base_name, attachments or []),
+        ensure_ascii=False,
+    )
 
 
-def deepseek_chat_url() -> str:
-    base_url = (DEEPSEEK_BASE_URL or "").rstrip("/")
-    if base_url.endswith("/v1"):
-        return f"{base_url}/chat/completions"
-    return f"{base_url}/v1/chat/completions"
-
-
-async def call_deepseek_json(system_prompt: str, user_prompt: str, max_tokens: int = 800) -> dict:
-    if not DEEPSEEK_API_KEY:
-        raise RuntimeError("DeepSeek API Key 未配置")
-
-    payload = {
-        "model": normalize_deepseek_model(DEEPSEEK_MODEL),
-        "stream": False,
-        "temperature": 0.1,
-        "max_tokens": max_tokens,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    async with httpx.AsyncClient(timeout=DEEPSEEK_TIMEOUT_SECONDS) as client:
-        response = await client.post(deepseek_chat_url(), json=payload, headers=headers)
-    if response.status_code >= 400:
-        raise RuntimeError(f"DeepSeek 调用失败: {response.status_code} {response.text[:200]}")
-
-    content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-    return _parse_json_object(content)
-
-
-@tool(name="decide_need_rag")
 async def decide_need_rag(
     question: str,
     memory_context: str = "",
     knowledge_base_name: str = "",
     attachments: list[dict] | None = None,
 ) -> dict:
-    """Use a lightweight model to decide whether this turn needs RAG."""
     attachments = attachments or []
     payload = {
         "question": (question or "").strip(),
@@ -122,111 +79,19 @@ async def decide_need_rag(
         "knowledge_base_name": knowledge_base_name or "",
         "attachments_count": len(attachments),
     }
-
-    if not TEXT_FALLBACK_API_KEY:
-        return _fallback_decision("路由模型未配置 API Key，保守进入 RAG。")
-
     try:
-        data = await _call_router_model(payload)
+        data = await call_router_json(payload)
         return _normalize_decision(data)
     except Exception as exc:
         return _fallback_decision(f"路由模型调用失败，保守进入 RAG：{exc}")
 
 
-async def _call_router_model(payload: dict) -> dict:
-    system_prompt = (
-        "你是企业知识库 RAG 路由器，只判断当前问题是否需要检索企业知识库。"
-        "只输出 JSON，不要输出 Markdown。字段必须是："
-        "need_rag(boolean), route(string: rag/direct), confidence(number:0-1), "
-        "reason(string), source(string)。"
-        "判断规则："
-        "1. 如果问题询问公司制度、规章、流程、文件、知识库、上传资料、PDF/DOCX 内容，need_rag=true。"
-        "2. 如果问题依赖前文已经检索出的制度/文件内容，比如“刚才那条制度在哪个文件里”，need_rag=true。"
-        "3. 如果只是数学、常识、闲聊、翻译、润色、代码解释，或询问当前会话本身，例如“我们之前进行了多少轮会话”，need_rag=false。"
-        "4. 图片附件已经被转成文本；如果只需要根据图片描述回答，不需要知识库，need_rag=false。"
-        "5. 只要不确定，need_rag=true，避免漏掉企业知识库问题。"
-    )
-    user_prompt = json.dumps(payload, ensure_ascii=False)
-    request_body = {
-        "model": TEXT_FALLBACK_MODEL,
-        "stream": False,
-        "temperature": 0,
-        "max_tokens": 300,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {TEXT_FALLBACK_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    async with httpx.AsyncClient(timeout=ROUTE_TIMEOUT_SECONDS) as client:
-        response = await client.post(
-            _openai_chat_url(TEXT_FALLBACK_BASE_URL),
-            json=request_body,
-            headers=headers,
-        )
-    if response.status_code >= 400:
-        raise RuntimeError(f"{response.status_code} {response.text[:200]}")
-
-    content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-    return _parse_json_object(content)
+@tool("build_query_plan", args_schema=QueryPlanInput)
+async def build_query_plan_tool(question: str) -> str:
+    """Build HyDE, rewrite, and keyword search plan for retrieval."""
+    return json.dumps(await build_query_plan(question), ensure_ascii=False)
 
 
-def _normalize_decision(data: dict) -> dict:
-    if not isinstance(data, dict) or "need_rag" not in data:
-        return _fallback_decision("路由模型未返回有效 JSON，保守进入 RAG。")
-
-    need_rag = _to_bool(data.get("need_rag"))
-    confidence = _to_confidence(data.get("confidence"))
-    reason = str(data.get("reason") or "").strip() or "路由模型已完成判断。"
-
-    if need_rag is None:
-        return _fallback_decision("路由模型缺少 need_rag 布尔值，保守进入 RAG。")
-    if confidence < ROUTE_CONFIDENCE_THRESHOLD:
-        return _fallback_decision(f"路由模型置信度过低（{confidence:.2f}），保守进入 RAG。")
-
-    return {
-        "need_rag": need_rag,
-        "route": "rag" if need_rag else "direct",
-        "confidence": confidence,
-        "reason": reason,
-        "source": "model",
-    }
-
-
-def _fallback_decision(reason: str) -> dict:
-    return {
-        "need_rag": True,
-        "route": "rag",
-        "confidence": 0.0,
-        "reason": reason,
-        "source": "fallback",
-    }
-
-
-def _to_bool(value) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"true", "yes", "1", "rag"}:
-            return True
-        if normalized in {"false", "no", "0", "direct"}:
-            return False
-    return None
-
-
-def _to_confidence(value) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    return max(0.0, min(1.0, number))
-
-
-@tool(name="build_query_plan")
 async def build_query_plan(question: str) -> dict:
     system_prompt = (
         "你是企业知识库 RAG 检索规划器。只输出 JSON，不要输出 Markdown。"
@@ -240,7 +105,7 @@ async def build_query_plan(question: str) -> dict:
         f"\n\n用户问题：{question}"
     )
     try:
-        data = await call_deepseek_json(system_prompt, user_prompt)
+        data = await call_chat_json(system_prompt, user_prompt)
     except Exception as exc:
         return {
             "hyde_document": "",
@@ -248,7 +113,6 @@ async def build_query_plan(question: str) -> dict:
             "keywords": _fallback_keywords(question),
             "error": str(exc),
         }
-
     return {
         "hyde_document": str(data.get("hyde_document") or "").strip(),
         "rewrites": _clean_list(data.get("rewrites"))[:3],
@@ -257,8 +121,38 @@ async def build_query_plan(question: str) -> dict:
     }
 
 
-@tool(name="retrieve_knowledge")
-async def retrieve_knowledge(question: str, knowledge_base_id: int, db: Session) -> tuple[list[dict], dict]:
+@tool("retrieve_knowledge", args_schema=RetrieveKnowledgeInput)
+async def retrieve_knowledge_tool(question: str) -> str:
+    """Retrieve relevant chunks from the current runtime knowledge base."""
+    runtime = _runtime()
+    chunks, trace = await retrieve_knowledge(question, runtime.knowledge_base_id, runtime.db, runtime.trace_recorder)
+    return json.dumps(
+        {
+            "chunks_count": len(chunks),
+            "top_chunks": [_trace_chunk(item) for item in chunks[:5]],
+            "trace": {
+                "query_plan": trace.get("query_plan", {}),
+                "routes_count": len(trace.get("routes") or []),
+                "rerank": trace.get("rerank", {}),
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
+async def retrieve_knowledge(
+    question: str,
+    knowledge_base_id: int,
+    db: Session,
+    trace_recorder: Any = None,
+) -> tuple[list[dict], dict]:
+    _trace_add(
+        trace_recorder,
+        "langchain_tool_called",
+        "retrieve_knowledge",
+        params={"question": question, "knowledge_base_id": knowledge_base_id},
+        note="LangChain Agent 调用 retrieve_knowledge 工具，进入多路召回、融合和重排。",
+    )
     query_plan = await build_query_plan(question)
     trace = {
         "embedding": embedding_backend_status(),
@@ -293,12 +187,7 @@ async def retrieve_knowledge(question: str, knowledge_base_id: int, db: Session)
         )
 
     keyword_terms = _merge_keywords(query_plan.get("keywords") or [], question)
-    keyword_chunks = keyword_recall(
-        db,
-        knowledge_base_id=knowledge_base_id,
-        keywords=keyword_terms,
-        top_k=RETRIEVAL_ROUTE_TOP_K,
-    )
+    keyword_chunks = keyword_recall(db, knowledge_base_id, keyword_terms, RETRIEVAL_ROUTE_TOP_K)
     route_results.append(("keyword", keyword_chunks))
     trace["routes"].append(
         {
@@ -314,15 +203,34 @@ async def retrieve_knowledge(question: str, knowledge_base_id: int, db: Session)
     reranked, rerank_trace = await rerank_chunks(question, fused[:12])
     trace["rerank"] = rerank_trace
     final_chunks = _select_final_chunks(reranked or fused, keyword_chunks)
+    _trace_add(
+        trace_recorder,
+        "langchain_retriever_done",
+        "retrieve_knowledge",
+        creates={
+            "query_plan": query_plan,
+            "routes": trace["routes"],
+            "rrf": trace["rrf"],
+            "rerank": rerank_trace,
+        },
+        result={"final_chunks_count": len(final_chunks)},
+        note="LangChain 检索工具完成，最终 chunk 会进入回答生成链。",
+    )
     return final_chunks, trace
 
 
-@tool(name="keyword_recall")
+@tool("keyword_recall", args_schema=KeywordRecallInput)
+def keyword_recall_tool(keywords: list[str], top_k: int = RETRIEVAL_ROUTE_TOP_K) -> str:
+    """Recall text chunks by keyword from the current runtime knowledge base."""
+    runtime = _runtime()
+    chunks = keyword_recall(runtime.db, runtime.knowledge_base_id, keywords, top_k)
+    return json.dumps({"chunks": [_trace_chunk(item) for item in chunks]}, ensure_ascii=False)
+
+
 def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top_k: int) -> list[dict]:
     clean_keywords = _expand_keywords(keywords)
     if not clean_keywords:
         return []
-
     candidates = []
     files = db.query(KnowledgeFile).filter_by(knowledge_base_id=knowledge_base_id).all()
     for file_entry in files:
@@ -349,7 +257,13 @@ def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top
     return candidates[:top_k]
 
 
-@tool(name="rrf_fuse")
+@tool("rrf_fuse")
+def rrf_fuse_tool(route_results_json: str, k: int = 60) -> str:
+    """Fuse multiple retrieval routes with reciprocal rank fusion."""
+    route_results = json.loads(route_results_json)
+    return json.dumps({"chunks": rrf_fuse(route_results, k)}, ensure_ascii=False)
+
+
 def rrf_fuse(route_results: list[tuple[str, list[dict]]], k: int = 60) -> list[dict]:
     fused: dict[str, dict] = {}
     for route, chunks in route_results:
@@ -361,11 +275,16 @@ def rrf_fuse(route_results: list[tuple[str, list[dict]]], k: int = 60) -> list[d
     return sorted(fused.values(), key=lambda item: item["rrf_score"], reverse=True)
 
 
-@tool(name="rerank_chunks")
+@tool("rerank_chunks", args_schema=RerankInput)
+async def rerank_chunks_tool(question: str, chunks: list[dict]) -> str:
+    """Rerank retrieved chunks against the user question."""
+    reranked, trace = await rerank_chunks(question, chunks)
+    return json.dumps({"chunks": [_trace_chunk(item) for item in reranked], "trace": trace}, ensure_ascii=False)
+
+
 async def rerank_chunks(question: str, chunks: list[dict]) -> tuple[list[dict], dict]:
     if not chunks:
         return [], {"status": "skipped", "items": []}
-
     compact_candidates = [
         {
             "id": index,
@@ -388,7 +307,7 @@ async def rerank_chunks(question: str, chunks: list[dict]) -> tuple[list[dict], 
         ensure_ascii=False,
     )
     try:
-        data = await call_deepseek_json(system_prompt, user_prompt, max_tokens=1200)
+        data = await call_chat_json(system_prompt, user_prompt, max_tokens=1200)
         rows = data.get("results") or []
         by_id = {index: chunk for index, chunk in enumerate(chunks, start=1)}
         reranked = []
@@ -408,22 +327,86 @@ async def rerank_chunks(question: str, chunks: list[dict]) -> tuple[list[dict], 
         return [], {"status": "failed", "error": str(exc), "items": []}
 
 
-def _parse_json_object(content: str) -> dict:
-    content = (content or "").strip()
-    if content.startswith("```"):
-        content = re.sub(r"^```(?:json)?", "", content).strip()
-        content = re.sub(r"```$", "", content).strip()
-    match = re.search(r"\{.*\}", content, flags=re.S)
-    if match:
-        content = match.group(0)
-    return json.loads(content)
+LANGCHAIN_RETRIEVAL_TOOLS = [
+    retrieve_knowledge_tool,
+    build_query_plan_tool,
+    keyword_recall_tool,
+    rrf_fuse_tool,
+    rerank_chunks_tool,
+]
+
+_CURRENT_RUNTIME: ContextVar[RetrievalRuntime | None] = ContextVar("langchain_retrieval_runtime", default=None)
 
 
-def _openai_chat_url(base_url: str) -> str:
-    base_url = (base_url or "").rstrip("/")
-    if base_url.endswith("/v1"):
-        return f"{base_url}/chat/completions"
-    return f"{base_url}/v1/chat/completions"
+class retrieval_runtime:
+    def __init__(self, db: Session, knowledge_base_id: int, trace_recorder: Any = None):
+        self.next_runtime = RetrievalRuntime(db=db, knowledge_base_id=knowledge_base_id, trace_recorder=trace_recorder)
+        self.token = None
+
+    def __enter__(self):
+        self.token = _CURRENT_RUNTIME.set(self.next_runtime)
+        return self.next_runtime
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.token is not None:
+            _CURRENT_RUNTIME.reset(self.token)
+        return False
+
+
+def _runtime() -> RetrievalRuntime:
+    runtime = _CURRENT_RUNTIME.get()
+    if runtime is None:
+        raise RuntimeError("LangChain retrieval runtime is not initialized")
+    return runtime
+
+
+def _normalize_decision(data: dict) -> dict:
+    if not isinstance(data, dict) or "need_rag" not in data:
+        return _fallback_decision("路由模型未返回有效 JSON，保守进入 RAG。")
+    need_rag = _to_bool(data.get("need_rag"))
+    confidence = _to_confidence(data.get("confidence"))
+    reason = str(data.get("reason") or "").strip() or "路由模型已完成判断。"
+    if need_rag is None:
+        return _fallback_decision("路由模型缺少 need_rag 布尔值，保守进入 RAG。")
+    if confidence < ROUTE_CONFIDENCE_THRESHOLD:
+        return _fallback_decision(f"路由模型置信度过低（{confidence:.2f}），保守进入 RAG。")
+    return {
+        "need_rag": need_rag,
+        "route": "rag" if need_rag else "direct",
+        "confidence": confidence,
+        "reason": reason,
+        "source": "langchain_model",
+    }
+
+
+def _fallback_decision(reason: str) -> dict:
+    return {
+        "need_rag": True,
+        "route": "rag",
+        "confidence": 0.0,
+        "reason": reason,
+        "source": "fallback",
+    }
+
+
+def _to_bool(value) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1", "rag"}:
+            return True
+        if normalized in {"false", "no", "0", "direct"}:
+            return False
+    return None
+
+
+def _to_confidence(value) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, number))
 
 
 def _clip(value: str, max_chars: int) -> str:
@@ -442,13 +425,8 @@ def _clean_list(value) -> list[str]:
 def _fallback_keywords(question: str) -> list[str]:
     text = question or ""
     keywords: list[str] = []
-
-    numeric_phrases = re.findall(
-        r"\d+\s*(?:分钟|元|次|天|小时)(?:以内|以上|以下|内|外)?",
-        text,
-    )
+    numeric_phrases = re.findall(r"\d+\s*(?:分钟|元|次|天|小时)(?:以内|以上|以下|内|外)?", text)
     keywords.extend(numeric_phrases)
-
     policy_terms = [
         "考勤",
         "迟到",
@@ -460,26 +438,18 @@ def _fallback_keywords(question: str) -> list[str]:
         "分钟",
         "以内",
         "以上",
-        "一次",
-        "二次",
-        "三次",
-        "月累计",
-        "降职",
-        "离职",
-        "请假",
-        "工资",
-        "加班",
-        "报销",
         "制度",
         "规定",
+        "流程",
+        "报销",
+        "请假",
+        "加班",
     ]
     keywords.extend(term for term in policy_terms if term in text)
-
     for token in re.findall(r"[\u4e00-\u9fffA-Za-z0-9_]{2,}", text):
         keywords.append(token)
         if re.search(r"[\u4e00-\u9fff]", token) and not re.search(r"\d", token) and len(token) <= 8:
             keywords.extend(token[index : index + 2] for index in range(0, max(len(token) - 1, 0)))
-
     return _dedupe_keywords(keywords)[:24]
 
 
@@ -507,10 +477,7 @@ def _expand_keywords(keywords: list[str]) -> list[str]:
         if not value:
             continue
         expanded.append(value)
-        for phrase in re.findall(
-            r"\d+\s*(?:分钟|元|次|天|小时)(?:以内|以上|以下|内|外)?",
-            value,
-        ):
+        for phrase in re.findall(r"\d+\s*(?:分钟|元|次|天|小时)(?:以内|以上|以下|内|外)?", value):
             expanded.append(phrase)
         if re.search(r"[\u4e00-\u9fff]", value) and not re.search(r"\d", value) and 2 < len(value) <= 8:
             expanded.extend(value[index : index + 2] for index in range(0, len(value) - 1))
@@ -537,7 +504,6 @@ def _keyword_score(content: str, keywords: list[str]) -> float:
             weight += 4.0
         score += count * weight
         matched_positions.append(normalized_content.find(normalized_keyword))
-
     if any(term in normalized_content for term in ("考勤", "上下班")):
         score += 6.0
     if "迟到" in normalized_content and "早退" in normalized_content:
@@ -546,7 +512,6 @@ def _keyword_score(content: str, keywords: list[str]) -> float:
         score += 10.0
     if "罚款50元" in normalized_content or "罚款200元" in normalized_content:
         score += 10.0
-
     unique_hits = len({pos for pos in matched_positions if pos >= 0})
     score += unique_hits * 1.5
     if _has_close_matches(normalized_content, keywords):
@@ -575,15 +540,12 @@ def _normalize_for_match(text: str) -> str:
 
 def _select_final_chunks(ranked_chunks: list[dict], keyword_chunks: list[dict]) -> list[dict]:
     selected = list(ranked_chunks[:RETRIEVAL_RERANK_TOP_N])
-    if not keyword_chunks:
-        return selected
-
-    best_keyword = keyword_chunks[0]
-    best_score = float(best_keyword.get("keyword_score") or 0)
-    already_selected = any(_chunk_key(chunk) == _chunk_key(best_keyword) for chunk in selected)
-    if best_score >= 10 and not already_selected:
-        selected = [best_keyword, *selected]
-
+    if keyword_chunks:
+        best_keyword = keyword_chunks[0]
+        best_score = float(best_keyword.get("keyword_score") or 0)
+        already_selected = any(_chunk_key(chunk) == _chunk_key(best_keyword) for chunk in selected)
+        if best_score >= 10 and not already_selected:
+            selected = [best_keyword, *selected]
     deduped = []
     seen = set()
     for chunk in selected:
@@ -624,19 +586,10 @@ def _trace_chunk(chunk: dict) -> dict:
     }
 
 
-__all__ = [
-    "ToolSpec",
-    "tool",
-    "get_tool",
-    "list_tools",
-    "call_tool",
-    "normalize_deepseek_model",
-    "deepseek_chat_url",
-    "call_deepseek_json",
-    "decide_need_rag",
-    "build_query_plan",
-    "retrieve_knowledge",
-    "keyword_recall",
-    "rrf_fuse",
-    "rerank_chunks",
-]
+def _trace_add(trace_recorder: Any, *args, **kwargs) -> None:
+    if not trace_recorder:
+        return
+    try:
+        trace_recorder.add(*args, **kwargs)
+    except Exception:
+        pass

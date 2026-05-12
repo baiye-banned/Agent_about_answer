@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from services.business.knowledge_service import (
+from service.knowledge_service import (
     create_knowledge_base,
     delete_knowledge,
     delete_knowledge_base,

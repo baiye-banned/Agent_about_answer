@@ -5,7 +5,7 @@ from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
-from database import Base
+from database.session import Base
 
 
 def _new_id() -> str:

@@ -9,27 +9,29 @@ from fastapi import Depends, File, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from checkpointer import delete_thread_checkpoints
+from database.checkpointer import delete_thread_checkpoints
+from config import MEMORY_WINDOW_TURNS
 from crud import chat as crud_chat
-from database import SessionLocal, get_db
-from learning_trace import TraceRecorder, compact_trace_reference, summarize_messages, summarize_text
-from models import Conversation, Message, User, _new_id
-from ragas_eval import schedule_ragas_evaluation
-from schemas import ChatRequest, RenameRequest
-from services.base.auth_service import decode_token, get_current_user
-from services.base.oss_service import _public_oss_url, _put_oss_object
-from services.base.trace_service import _safe_trace_add, _safe_trace_attach, _safe_trace_finish, _trace_sse_payloads
-from services.base.utils_service import _build_sources
-from services.business.knowledge_service import agentic_retrieve_knowledge, resolve_knowledge_base
-from services.engine.llm_service import _stream_deepseek_response
-from services.engine.memory_service import (
+from database.session import SessionLocal, get_db
+from rag.learning_trace import TraceRecorder, compact_trace_reference, summarize_messages, summarize_text
+from model.models import Conversation, Message, User, _new_id
+from rag.ragas_eval import schedule_ragas_evaluation
+from schema.schemas import ChatRequest, RenameRequest
+from service.auth_service import decode_token, get_current_user
+from service.oss_service import _public_oss_url, _put_oss_object
+from service.trace_service import _safe_trace_add, _safe_trace_attach, _safe_trace_finish, _trace_sse_payloads
+from service.utils_service import _build_sources
+from service.knowledge_service import agentic_retrieve_knowledge, resolve_knowledge_base
+from rag.memory_service import (
     _build_memory_aware_retrieval_question,
     _build_memory_context,
+    _build_recent_memory_text,
     _schedule_memory_summary_update,
 )
-from services.engine.vision_service import _build_effective_question
-from tool import decide_need_rag
-from chroma_client import embedding_backend_status
+from rag.vision_service import _build_effective_question
+from rag.chroma_client import embedding_backend_status
+from rag.chains import stream_rag_answer
+from tool.tools import decide_need_rag
 
 
 logger = logging.getLogger(__name__)
@@ -251,10 +253,17 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             note="用户消息先写入数据库，后面的滑动窗口会排除这条当前消息，避免重复塞进 prompt。",
         )
 
+        recent_text = await _build_recent_memory_text(
+            db,
+            conv,
+            current_message_id=user_message.id,
+            trace_id=trace.trace_id,
+        )
         memory_context = _build_memory_context(
             db,
             conv,
             current_message_id=user_message.id,
+            recent_text=recent_text,
         )
         retrieval_question = _build_memory_aware_retrieval_question(effective_question, memory_context)
         trace.add(
@@ -266,6 +275,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 "summary_upto_message_id": conv.memory_summary_upto_message_id or 0,
             },
             creates={
+                "recent_text": recent_text,
                 "memory_context": memory_context,
                 "retrieval_question": retrieval_question,
             },
@@ -359,7 +369,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 retrieval_trace["image_description"] = image_analysis.get("description", "")
             trace.add(
                 "retrieval_completed",
-                "agentic_retrieve_knowledge",
+                "langchain_agentic_retrieve_knowledge",
                 params={"question": retrieval_question, "knowledge_base_id": knowledge_base.id},
                 creates={
                     "query_plan": retrieval_trace.get("query_plan", {}),
@@ -369,7 +379,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                     "agent": retrieval_trace.get("agent", {}),
                 },
                 result={"final_chunks_count": len(knowledge_chunks)},
-                note="AgenticRAG retrieval completed with bounded planning, tool calls, and selected context.",
+                note="LangChain Agent retrieval completed with bounded planning, tool calls, and selected context.",
             )
             if knowledge_chunks:
                 context = "\n\n".join(
@@ -435,7 +445,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 yield f"data: {data}\n\n"
             trace.add(
                 "generation_started",
-                "_stream_deepseek_response",
+                "stream_rag_answer",
                 params={
                     "question": effective_question,
                     "memory_context": memory_context,
@@ -450,7 +460,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             )
             for payload in _trace_sse_payloads(trace):
                 yield payload
-            async for event in _stream_deepseek_response(
+            async for event in stream_rag_answer(
                 effective_question,
                 context,
                 memory_context,
@@ -591,19 +601,19 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                         _schedule_memory_summary_update(cid, trace.trace_id)
                         _safe_trace_add(
                             trace,
-                            "memory_summary_check_scheduled",
+                            "memory_summary_update_scheduled",
                             "_schedule_memory_summary_update",
                             params={"conversation_id": cid},
-                            note="系统异步检查是否满足摘要压缩条件：完整回答轮数超过 8 且未摘要轮数至少 4。",
+                            note="系统异步检查长期记忆是否超过上限，若超过则进行二次摘要。",
                         )
                     except Exception as exc:
                         logger.warning("Memory summary schedule failed after stream finished: %s", exc, exc_info=True)
                         _safe_trace_add(
                             trace,
-                            "memory_summary_schedule_failed",
+                            "memory_summary_update_schedule_failed",
                             "_schedule_memory_summary_update",
                             result={"error": str(exc)},
-                            note="摘要调度失败，但不影响主回答完成。",
+                            note="长期记忆压缩调度失败，但不影响主回答完成。",
                         )
                     try:
                         retrieval_trace["learning_trace"] = compact_trace_reference(trace.snapshot())

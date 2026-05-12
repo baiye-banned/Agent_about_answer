@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 
-from services.base.trace_service import get_chat_trace, get_message_trace
-from services.business.chat_service import (
+from service.trace_service import get_chat_trace, get_message_trace
+from service.chat_service import (
     delete_conversation,
     get_messages,
     list_conversations,

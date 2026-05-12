@@ -19,10 +19,10 @@ from config import (
     RAGAS_METRIC_TIMEOUT_SECONDS,
     RAGAS_TIMEOUT_SECONDS,
 )
-from database import SessionLocal
-from learning_trace import append_trace_event, summarize_text
-from models import Message
-from retrieval import normalize_deepseek_model
+from database.session import SessionLocal
+from rag.learning_trace import append_trace_event, summarize_text
+from model.models import Message
+from rag.llm import normalize_deepseek_model
 
 
 logger = logging.getLogger(__name__)

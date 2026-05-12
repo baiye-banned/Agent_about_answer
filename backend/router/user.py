@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from services.business.user_service import get_profile, update_password, upload_avatar
+from service.user_service import get_profile, update_password, upload_avatar
 
 
 router = APIRouter()

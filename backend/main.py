@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -7,15 +7,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from config import REBUILD_KNOWLEDGE_INDEX_ON_STARTUP
-from database import init_db
+from database.session import init_db
 from paths import UPLOAD_DIR, AVATAR_DIR
-from routers.auth import router as auth_router
-from routers.chat import router as chat_router
-from routers.checkpointer import router as checkpointer_router
-from routers.knowledge import router as knowledge_router
-from routers.user import router as user_router
-from services.business.knowledge_service import rebuild_existing_knowledge_index
-from services.business.user_service import seed_default_users
+from router.auth import router as auth_router
+from router.chat import router as chat_router
+from router.checkpointer import router as checkpointer_router
+from router.knowledge import router as knowledge_router
+from router.user import router as user_router
+from service.knowledge_service import rebuild_existing_knowledge_index
+from service.user_service import seed_default_users
 
 
 logger = logging.getLogger(__name__)

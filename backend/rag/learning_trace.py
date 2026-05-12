@@ -3,7 +3,7 @@ from uuid import uuid4
 
 from config import LEARNING_TRACE_ENABLED, LEARNING_TRACE_MAX_TEXT_CHARS
 from crud import trace as crud_trace
-from models import ChatTraceSession
+from model.models import ChatTraceSession
 
 
 def _now_iso() -> str:
@@ -18,7 +18,18 @@ def _clip_text(value: str, max_chars: int | None = None) -> str:
     return text[:limit].rstrip() + "...(已截断)"
 
 
-def sanitize_trace_value(value):
+FULL_TEXT_TRACE_KEYS = {
+    "effective_question",
+    "recent_text",
+    "memory_context",
+    "memory_summary",
+    "conv.memory_summary",
+    "retrieval_question",
+    "transcript",
+}
+
+
+def sanitize_trace_value(value, key: str | None = None):
     if isinstance(value, dict):
         sanitized = {}
         for key, item in value.items():
@@ -26,11 +37,13 @@ def sanitize_trace_value(value):
             if any(secret in lowered for secret in ["authorization", "api_key", "secret", "signature", "token"]):
                 sanitized[key] = "***"
             else:
-                sanitized[key] = sanitize_trace_value(item)
+                sanitized[key] = sanitize_trace_value(item, key=str(key))
         return sanitized
     if isinstance(value, list):
-        return [sanitize_trace_value(item) for item in value[:20]]
+        return [sanitize_trace_value(item, key=key) for item in value[:20]]
     if isinstance(value, str):
+        if key in FULL_TEXT_TRACE_KEYS:
+            return value
         return _clip_text(value)
     return value
 

@@ -5,13 +5,13 @@ import logging
 from fastapi import Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from checkpointer import list_threads
+from database.checkpointer import list_threads
 from crud import chat as crud_chat
-from database import get_db
-from learning_trace import TraceRecorder, get_trace_snapshot, serialize_trace_session as _serialize_trace_session
-from models import User
-from services.base.auth_service import get_current_user
-from services.base.utils_service import _loads_json
+from database.session import get_db
+from rag.learning_trace import TraceRecorder, get_trace_snapshot, serialize_trace_session as _serialize_trace_session
+from model.models import User
+from service.auth_service import get_current_user
+from service.utils_service import _loads_json
 
 
 logger = logging.getLogger(__name__)

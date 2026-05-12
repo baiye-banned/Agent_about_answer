@@ -2,8 +2,8 @@ import json
 
 from sqlalchemy.orm import Session
 
-from database import SessionLocal
-from models import ChatTraceSession
+from database.session import SessionLocal
+from model.models import ChatTraceSession
 
 
 def persist_trace_session(
