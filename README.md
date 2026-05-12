@@ -1,42 +1,58 @@
 # 企业知识库 RAG 智能问答系统
 
-一个面向企业知识库场景的全栈 RAG 问答系统，支持登录、知识库管理、文件上传解析、多知识库隔离、SSE 流式问答、DeepSeek / DashScope 调用、RAGAS 在线评估和 OSS 图片附件上传。
+一个面向企业知识库场景的全栈 RAG 问答系统。项目支持登录鉴权、知识库管理、文件上传解析、多知识库隔离、SSE 流式回答、图片附件分析、LangChain Agent 检索编排、RAGAS 在线评估、学习中心 Trace 回放和会话记忆管理。
 
 ## 核心能力
 
-- 登录鉴权与用户资料管理
-- 知识库创建、重命名、删除与切换
-- 文件上传、解析、检索、预览与删除
-- 多知识库隔离检索与会话绑定
-- SSE 流式回答与历史对话管理
-- DeepSeek 生成、重写、HyDE、Rerank
-- DashScope `text-embedding-v4` 向量化
-- RAGAS 在线评估状态展示
-- 阿里云 OSS 图片附件上传与签名访问
+- 登录鉴权、用户资料和头像管理
+- 知识库创建、重命名、删除、切换和默认知识库兜底
+- 文本、DOCX、PDF 上传解析、分块、Chroma 索引和失败回滚
+- 多知识库隔离检索，基于 `knowledge_base_id` 过滤 SQL 与 Chroma 数据
+- `/api/chat/stream` SSE 流式问答，支持历史会话、来源抽屉和 Markdown 渲染
+- LangChain Agent + Tool 组织 RAG：路由判断、查询规划、关键词召回、向量召回、RRF 融合、rerank、生成
+- DeepSeek OpenAI 兼容调用，DashScope `text-embedding-v4` 向量化
+- 图片附件上传 OSS 后做视觉分析，再合并进同一条聊天主链路
+- RAGAS 在线评估，assistant 保存后异步计算评分
+- 学习中心支持 demo 流程和真实 Trace 回放，可查看变量流、检索过程、记忆管理和 RAGAS 状态
+- 会话记忆策略：短期滑窗、滑出轮次写入长期记忆、短期超长语义压缩、长期超长二次摘要
 
 ## 技术栈
 
-- 前端：Vue 3、Vite、Element Plus、Pinia、Vue Router、TailwindCSS、Axios
-- 后端：FastAPI、SQLAlchemy、MySQL、ChromaDB、httpx
-- 模型：DeepSeek、DashScope Embedding、RAGAS
-- 存储：MySQL、ChromaDB、Aliyun OSS
+- 前端：Vue 3、Vite、Element Plus、Pinia、Vue Router、TailwindCSS、Axios、Fetch 流式读取
+- 后端：FastAPI、SQLAlchemy、MySQL、ChromaDB、LangChain 1.x、httpx
+- LLM / Agent：LangChain `ChatOpenAI`、`create_agent`、DeepSeek OpenAI 兼容接口、文本后备模型
+- Embedding：DashScope `text-embedding-v4`，默认维度 1024
+- 评估：RAGAS
+- 对象存储：阿里云 OSS REST 签名
 
 ## 目录结构
 
 ```text
 .
-├── src/                  # 前端源码
-├── backend/              # FastAPI 后端
-├── README.md
-├── .gitignore
-├── .env.example
+├── src/                         # Vue 前端
+│   ├── api/                     # Axios / Fetch API 封装
+│   ├── stores/                  # Pinia 状态
+│   ├── views/                   # Chat / Knowledge / Learn / UserProfile
+│   └── components/              # Markdown、Trace 等组件
+├── backend/                     # FastAPI 后端
+│   ├── router/                  # HTTP 路由挂载
+│   ├── service/                 # 业务编排
+│   ├── crud/                    # 数据访问
+│   ├── model/                   # SQLAlchemy 模型
+│   ├── schema/                  # Pydantic schema
+│   ├── database/                # DB session、初始化、checkpoint
+│   ├── agent/                   # LangChain Agent
+│   ├── tool/                    # LangChain tools / RAG 工具
+│   └── rag/                     # Chroma、LLM、Chain、记忆、Trace、RAGAS、视觉
+├── docs/                        # 架构、流程图、阅读路线
 ├── package.json
+├── vite.config.js
 └── backend/requirements.txt
 ```
 
 ## 快速启动
 
-### 1. 前端
+### 前端
 
 ```bash
 npm install
@@ -45,11 +61,12 @@ npm run dev
 
 前端默认地址：`http://localhost:5173/`
 
-### 2. 后端
+`vite.config.js` 会把 `/api` 代理到 `http://localhost:8002`。
 
-进入 `backend/` 目录后启动：
+### 后端
 
 ```bash
+cd backend
 pip install -r requirements.txt
 python -m uvicorn main:app --host 127.0.0.1 --port 8002
 ```
@@ -57,7 +74,14 @@ python -m uvicorn main:app --host 127.0.0.1 --port 8002
 健康检查：
 
 ```bash
-http://127.0.0.1:8002/health
+Invoke-WebRequest http://127.0.0.1:8002/health
+```
+
+也可以直接运行：
+
+```bash
+cd backend
+python main.py
 ```
 
 ## 环境变量
@@ -76,17 +100,40 @@ http://127.0.0.1:8002/health
 - `MYSQL_PORT`
 - `MYSQL_DATABASE`
 
-### Chroma / Checkpointer
-
-- `CHROMA_PERSIST_DIR`
-- `REBUILD_KNOWLEDGE_INDEX_ON_STARTUP`
-- `CHECKPOINTER_DB_PATH`
-
-### DeepSeek
+### DeepSeek / LangChain
 
 - `DEEPSEEK_API_KEY`
 - `DEEPSEEK_BASE_URL`
 - `DEEPSEEK_MODEL`
+- `TEXT_FALLBACK_ENABLED`
+- `TEXT_FALLBACK_BASE_URL`
+- `TEXT_FALLBACK_API_KEY`
+- `TEXT_FALLBACK_MODEL`
+
+### Embedding / Chroma
+
+- `EMBEDDING_BASE_URL`
+- `EMBEDDING_API_KEY`
+- `EMBEDDING_MODEL`
+- `EMBEDDING_DIM`
+- `CHROMA_PERSIST_DIR`
+- `REBUILD_KNOWLEDGE_INDEX_ON_STARTUP`
+
+### 记忆与 Trace
+
+- `MEMORY_WINDOW_TURNS`：短期记忆滑窗轮数，默认 `4`
+- `MEMORY_RECENT_MAX_CHARS`：短期窗口超长阈值，超过后语义压缩为一条近期记忆
+- `MEMORY_SUMMARY_MAX_CHARS`：长期记忆超长阈值，超过后做二次摘要
+- `LEARNING_TRACE_ENABLED`
+- `LEARNING_TRACE_MAX_TEXT_CHARS`
+
+当前记忆规则：
+
+- 最近窗口保留 `MEMORY_WINDOW_TURNS` 轮。
+- assistant 保存后检查滑窗，滑出窗口的完整问答轮次会合并进长期记忆。
+- 短期窗口文本超过 `MEMORY_RECENT_MAX_CHARS` 时，调用模型压缩为一条近期记忆；模型失败才使用裁剪兜底。
+- 长期记忆超过 `MEMORY_SUMMARY_MAX_CHARS` 时，先做二次摘要；摘要失败才裁剪兜底。
+- 学习中心记忆链路字段不做 Trace 截断，便于排查真实上下文。
 
 ### 视觉问答 / 图片附件
 
@@ -94,20 +141,6 @@ http://127.0.0.1:8002/health
 - `VISION_API_KEY`
 - `VISION_MODEL`
 - `VISION_OSS_URL_EXPIRES_SECONDS`
-
-### 文本兜底
-
-- `TEXT_FALLBACK_ENABLED`
-- `TEXT_FALLBACK_BASE_URL`
-- `TEXT_FALLBACK_API_KEY`
-- `TEXT_FALLBACK_MODEL`
-
-### 向量化
-
-- `EMBEDDING_BASE_URL`
-- `EMBEDDING_API_KEY`
-- `EMBEDDING_MODEL`
-- `EMBEDDING_DIM`
 
 ### RAGAS
 
@@ -128,16 +161,56 @@ http://127.0.0.1:8002/health
 
 ### JWT
 
-- `SECRET_KEY`：建议改造为环境变量读取；当前代码仍使用 `backend/config.py` 中的固定值
-- `ALGORITHM`：当前代码常量为 `HS256`
-- `ACCESS_TOKEN_EXPIRE_MINUTES`：当前代码常量为 1440 分钟
+- `SECRET_KEY`
+- `ALGORITHM`
+- `ACCESS_TOKEN_EXPIRE_MINUTES`
+
+## 主要链路
+
+### 聊天问答
+
+```text
+Chat.vue
+-> chatStore.sendMessage()
+-> streamChat()
+-> POST /api/chat/stream
+-> backend/service/chat_service.py::stream_chat()
+-> vision_service / memory_service
+-> tool.decide_need_rag()
+-> agent.agentic_retrieve_knowledge()
+-> tool.retrieve_knowledge()
+-> rag.chains.stream_rag_answer()
+-> SSE content / sources / trace / [DONE]
+```
+
+### 知识库上传
+
+```text
+Knowledge.vue
+-> /api/knowledge/upload
+-> backend/service/knowledge_service.py
+-> extract_file_text()
+-> chunk_text()
+-> KnowledgeFile 落库
+-> Chroma add_chunks()
+-> 失败时回滚 SQL 和索引
+```
+
+### 学习中心
+
+学习中心由 `src/views/Learn.vue` 和 `src/views/learnFlowSpec.js` 驱动：
+
+- demo 模式播放当前真实链路的流程图。
+- trace 模式读取 `/api/chat/traces/{trace_id}` 或消息 Trace。
+- 记忆管理页展示 `recent_text`、`memory_context`、`retrieval_question`、`conv.memory_summary` 等真实变量。
+- 流程图文档见 `docs/PROJECT_FLOW_DIAGRAM.md`。
 
 ## 验证命令
 
 ### 后端语法检查
 
-```bash
-python -m py_compile backend/main.py backend/models.py backend/database.py backend/chroma_client.py backend/retrieval.py backend/ragas_eval.py backend/config.py
+```powershell
+python -m py_compile (Get-ChildItem backend -Recurse -File -Filter *.py | ForEach-Object { $_.FullName })
 ```
 
 ### 前端构建
@@ -146,40 +219,43 @@ python -m py_compile backend/main.py backend/models.py backend/database.py backe
 node node_modules/vite/bin/vite.js build
 ```
 
-### 忽略规则验证
+当前构建可能出现 `Chat` chunk 大于 500kB 的 Vite 警告，这是已知构建体积提醒，不代表构建失败。
+
+### 忽略规则检查
 
 ```bash
 git check-ignore -v .env .env.development node_modules dist backend/chroma_data backend/uploads backend/checkpointer.db frontend.log backend.log backend.pid
 ```
 
+## 文档
+
+- `docs/PROJECT_ARCHITECTURE_FULL.md`：完整架构与模块说明
+- `docs/PROJECT_CODE_READING_ROADMAP.md`：代码阅读路线
+- `docs/PROJECT_FLOW_DIAGRAM.md`：聊天和知识库主流程 Mermaid 图
+- `AGENTS.md`：项目约束、开发范式和当前状态
+
 ## 常见问题
 
-### 1. 为什么 `.env` 不能提交？
+### 为什么旧 Trace 里仍看到“已截断”？
 
-`.env` 通常包含数据库密码、OSS 密钥、API Key 等敏感信息，公开仓库必须排除。
+旧 Trace 在写入数据库时已经被截断，无法恢复。新产生的记忆链路 Trace 字段会完整展示。
 
-### 2. 为什么仓库里不该提交 `node_modules/` 和 `dist/`？
+### 为什么输入很长但短期记忆没有立刻压缩？
 
-这两个目录分别是本地依赖和构建产物，可以通过 `package-lock.json` 和 `npm run build` 重新生成。
+当前问题保存后，构造本轮记忆时会排除当前 user message，避免重复塞进 prompt。它会从下一轮开始进入短期窗口；当最近窗口文本超过 `MEMORY_RECENT_MAX_CHARS` 时才触发短期语义压缩。
 
-### 3. 为什么要忽略 `backend/chroma_data/` 和 `backend/uploads/`？
+### 为什么 `.env` 不能提交？
 
-这两个目录属于本地运行数据，包含向量库、上传文件和运行时资源，不适合直接推送到 GitHub。
+`.env` 通常包含数据库密码、OSS 密钥、API Key、JWT 密钥等敏感信息，公开仓库必须排除。
 
-### 4. 公开仓库还有哪些安全注意点？
+### 为什么不提交 `node_modules/`、`dist/`、`backend/chroma_data/`？
 
-当前 `backend/config.py` 里仍有 MySQL 默认密码和固定 `SECRET_KEY`。公开发布前，建议尽快改为环境变量注入并使用更强的随机密钥。
+这些目录是本地依赖、构建产物或运行数据，可以重新生成，不适合进入 Git 历史。
 
-### 5. 后端为什么默认是 `8002`？
+## 发布前检查
 
-这是当前仓库里的实际启动端口，与前端开发代理配置保持一致。
+公开发布前请确认：
 
-## 发布说明
-
-仓库准备推送到：
-
-```text
-https://github.com/baiye-banned/Agent_about_answer.git
-```
-
-如果是公开仓库，请先确认 `.env`、本地数据库、向量库、日志和上传文件都没有进入提交记录。
+- `.env`、本地数据库、向量库、上传文件、日志和 pid 文件没有进入提交记录。
+- `SECRET_KEY`、MySQL 密码、OSS 密钥、API Key 已改为环境变量管理。
+- `REBUILD_KNOWLEDGE_INDEX_ON_STARTUP` 在生产环境保持 `false`，避免启动阻塞。
