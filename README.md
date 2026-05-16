@@ -25,6 +25,19 @@
 - 评估：RAGAS
 - 对象存储：阿里云 OSS REST 签名
 
+## 模型与用途
+
+| 功能 | 默认模型 | 说明 |
+| --- | --- | --- |
+| 最终回答生成 | `deepseekv4flash` | `stream_rag_answer()` 使用，DeepSeek 不可用时切到文本后备模型 |
+| RAG 路由判断 | `qwen3.6-plus` | 判断当前问题是否需要检索知识库 |
+| 检索规划 / HyDE / 改写 / 关键词生成 | `deepseekv4flash` | 由 `build_query_plan()` 生成检索计划 |
+| 检索结果重排 | `deepseekv4flash` | 由 `rerank_chunks()` 重新判断候选 chunk 相关性 |
+| 图片内容理解 | `qwen3.6-plus` | 先把图片转成文字描述，再并入问题 |
+| 会话记忆压缩 | `deepseekv4flash` | 用于短期记忆压缩和长期记忆摘要 |
+| RAGAS 在线评估 | `deepseekv4flash` + `text-embedding-v4` | 用于 faithfulness、context precision、response relevancy |
+| 知识库向量化 | `text-embedding-v4` | 上传分块和检索 query 都使用同一 embedding 体系 |
+
 ## 目录结构
 
 ```text
@@ -152,6 +165,12 @@ python main.py
 - `RAGAS_MAX_CONTEXT_CHARS`
 - `RAGAS_MAX_ANSWER_CHARS`
 
+当前评估规则：
+
+- assistant 消息保存成功后，如果本轮走了 RAG，系统才会异步启动 RAGAS。
+- 评估会先裁剪回答和上下文，再计算 `faithfulness`、`context_precision_without_reference`、`response_relevancy`。
+- 评估结果会回写到 `messages.ragas_status`、`messages.ragas_scores`、`messages.ragas_error`。
+
 ### OSS
 
 - `OSS_ACCESS_KEY_ID`
@@ -175,11 +194,12 @@ Chat.vue
 -> streamChat()
 -> POST /api/chat/stream
 -> backend/service/chat_service.py::stream_chat()
--> vision_service / memory_service
--> tool.decide_need_rag()
--> agent.agentic_retrieve_knowledge()
--> tool.retrieve_knowledge()
+-> decode_token() / resolve_knowledge_base()
+-> _build_effective_question() / _build_memory_context()
+-> decide_need_rag()
+-> agent.agentic_retrieve_knowledge() / tool.retrieve_knowledge()
 -> rag.chains.stream_rag_answer()
+-> assistant 消息保存后异步 schedule_ragas_evaluation()
 -> SSE content / sources / trace / [DONE]
 ```
 
@@ -233,29 +253,3 @@ git check-ignore -v .env .env.development node_modules dist backend/chroma_data 
 - `docs/PROJECT_CODE_READING_ROADMAP.md`：代码阅读路线
 - `docs/PROJECT_FLOW_DIAGRAM.md`：聊天和知识库主流程 Mermaid 图
 - `AGENTS.md`：项目约束、开发范式和当前状态
-
-## 常见问题
-
-### 为什么旧 Trace 里仍看到“已截断”？
-
-旧 Trace 在写入数据库时已经被截断，无法恢复。新产生的记忆链路 Trace 字段会完整展示。
-
-### 为什么输入很长但短期记忆没有立刻压缩？
-
-当前问题保存后，构造本轮记忆时会排除当前 user message，避免重复塞进 prompt。它会从下一轮开始进入短期窗口；当最近窗口文本超过 `MEMORY_RECENT_MAX_CHARS` 时才触发短期语义压缩。
-
-### 为什么 `.env` 不能提交？
-
-`.env` 通常包含数据库密码、OSS 密钥、API Key、JWT 密钥等敏感信息，公开仓库必须排除。
-
-### 为什么不提交 `node_modules/`、`dist/`、`backend/chroma_data/`？
-
-这些目录是本地依赖、构建产物或运行数据，可以重新生成，不适合进入 Git 历史。
-
-## 发布前检查
-
-公开发布前请确认：
-
-- `.env`、本地数据库、向量库、上传文件、日志和 pid 文件没有进入提交记录。
-- `SECRET_KEY`、MySQL 密码、OSS 密钥、API Key 已改为环境变量管理。
-- `REBUILD_KNOWLEDGE_INDEX_ON_STARTUP` 在生产环境保持 `false`，避免启动阻塞。
