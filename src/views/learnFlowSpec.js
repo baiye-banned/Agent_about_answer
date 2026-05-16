@@ -355,6 +355,867 @@ export const demoPath = [
   'ragasStatus',
 ]
 
+export const retrieveKnowledgeFlowSpec = {
+  width: 3280,
+  height: 940,
+  nodes: [
+    {
+      id: 'rkInputs',
+      kind: 'variable',
+      name: 'retrieve_knowledge inputs',
+      value: '{ question, knowledge_base_id, db }',
+      file: 'backend/tool/tools.py',
+      why: 'retrieve_knowledge 的 RAG 业务入参。question 是本轮检索文本，knowledge_base_id 同时约束 SQL 文件和 Chroma 向量查询，db 用于关键词召回。',
+      x: 40,
+      y: 330,
+    },
+    {
+      id: 'rkParamQuestion',
+      kind: 'variable',
+      name: 'question',
+      value: '员工迟到、早退在 30 分钟以内，公司会如何处罚？',
+      file: 'backend/tool/tools.py',
+      why: 'retrieve_knowledge、build_query_plan 和 rerank_chunks 共用的用户问题参数；在 query_vectors 的循环里会派生为每一路的 query。',
+      x: 40,
+      y: 40,
+    },
+    {
+      id: 'rkParamKnowledgeBaseId',
+      kind: 'variable',
+      name: 'knowledge_base_id',
+      value: '7',
+      file: 'backend/tool/tools.py / backend/rag/chroma_client.py',
+      why: '知识库隔离参数。SQL 关键词召回用它过滤 KnowledgeFile，Chroma 向量召回用它构造 where={"knowledge_base_id": knowledge_base_id}。',
+      x: 40,
+      y: 40,
+    },
+    {
+      id: 'rkParamDb',
+      kind: 'variable',
+      name: 'db',
+      value: 'SQLAlchemy Session',
+      file: 'backend/tool/tools.py',
+      why: '数据库会话参数，只在关键词召回路线使用，用于读取当前知识库的 KnowledgeFile.content。',
+      x: 40,
+      y: 40,
+    },
+    {
+      id: 'rkParamQuery',
+      kind: 'variable',
+      name: 'query',
+      value: 'route_specs 中当前 route 对应的文本：original question / hyde_document / rewrite',
+      file: 'backend/tool/tools.py / backend/rag/chroma_client.py',
+      why: 'for route, query in route_specs 循环里的局部参数，传给 query_vectors 的 query_texts=[query]。',
+      x: 40,
+      y: 40,
+    },
+    {
+      id: 'rkParamTopK',
+      kind: 'variable',
+      name: 'top_k',
+      value: 'RETRIEVAL_ROUTE_TOP_K',
+      file: 'backend/tool/tools.py / backend/rag/chroma_client.py',
+      why: '每一路召回数量参数。query_vectors 会把它限制在 1 到 20 之间，keyword_recall 用它截断关键词候选。',
+      x: 40,
+      y: 40,
+    },
+    {
+      id: 'rkParamRoute',
+      kind: 'variable',
+      name: 'route',
+      value: '"original" | "hyde" | "rewrite_1" | "keyword"',
+      file: 'backend/tool/tools.py / backend/rag/chroma_client.py',
+      why: '路线标记参数。向量 chunk 会保留 route 字段，后续 RRF 会用它说明这个片段来自原问题、HyDE、改写还是关键词召回。',
+      x: 40,
+      y: 40,
+    },
+    {
+      id: 'rkParamKeywords',
+      kind: 'variable',
+      name: 'keywords',
+      value: 'query_plan.keywords + _fallback_keywords(question)',
+      file: 'backend/tool/tools.py',
+      why: 'keyword_recall 的关键词参数，真实调用前会先经过 _merge_keywords 合并、去重，再由 _expand_keywords 扩展。',
+      x: 40,
+      y: 40,
+    },
+    {
+      id: 'rkParamRouteResults',
+      kind: 'variable',
+      name: 'route_results',
+      value: '[("original", chunks), ("hyde", chunks), ("rewrite_1", chunks), ("keyword", keyword_chunks)]',
+      file: 'backend/tool/tools.py',
+      why: 'rrf_fuse 的输入参数，保存所有召回路线及其 chunk 列表。',
+      x: 40,
+      y: 40,
+    },
+    {
+      id: 'rkParamK',
+      kind: 'variable',
+      name: 'k',
+      value: '60',
+      file: 'backend/tool/tools.py',
+      why: 'RRF 平滑常量。真实公式是 entry["rrf_score"] += 1.0 / (k + rank)。',
+      x: 40,
+      y: 40,
+    },
+    {
+      id: 'rkParamChunks',
+      kind: 'variable',
+      name: 'chunks',
+      value: 'fused[:12]',
+      file: 'backend/tool/tools.py',
+      why: 'rerank_chunks 的候选 chunk 参数；retrieve_knowledge 只把 RRF 前 12 个候选交给模型重排。',
+      x: 40,
+      y: 40,
+    },
+    {
+      id: 'rkParamRankedChunks',
+      kind: 'variable',
+      name: 'ranked_chunks',
+      value: 'reranked or fused',
+      file: 'backend/tool/tools.py',
+      why: '_select_final_chunks 的第一参数。rerank 成功时用 reranked，失败或空结果时回退到 fused。',
+      x: 40,
+      y: 40,
+    },
+    {
+      id: 'rkParamKeywordChunks',
+      kind: 'variable',
+      name: 'keyword_chunks',
+      value: 'keyword_recall(db, knowledge_base_id, keyword_terms, RETRIEVAL_ROUTE_TOP_K)',
+      file: 'backend/tool/tools.py',
+      why: '_select_final_chunks 的第二参数。最高分 keyword chunk 如果 keyword_score >= 10 且未入选，会被前置保护。',
+      x: 40,
+      y: 40,
+    },
+    {
+      id: 'rkQueryPlanFn',
+      kind: 'method',
+      name: 'build_query_plan()',
+      signature: 'async def build_query_plan(question: str) -> dict',
+      value: 'call_chat_json(system_prompt, user_prompt) -> call_chat_text -> model.ainvoke -> parse_json_object',
+      file: 'backend/tool/tools.py',
+      why: '把 system_prompt 和 user_prompt 发给模型，解析出 HyDE、改写问题和关键词。失败时不会中断检索，会回退到 fallback keywords。',
+      x: 320,
+      y: 330,
+    },
+    {
+      id: 'rkSystemPrompt',
+      kind: 'variable',
+      name: 'system_prompt',
+      value: `system_prompt:
+你是企业知识库 RAG 检索规划器。只输出 JSON，不要输出 Markdown。字段必须是：hyde_document、rewrites、keywords。
+`,
+      file: 'backend/tool/tools.py',
+      why: '告诉模型它的角色和输出格式，约束它只能返回检索规划需要的 JSON 字段。',
+      x: 320,
+      y: 260,
+    },
+    {
+      id: 'rkUserPrompt',
+      kind: 'variable',
+      name: 'user_prompt',
+      value: `user_prompt:
+请为下面的用户问题生成：
+1. 一段可能出现在企业文档里的假设答案文档 hyde_document；
+2. 3 个语义不同但意图一致的检索改写 rewrites；
+3. 不超过 8 个中文关键词 keywords。
+
+用户问题：员工迟到、早退在 30 分钟以内，公司会如何处罚？`,
+      file: 'backend/tool/tools.py',
+      why: '把当前用户问题放进规划任务里，要求模型生成 HyDE、rewrites 和 keywords。',
+      x: 320,
+      y: 400,
+    },
+    {
+      id: 'rkQueryPlan',
+      kind: 'variable',
+      name: 'query_plan',
+      value: `{
+  "hyde_document": "员工迟到或早退在 30 分钟以内，按考勤制度扣除绩效并记录一次异常。",
+  "rewrites": [
+    "迟到早退 30 分钟以内处罚规定",
+    "员工考勤异常 30 分钟以内怎么处理",
+    "公司对迟到早退半小时内的扣罚标准"
+  ],
+  "keywords": ["迟到", "早退", "30分钟", "处罚", "考勤"],
+  "error": ""
+}`,
+      file: 'backend/tool/tools.py',
+      why: '规划结果是后续多路召回的源头。真实字段固定为 hyde_document、rewrites、keywords、error。',
+      x: 620,
+      y: 330,
+    },
+    {
+      id: 'rkRouteSpecs',
+      kind: 'variable',
+      name: 'route_specs',
+      value: `[
+  ["original", "员工迟到、早退在 30 分钟以内，公司会如何处罚？"],
+  ["hyde", "员工迟到或早退在 30 分钟以内，按考勤制度扣除绩效并记录一次异常。"],
+  ["rewrite_1", "迟到早退 30 分钟以内处罚规定"],
+  ["rewrite_2", "员工考勤异常 30 分钟以内怎么处理"]
+]`,
+      file: 'backend/tool/tools.py',
+      why: '向量召回的路线表。original 永远存在，hyde 和 rewrite 只有 query_plan 中有值才加入。',
+      x: 920,
+      y: 260,
+    },
+    {
+      id: 'rkRouteSpecsInit',
+      kind: 'variable',
+      name: 'route_specs init',
+      value: `route_specs = [
+  ("original", question)
+]`,
+      file: 'backend/tool/tools.py',
+      why: '多路召回永远先放入原始问题路线，保证即使 HyDE 或改写为空，也至少能用原问题查向量库。',
+      x: 920,
+      y: 260,
+    },
+    {
+      id: 'rkAppendOriginal',
+      kind: 'method',
+      name: 'append original',
+      value: `route_specs = [("original", question)]`,
+      file: 'backend/tool/tools.py',
+      why: '这是 route_specs 的初始值，不依赖模型规划结果；question 就是用户原始问题。',
+      x: 920,
+      y: 260,
+    },
+    {
+      id: 'rkAppendHyde',
+      kind: 'method',
+      name: 'append hyde if exists',
+      value: `if query_plan.get("hyde_document"):
+    route_specs.append(("hyde", query_plan["hyde_document"]))`,
+      file: 'backend/tool/tools.py',
+      why: '只有 query_plan 里真的生成了 hyde_document，才追加 HyDE 路线，用假设答案文档去做一次语义召回。',
+      x: 920,
+      y: 260,
+    },
+    {
+      id: 'rkAppendRewrites',
+      kind: 'method',
+      name: 'append rewrites loop',
+      value: `for index, rewrite in enumerate(query_plan.get("rewrites") or [], start=1):
+    route_specs.append((f"rewrite_{index}", rewrite))
+
+示例输出：
+("rewrite_1", "迟到早退 30 分钟以内处罚规定")
+("rewrite_2", "员工考勤异常 30 分钟以内怎么处理")
+("rewrite_3", "公司对迟到早退半小时内的扣罚标准")`,
+      file: 'backend/tool/tools.py',
+      why: '每个改写问题都会变成一条独立路线，路线名按 rewrite_1、rewrite_2、rewrite_3 编号。',
+      x: 920,
+      y: 260,
+    },
+    {
+      id: 'rkRouteLoop',
+      kind: 'method',
+      name: 'for route, query in route_specs',
+      value: `for route, query in route_specs:
+    chunks = query_vectors(
+        query,
+        top_k=RETRIEVAL_ROUTE_TOP_K,
+        knowledge_base_id=knowledge_base_id,
+        route=route,
+    )
+    route_results.append((route, chunks))`,
+      file: 'backend/tool/tools.py',
+      why: 'route_specs 构建完成后，系统逐条取出 route 和 query，同一套 query_vectors 参数结构会跑多次。',
+      x: 920,
+      y: 260,
+    },
+    {
+      id: 'rkRouteQuery',
+      kind: 'variable',
+      name: 'route / query',
+      value: `第 1 次：route="original", query=原问题
+第 2 次：route="hyde", query=hyde_document
+第 3 次：route="rewrite_1", query=第一个改写问题
+第 4 次：route="rewrite_2", query=第二个改写问题`,
+      file: 'backend/tool/tools.py',
+      why: '循环中每一次 query_vectors 调用都会带着当前 route 名称，后续 chunk 也会保留这个来源标记。',
+      x: 920,
+      y: 260,
+    },
+    {
+      id: 'rkQueryVectors',
+      kind: 'method',
+      name: 'query_vectors()',
+      signature: "query_vectors(query, top_k=..., knowledge_base_id=None, route='vector')",
+      value: `original:
+query_vectors(question, top_k=RETRIEVAL_ROUTE_TOP_K, knowledge_base_id=7, route="original")
+
+hyde:
+query_vectors(query_plan["hyde_document"], top_k=RETRIEVAL_ROUTE_TOP_K, knowledge_base_id=7, route="hyde")
+
+rewrite_1:
+query_vectors("迟到早退 30 分钟以内处罚规定", top_k=RETRIEVAL_ROUTE_TOP_K, knowledge_base_id=7, route="rewrite_1")`,
+      file: 'backend/rag/chroma_client.py',
+      why: 'query_vectors 会拿用户问题、HyDE 文档或改写后的 query 去 ChromaDB 做语义相似度检索，只在当前 knowledge_base_id 对应的知识库中查找，返回最相关的前 top_k 个知识片段 chunk。真实代码会把 top_k 限制在 1 到 20 之间。',
+      x: 1210,
+      y: 220,
+    },
+    {
+      id: 'rkGetCollection',
+      kind: 'method',
+      name: 'get_collection()',
+      value: `collection = get_collection()
+
+if _semantic_collection is None:
+    client = get_chroma_client()
+    _semantic_collection = client.get_or_create_collection(
+        COLLECTION_NAME,
+        embedding_function=_embedding_fn,
+    )
+return _semantic_collection`,
+      file: 'backend/rag/chroma_client.py',
+      why: 'query_vectors 开始检索前，先拿到保存知识片段向量的集合。可以把它理解成“我要在哪个向量表里查”。',
+      x: 1210,
+      y: 220,
+    },
+    {
+      id: 'rkGetChromaClient',
+      kind: 'method',
+      name: 'get_chroma_client()',
+      value: `if _client is None:
+    _client = chromadb.PersistentClient(
+        path=CHROMA_PERSIST_DIR,
+        settings=Settings(anonymized_telemetry=False),
+    )
+return _client`,
+      file: 'backend/rag/chroma_client.py',
+      why: '这一步负责连接本地 Chroma 向量库。后面的相似片段检索都要通过这个连接发起。',
+      x: 1210,
+      y: 220,
+    },
+    {
+      id: 'rkPersistentClient',
+      kind: 'method',
+      boundary: 'ChromaDB',
+      name: 'chromadb.PersistentClient(...)',
+      value: `chromadb.PersistentClient(
+    path=CHROMA_PERSIST_DIR,
+    settings=Settings(anonymized_telemetry=False),
+)`,
+      file: 'backend/rag/chroma_client.py',
+      why: '这是 ChromaDB 第三方库边界。项目只告诉 Chroma 本地向量库存在哪里，不继续展开 Chroma 内部实现。',
+      x: 1210,
+      y: 220,
+    },
+    {
+      id: 'rkGetOrCreateCollection',
+      kind: 'method',
+      boundary: 'ChromaDB',
+      name: 'client.get_or_create_collection(...)',
+      value: `client.get_or_create_collection(
+    COLLECTION_NAME,
+    embedding_function=_embedding_fn,
+)`,
+      file: 'backend/rag/chroma_client.py',
+      why: '找到保存知识片段的向量集合；如果还没有，就创建一个。这里也是 ChromaDB 边界，不继续展开第三方库内部。',
+      x: 1210,
+      y: 220,
+    },
+    {
+      id: 'rkVectorWhere',
+      kind: 'variable',
+      name: 'where',
+      value: `where = {"knowledge_base_id": knowledge_base_id} if knowledge_base_id else None
+
+示例：
+knowledge_base_id = 7
+where = {"knowledge_base_id": 7}`,
+      file: 'backend/rag/chroma_client.py',
+      why: 'where 会告诉 Chroma：只从当前选中的知识库里找 chunks，避免查到其他知识库的内容。',
+      x: 1210,
+      y: 220,
+    },
+    {
+      id: 'rkCollectionQuery',
+      kind: 'method',
+      boundary: 'ChromaDB',
+      name: 'collection.query(...)',
+      value: `collection.query(
+    query_texts=[query],
+    n_results=min(max(top_k, 1), 20),
+    where=where,
+)
+
+示例：
+collection.query(
+    query_texts=["迟到早退 30 分钟以内处罚规定"],
+    n_results=6,
+    where={"knowledge_base_id": 7},
+)`,
+      file: 'backend/rag/chroma_client.py',
+      why: '真正的向量检索发生在这里。系统把当前路线的 query 发给 Chroma，让它在当前知识库中找最相似的知识片段。',
+      x: 1210,
+      y: 220,
+    },
+    {
+      id: 'rkVectorResults',
+      kind: 'variable',
+      name: 'results',
+      value: `{
+  "ids": [["5_12", "5_3"]],
+  "documents": [[
+    "员工迟到、早退 30 分钟以内，扣除当月绩效 20 元并记录考勤异常。",
+    "迟到早退属于考勤异常，按制度进行提醒和扣罚。"
+  ]],
+  "metadatas": [[
+    {"chunk_id": "12", "file_id": 5, "file_name": "公司考勤制度.pdf", "knowledge_base_id": 7},
+    {"chunk_id": "3", "file_id": 5, "file_name": "公司考勤制度.pdf", "knowledge_base_id": 7}
+  ]],
+  "distances": [[0.18, 0.24]]
+}`,
+      file: 'backend/rag/chroma_client.py',
+      why: '这是 Chroma 找回来的原始结果，还不能直接给 RAG 使用。后面会把文本、文件信息和相似度距离整理成统一 chunk。',
+      x: 1210,
+      y: 220,
+    },
+    {
+      id: 'rkVectorEmptyGuard',
+      kind: 'method',
+      name: 'empty result guard',
+      value: `if not results["documents"] or not results["documents"][0]:
+    return []`,
+      file: 'backend/rag/chroma_client.py',
+      why: '如果这一条路线没有找到任何知识片段，就返回空列表。其他路线仍会继续检索，不会因为一路为空就中断。',
+      x: 1210,
+      y: 220,
+    },
+    {
+      id: 'rkVectorDistances',
+      kind: 'variable',
+      name: 'distances',
+      value: `distances = results.get("distances") or [[]]
+
+示例：
+distances = [[0.18, 0.24, 0.31]]`,
+      file: 'backend/rag/chroma_client.py',
+      why: 'distance 表示“这个片段和问题有多接近”。后续展示和调试时可以用它理解为什么某个片段被召回。',
+      x: 1210,
+      y: 220,
+    },
+    {
+      id: 'rkVectorLoop',
+      kind: 'method',
+      name: 'for index, doc in enumerate(...)',
+      value: `chunks = []
+for index, doc in enumerate(results["documents"][0]):
+    meta = results["metadatas"][0][index] if results["metadatas"] else {}
+    distance = distances[0][index] if distances and len(distances[0]) > index else None
+    chunks.append({...})`,
+      file: 'backend/rag/chroma_client.py',
+      why: 'Chroma 一次会返回多个片段，这里逐条处理。每处理一个片段，就准备把它变成 RAG 后续能直接使用的 chunk。',
+      x: 1210,
+      y: 220,
+    },
+    {
+      id: 'rkVectorMetaDistance',
+      kind: 'variable',
+      name: 'meta / distance',
+      value: `index = 0
+doc = "员工迟到、早退 30 分钟以内，扣除当月绩效 20 元..."
+meta = {
+  "chunk_id": "12",
+  "file_id": 5,
+  "file_name": "公司考勤制度.pdf",
+  "knowledge_base_id": 7
+}
+distance = 0.18`,
+      file: 'backend/rag/chroma_client.py',
+      why: '这里取出片段来自哪个文件、哪个分块，以及它和问题的相似度距离。这样最终答案可以展示来源，也能保留召回依据。',
+      x: 1210,
+      y: 220,
+    },
+    {
+      id: 'rkVectorAppendChunk',
+      kind: 'method',
+      name: 'chunks.append({...})',
+      value: `chunks.append({
+    "id": results["ids"][0][index],
+    "chunk_id": str(meta.get("chunk_id", "")),
+    "content": doc,
+    "file_name": meta.get("file_name", ""),
+    "file_id": meta.get("file_id", 0),
+    "route": route,
+    "distance": distance,
+})`,
+      file: 'backend/rag/chroma_client.py',
+      why: '这里把一个原始召回片段组装成统一 chunk：包含内容、来源文件、路线名和距离。后面的 RRF、rerank、final_chunks 都吃这个格式。',
+      x: 1210,
+      y: 220,
+    },
+    {
+      id: 'rkVectorReturnChunks',
+      kind: 'variable',
+      name: 'return chunks',
+      value: `return [
+  {
+    "id": "5_12",
+    "chunk_id": "12",
+    "content": "员工迟到、早退 30 分钟以内，扣除当月绩效 20 元并记录考勤异常。",
+    "file_name": "公司考勤制度.pdf",
+    "file_id": 5,
+    "route": "rewrite_1",
+    "distance": 0.18
+  }
+]`,
+      file: 'backend/rag/chroma_client.py',
+      why: '这一条路线的向量召回到这里结束。返回的 chunks 会交回外层循环，再和 route 一起放入 route_results。',
+      x: 1210,
+      y: 220,
+    },
+    {
+      id: 'rkVectorChunks',
+      kind: 'variable',
+      name: 'vector chunks',
+      value: `[
+  {
+    id: "5_12",
+    chunk_id: "12",
+    content: "员工迟到、早退 30 分钟以内，扣除当月绩效 20 元并记录考勤异常。",
+    file_name: "公司考勤制度.pdf",
+    file_id: 5,
+    route: "original",
+    distance: 0.18
+  }
+]`,
+      file: 'backend/rag/chroma_client.py',
+      why: 'Chroma 返回文档、元数据和距离后，被整理成统一 chunk 结构。route 字段标记它来自 original、hyde 或 rewrite。',
+      x: 1500,
+      y: 220,
+    },
+    {
+      id: 'rkRouteChunks',
+      kind: 'variable',
+      name: 'chunks',
+      value: `original -> 召回 4 个 chunks
+hyde -> 召回 3 个 chunks
+rewrite_1 -> 召回 4 个 chunks
+rewrite_2 -> 召回 3 个 chunks`,
+      file: 'backend/rag/chroma_client.py',
+      why: '每一路 query_vectors 都返回自己的 chunks 列表，随后与路线名一起放入 route_results。',
+      x: 1500,
+      y: 220,
+    },
+    {
+      id: 'rkKeywordTerms',
+      kind: 'variable',
+      name: 'keyword_terms',
+      value: '["迟到", "早退", "30分钟", "处罚", "考勤", "绩效"]',
+      file: 'backend/tool/tools.py',
+      why: '模型关键词会和问题中提取的 fallback keywords 合并去重，避免规划模型漏掉制度类关键词。',
+      x: 920,
+      y: 540,
+    },
+    {
+      id: 'rkKeywordRecall',
+      kind: 'method',
+      name: 'keyword_recall()',
+      signature: 'keyword_recall(db, knowledge_base_id, keywords, top_k)',
+      value: 'KnowledgeFile.content -> _split_keyword_chunks() -> _keyword_score()',
+      file: 'backend/tool/tools.py',
+      why: '关键词召回不是查 Chroma，也不是查独立 chunk 表；它读取当前知识库的 KnowledgeFile.content，在内存里按 900 字、180 重叠临时切块。',
+      x: 1210,
+      y: 540,
+    },
+    {
+      id: 'rkKeywordChunks',
+      kind: 'variable',
+      name: 'keyword_chunks',
+      value: `[
+  {
+    id: "5_3",
+    chunk_id: "3",
+    content: "迟到、早退在 30 分钟以内的，按一次轻微考勤异常处理。",
+    file_name: "公司考勤制度.pdf",
+    file_id: 5,
+    route: "keyword",
+    keyword_score: 18
+  }
+]`,
+      file: 'backend/tool/tools.py',
+      why: '关键词路线会补足精确制度、数字和处罚类问题。keyword_score 会按命中次数、长度、数字、近距离命中和业务词加权。',
+      x: 1500,
+      y: 540,
+    },
+    {
+      id: 'rkRouteResults',
+      kind: 'variable',
+      name: 'route_results',
+      value: `[
+  ("original", [chunk1, chunk2, chunk3, chunk4]),
+  ("hyde", [chunk5, chunk6, chunk7]),
+  ("rewrite_1", [chunk8, chunk9, chunk10, chunk11]),
+  ("rewrite_2", [chunk12, chunk13, chunk14])
+]`,
+      file: 'backend/tool/tools.py',
+      why: '向量多路召回的输出会先形成 route_results；后面关键词路线会再追加 ("keyword", keyword_chunks)，一起进入 RRF。',
+      x: 1780,
+      y: 360,
+    },
+    {
+      id: 'rkRrfFuse',
+      kind: 'method',
+      name: 'rrf_fuse()',
+      signature: 'rrf_fuse(route_results, k=60)',
+      value: `同一个 chunk 被多路召回时累加：
+original rank 1 -> 1 / (60 + 1)
+hyde rank 2 -> 1 / (60 + 2)
+最终 rrf_score = 0.0325`,
+      file: 'backend/tool/tools.py',
+      why: '用 file_id:chunk_id 生成唯一 key。同一 chunk 被多路召回时分数累加，routes 记录每一路的 route 和 rank。',
+      x: 2050,
+      y: 360,
+    },
+    {
+      id: 'rkFused',
+      kind: 'variable',
+      name: 'fused',
+      value: `[
+  {
+    content: "员工迟到、早退 30 分钟以内...",
+    file_name: "公司考勤制度.pdf",
+    routes: [{ route: "original", rank: 1 }, { route: "hyde", rank: 2 }],
+    rrf_score: 0.0325
+  }
+]`,
+      file: 'backend/tool/tools.py',
+      why: 'RRF 后按 rrf_score 降序。rerank 实际拿 fused[:12]，避免把过多候选交给模型。',
+      x: 2320,
+      y: 360,
+    },
+    {
+      id: 'rkRerank',
+      kind: 'method',
+      name: 'rerank_chunks()',
+      signature: 'async def rerank_chunks(question, chunks)',
+      value: `rerank_chunks(
+  question="员工迟到、早退在 30 分钟以内，公司会如何处罚？",
+  chunks=fused[:12]
+)`,
+      file: 'backend/tool/tools.py',
+      why: '把 fused[:12] 压缩成 compact_candidates，交给模型按问题相关性打 rerank_score。失败时返回空结果，后续自动回退到 fused。',
+      x: 2590,
+      y: 230,
+    },
+    {
+      id: 'rkReranked',
+      kind: 'variable',
+      name: 'reranked',
+      value: `[
+  {
+    content: "员工迟到、早退 30 分钟以内，扣除当月绩效 20 元...",
+    rerank_score: 0.92,
+    rerank_reason: "直接回答 30 分钟以内处罚标准"
+  }
+]`,
+      file: 'backend/tool/tools.py',
+      why: 'rerank 成功时按 rerank_score 降序；失败时 retrieve_knowledge 会自动回退到 fused，不会中断回答。',
+      x: 2860,
+      y: 230,
+    },
+    {
+      id: 'rkSelectFinal',
+      kind: 'method',
+      name: '_select_final_chunks()',
+      signature: '_select_final_chunks(ranked_chunks, keyword_chunks)',
+      value: 'ranked_chunks[:RETRIEVAL_RERANK_TOP_N] + keyword guard',
+      file: 'backend/tool/tools.py',
+      why: '最终选择默认取 reranked 或 fused 的前 N 个；如果 keyword_chunks[0].keyword_score >= 10 且未入选，会被前置保护。',
+      x: 2590,
+      y: 520,
+    },
+    {
+      id: 'rkFinalChunks',
+      kind: 'variable',
+      name: 'final_chunks',
+      value: `[
+  {
+    content: "员工迟到、早退 30 分钟以内，扣除当月绩效 20 元并记录一次轻微考勤异常。",
+    file_name: "公司考勤制度.pdf",
+    file_id: 5,
+    rrf_score: 0.0325,
+    rerank_score: 0.92
+  }
+]`,
+      file: 'backend/tool/tools.py',
+      why: '最终返回给上层 Agent 和回答生成链的上下文片段。回答模型只需要这些片段来生成有依据的答案。',
+      x: 2860,
+      y: 520,
+    },
+  ],
+  edges: [
+    ['rkInputs', 'rkSystemPrompt', 'question context'],
+    ['rkInputs', 'rkUserPrompt', 'question'],
+    ['rkSystemPrompt', 'rkQueryPlanFn', 'system_prompt'],
+    ['rkUserPrompt', 'rkQueryPlanFn', 'user_prompt'],
+    ['rkQueryPlanFn', 'rkQueryPlan', 'JSON plan'],
+    ['rkQueryPlan', 'rkRouteSpecsInit', 'init original'],
+    ['rkRouteSpecsInit', 'rkAppendOriginal', 'set initial list'],
+    ['rkQueryPlan', 'rkAppendHyde', 'if has hyde_document'],
+    ['rkAppendOriginal', 'rkAppendHyde', 'append hyde'],
+    ['rkQueryPlan', 'rkAppendRewrites', 'for each rewrite'],
+    ['rkAppendHyde', 'rkAppendRewrites', 'append rewrites'],
+    ['rkAppendRewrites', 'rkRouteSpecs', 'final route_specs'],
+    ['rkRouteSpecs', 'rkRouteLoop', 'for each route'],
+    ['rkRouteLoop', 'rkRouteQuery', 'route / query'],
+    ['rkRouteQuery', 'rkQueryVectors', 'query_vectors args'],
+    ['rkQueryVectors', 'rkGetCollection', 'collection'],
+    ['rkGetCollection', 'rkGetChromaClient', 'client'],
+    ['rkGetChromaClient', 'rkPersistentClient', 'create client'],
+    ['rkPersistentClient', 'rkGetOrCreateCollection', 'client ready'],
+    ['rkGetCollection', 'rkGetOrCreateCollection', 'collection exists'],
+    ['rkQueryVectors', 'rkVectorWhere', 'kb filter'],
+    ['rkGetOrCreateCollection', 'rkCollectionQuery', 'collection'],
+    ['rkVectorWhere', 'rkCollectionQuery', 'where'],
+    ['rkCollectionQuery', 'rkVectorResults', 'Chroma results'],
+    ['rkVectorResults', 'rkVectorEmptyGuard', 'empty guard'],
+    ['rkVectorEmptyGuard', 'rkVectorDistances', 'has documents'],
+    ['rkVectorDistances', 'rkVectorLoop', 'distance lookup'],
+    ['rkVectorLoop', 'rkVectorMetaDistance', 'index aligned'],
+    ['rkVectorMetaDistance', 'rkVectorAppendChunk', 'chunk fields'],
+    ['rkVectorAppendChunk', 'rkVectorReturnChunks', 'append result'],
+    ['rkVectorReturnChunks', 'rkVectorChunks', 'Chroma result item'],
+    ['rkVectorChunks', 'rkRouteChunks', 'chunks per route'],
+    ['rkQueryPlan', 'rkKeywordTerms', 'keywords'],
+    ['rkInputs', 'rkKeywordRecall', 'db / kb scope'],
+    ['rkKeywordTerms', 'rkKeywordRecall', 'terms'],
+    ['rkKeywordRecall', 'rkKeywordChunks', 'scored chunks'],
+    ['rkRouteChunks', 'rkRouteResults', 'route_results.append'],
+    ['rkKeywordChunks', 'rkRouteResults', 'append keyword route'],
+    ['rkRouteResults', 'rkRrfFuse', 'multi-route candidates'],
+    ['rkRrfFuse', 'rkFused', 'sorted by rrf_score'],
+    ['rkFused', 'rkRerank', 'fused[:12]'],
+    ['rkRerank', 'rkReranked', 'LLM scores'],
+    ['rkReranked', 'rkSelectFinal', 'reranked or fused'],
+    ['rkFused', 'rkSelectFinal', 'fallback if rerank failed'],
+    ['rkKeywordChunks', 'rkSelectFinal', 'keyword guard'],
+    ['rkSelectFinal', 'rkFinalChunks', 'dedupe + top N'],
+  ],
+}
+
+export const retrieveKnowledgeDemoPath = [
+  'rkInputs',
+  'rkSystemPrompt',
+  'rkUserPrompt',
+  'rkQueryPlanFn',
+  'rkQueryPlan',
+  'rkRouteSpecsInit',
+  'rkAppendOriginal',
+  'rkAppendHyde',
+  'rkAppendRewrites',
+  'rkRouteSpecs',
+  'rkRouteLoop',
+  'rkRouteQuery',
+  'rkQueryVectors',
+  'rkGetCollection',
+  'rkGetChromaClient',
+  'rkPersistentClient',
+  'rkGetOrCreateCollection',
+  'rkVectorWhere',
+  'rkCollectionQuery',
+  'rkVectorResults',
+  'rkVectorEmptyGuard',
+  'rkVectorDistances',
+  'rkVectorLoop',
+  'rkVectorMetaDistance',
+  'rkVectorAppendChunk',
+  'rkVectorReturnChunks',
+  'rkVectorChunks',
+  'rkRouteChunks',
+  'rkKeywordTerms',
+  'rkKeywordRecall',
+  'rkKeywordChunks',
+  'rkRouteResults',
+  'rkRrfFuse',
+  'rkFused',
+  'rkRerank',
+  'rkReranked',
+  'rkSelectFinal',
+  'rkFinalChunks',
+]
+
+export const retrieveKnowledgeBranchSpecs = [
+  {
+    title: 'query_plan failed',
+    symbol: 'build_query_plan()',
+    file: 'backend/tool/tools.py',
+    text: '规划模型失败时不会中断 retrieve_knowledge，会返回空 hyde、空 rewrites、fallback keywords，并把 error 放进 query_plan。',
+  },
+  {
+    title: 'rerank failed',
+    symbol: 'rerank_chunks()',
+    file: 'backend/tool/tools.py',
+    text: 'rerank_chunks 失败时返回空 reranked，最终选择使用 reranked or fused 自动回退到 RRF 结果。',
+  },
+  {
+    title: 'keyword guard',
+    symbol: '_select_final_chunks()',
+    file: 'backend/tool/tools.py',
+    text: '如果关键词路线最高分 >= 10 且没有进入候选，_select_final_chunks 会把它前置，保护制度和数字类精确命中。',
+  },
+]
+
+export const retrieveKnowledgeSymbolToNodeId = {
+  retrieve_knowledge: 'rkInputs',
+  'retrieve_knowledge()': 'rkInputs',
+  system_prompt: 'rkSystemPrompt',
+  user_prompt: 'rkUserPrompt',
+  build_query_plan: 'rkQueryPlanFn',
+  'build_query_plan()': 'rkQueryPlanFn',
+  query_plan: 'rkQueryPlan',
+  route_specs: 'rkRouteSpecs',
+  hyde_document: 'rkAppendHyde',
+  rewrites: 'rkAppendRewrites',
+  rewrite: 'rkAppendRewrites',
+  route: 'rkRouteQuery',
+  query: 'rkRouteQuery',
+  query_vectors: 'rkQueryVectors',
+  'query_vectors()': 'rkQueryVectors',
+  get_collection: 'rkGetCollection',
+  'get_collection()': 'rkGetCollection',
+  get_chroma_client: 'rkGetChromaClient',
+  'get_chroma_client()': 'rkGetChromaClient',
+  'chromadb.PersistentClient': 'rkPersistentClient',
+  PersistentClient: 'rkPersistentClient',
+  get_or_create_collection: 'rkGetOrCreateCollection',
+  where: 'rkVectorWhere',
+  'collection.query': 'rkCollectionQuery',
+  'collection.query()': 'rkCollectionQuery',
+  results: 'rkVectorResults',
+  documents: 'rkVectorResults',
+  metadatas: 'rkVectorResults',
+  ids: 'rkVectorResults',
+  distances: 'rkVectorDistances',
+  meta: 'rkVectorMetaDistance',
+  distance: 'rkVectorMetaDistance',
+  'chunks.append': 'rkVectorAppendChunk',
+  'chunks.append()': 'rkVectorAppendChunk',
+  chunks: 'rkRouteChunks',
+  keyword_terms: 'rkKeywordTerms',
+  keyword_recall: 'rkKeywordRecall',
+  'keyword_recall()': 'rkKeywordRecall',
+  keyword_chunks: 'rkKeywordChunks',
+  route_results: 'rkRouteResults',
+  rrf_fuse: 'rkRrfFuse',
+  'rrf_fuse()': 'rkRrfFuse',
+  fused: 'rkFused',
+  rerank_chunks: 'rkRerank',
+  'rerank_chunks()': 'rkRerank',
+  rerank: 'rkReranked',
+  reranked: 'rkReranked',
+  _select_final_chunks: 'rkSelectFinal',
+  '_select_final_chunks()': 'rkSelectFinal',
+  final_chunks: 'rkFinalChunks',
+}
+
 export const branchSpecs = [
   {
     title: 'LangChain Agent plan failed',

@@ -165,20 +165,20 @@ async def _run_langchain_agent(
 ) -> dict:
     fallback = _fallback_plan(question, "fallback")
     system_prompt = (
-        "You are a bounded LangChain RAG agent for an enterprise knowledge-base QA system. "
-        "You may use the provided retrieval tools, but keep the plan small. "
-        "Return a final JSON object only with keys: should_retrieve, queries, max_rounds, reason. "
-        f"max_rounds must be between 1 and {MAX_AGENT_ROUNDS}."
+        "你是企业知识库问答系统中的受控 LangChain RAG Agent。"
+        "你可以使用提供的检索工具，但检索计划必须保持简洁。"
+        "最终只能返回一个 JSON 对象，字段只能包含：should_retrieve、queries、max_rounds、reason。"
+        f"max_rounds 必须在 1 到 {MAX_AGENT_ROUNDS} 之间。"
     )
     user_prompt = json.dumps(
         {
             "question": question,
             "knowledge_base_id": knowledge_base_id,
-            "memory_context": _clip(memory_context, 1200),
+            "memory_context": memory_context or "",
             "rag_gate": rag_gate or {},
             "rules": {
-                "need_queries": "1 or 2 concise retrieval queries",
-                "fallback": "If uncertain, retrieve with the original question.",
+                "need_queries": "生成 1 到 2 条简洁的检索 query",
+                "fallback": "如果不确定，就使用原始问题进行检索。",
             },
         },
         ensure_ascii=False,
@@ -230,7 +230,7 @@ def _normalize_plan(data: dict, question: str) -> dict:
         "should_retrieve": should_retrieve is not False,
         "queries": queries[:MAX_AGENT_ROUNDS] or [question],
         "max_rounds": max(1, min(MAX_AGENT_ROUNDS, max_rounds)),
-        "reason": str(data.get("reason") or "LangChain agent planner completed.").strip(),
+        "reason": str(data.get("reason") or "LangChain Agent 已完成检索规划。").strip(),
         "source": "langchain_agent",
     }
 
@@ -240,7 +240,7 @@ def _fallback_plan(question: str, source: str) -> dict:
         "should_retrieve": True,
         "queries": [question],
         "max_rounds": 1,
-        "reason": "Use the stable retrieval path.",
+        "reason": "使用稳定的原始问题检索路径。",
         "source": source,
     }
 
@@ -347,13 +347,6 @@ def _safe_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
-
-
-def _clip(value: str, max_chars: int) -> str:
-    text = str(value or "")
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars].rstrip() + "...(truncated)"
 
 
 def _trace_add(trace_recorder: Any, *args, **kwargs) -> None:
