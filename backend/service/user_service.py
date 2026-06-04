@@ -10,6 +10,7 @@ from model.models import User
 from paths import AVATAR_DIR
 from schema.schemas import PasswordUpdate
 from service.auth_service import get_current_user, pwd_context
+from service.utils_service import AVATAR_MAX_BYTES, resolve_image_upload_type
 
 
 def seed_default_users() -> None:
@@ -35,18 +36,13 @@ def update_password(body: PasswordUpdate, user: User = Depends(get_current_user)
 
 
 async def upload_avatar(file: UploadFile = File(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    allowed_types = {
-        "image/png": ".png",
-        "image/jpeg": ".jpg",
-        "image/webp": ".webp",
-    }
-    content_type = file.content_type or ""
-    ext = allowed_types.get(content_type)
-    if not ext:
+    image_type = resolve_image_upload_type(file.content_type)
+    if not image_type:
         raise HTTPException(400, "仅支持 png、jpg、jpeg、webp 格式头像")
+    _content_type, ext = image_type
 
     content = await file.read()
-    if len(content) > 2 * 1024 * 1024:
+    if len(content) > AVATAR_MAX_BYTES:
         raise HTTPException(400, "头像文件不能超过 2MB")
 
     filename = f"user_{user.id}_{int(datetime.now().timestamp())}{ext}"

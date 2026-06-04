@@ -1,6 +1,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { chatAPI, streamChat } from '@/api/chat'
+import { RAGAS_STATUS, isPendingRagasStatus } from '@/utils/ragasStatus'
 
 const EVALUATION_POLL_INTERVAL_MS = 3000
 const EVALUATION_POLL_TIMEOUT_MS = 190000
@@ -25,7 +26,6 @@ export const useChatStore = defineStore('chat', () => {
   const streamingHasAttachments = ref(false)
   const streamImageAnalysis = ref(null)
   const evaluationPollTimer = ref(null)
-  const evaluationPollStartedAt = ref(0)
 
   const currentConversation = computed(() =>
     conversations.value.find((conversation) => conversation.id === currentId.value)
@@ -50,8 +50,8 @@ export const useChatStore = defineStore('chat', () => {
       title: conversation.title || '未命名对话',
       knowledge_base_id: conversation.knowledge_base_id || null,
       knowledge_base_name: conversation.knowledge_base_name || '',
-      created_at: conversation.created_at || new Date().toISOString(),
-      updated_at: conversation.updated_at || new Date().toISOString(),
+      created_at: conversation.created_at || '',
+      updated_at: conversation.updated_at || '',
     }
     if (index >= 0) {
       conversations.value[index] = { ...conversations.value[index], ...next }
@@ -194,7 +194,7 @@ export const useChatStore = defineStore('chat', () => {
         sources: streamSources.value,
         learning_trace: cloneTrace(streamTrace.value),
         ...streamImageAnalysisFields(),
-        ragas_status: shouldTrackEvaluation ? 'pending' : '',
+        ragas_status: shouldTrackEvaluation ? RAGAS_STATUS.PENDING : '',
         isLocal: true,
       })
     }
@@ -354,7 +354,7 @@ export const useChatStore = defineStore('chat', () => {
             item.content.includes(localMessage.content)
           )
       )
-      if (!exists && latestBackendAssistant && localMessage.ragas_status === 'pending') {
+      if (!exists && latestBackendAssistant && localMessage.ragas_status === RAGAS_STATUS.PENDING) {
         continue
       }
       if (!exists) {
@@ -369,13 +369,12 @@ export const useChatStore = defineStore('chat', () => {
 
   function hasPendingEvaluation(nextMessages = messages.value) {
     return nextMessages.some((message) =>
-      message.role === 'assistant' && ['pending', 'running'].includes(message.ragas_status)
+      message.role === 'assistant' && isPendingEvaluationStatus(message.ragas_status)
     )
   }
 
   function startEvaluationPolling(conversationId) {
     stopEvaluationPolling()
-    evaluationPollStartedAt.value = Date.now()
     let elapsed = 0
     evaluationPollTimer.value = window.setInterval(async () => {
       elapsed += EVALUATION_POLL_INTERVAL_MS
@@ -400,7 +399,6 @@ export const useChatStore = defineStore('chat', () => {
       window.clearInterval(evaluationPollTimer.value)
       evaluationPollTimer.value = null
     }
-    evaluationPollStartedAt.value = 0
   }
 
   function markLocalEvaluationTimeout() {
@@ -408,11 +406,11 @@ export const useChatStore = defineStore('chat', () => {
       if (
         message.role === 'assistant' &&
         message.isLocal &&
-        ['pending', 'running'].includes(message.ragas_status)
+        isPendingEvaluationStatus(message.ragas_status)
       ) {
         return {
           ...message,
-          ragas_status: 'failed',
+          ragas_status: RAGAS_STATUS.FAILED,
           ragas_error: '评测未及时返回，稍后刷新会话可查看最终状态',
         }
       }
@@ -456,8 +454,12 @@ export const useChatStore = defineStore('chat', () => {
       image_analysis_error: message.image_analysis_error || retrievalTrace.image_analysis_error || '',
       image_description: message.image_description || retrievalTrace.image_description || '',
       isLocal: Boolean(message.isLocal),
-      created_at: message.created_at || new Date().toISOString(),
+      created_at: message.created_at || '',
     }
+  }
+
+  function isPendingEvaluationStatus(status) {
+    return isPendingRagasStatus(status)
   }
 
   return {

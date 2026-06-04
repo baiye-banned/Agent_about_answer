@@ -1,4 +1,5 @@
 from io import BytesIO
+import re
 
 from fastapi import HTTPException
 from sqlalchemy.exc import SQLAlchemyError
@@ -131,17 +132,141 @@ def knowledge_file_save_error_message(exc: SQLAlchemyError) -> str:
     return "文件信息写入数据库失败，请稍后重试"
 
 
-def chunk_text(text: str, file_id: int, chunk_size: int = 500, chunk_overlap: int = 50) -> list[dict]:
-    """Split text into chunks with overlap and return them with ids."""
+_SECTION_HEADING_RE = re.compile(
+    r"^(?:"
+    r"[一二三四五六七八九十百千万零〇]+、"
+    r"|第[一二三四五六七八九十百千万零〇0-9]+[章节条款篇]"
+    r")"
+)
+_LIST_ITEM_RE = re.compile(r"^(?:[0-9]+|[一二三四五六七八九十百千万零〇]+)[、\.．)]")
+
+
+def _normalize_line(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_section_heading(line: str) -> bool:
+    stripped = _normalize_line(line)
+    return bool(stripped) and len(stripped) <= 24 and bool(_SECTION_HEADING_RE.match(stripped))
+
+
+def _is_list_item(line: str) -> bool:
+    stripped = _normalize_line(line)
+    return bool(stripped) and bool(_LIST_ITEM_RE.match(stripped))
+
+
+def _split_long_segment(segment: str, max_len: int) -> list[str]:
+    segment = _normalize_line(segment)
+    if not segment:
+        return []
+    if len(segment) <= max_len:
+        return [segment]
+
+    pieces: list[str] = []
+    for sentence in re.split(r"(?<=[。！？；;])", segment):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence) <= max_len:
+            pieces.append(sentence)
+            continue
+
+        clause_buffer = ""
+        for clause in re.split(r"(?<=[，,、：:])", sentence):
+            clause = clause.strip()
+            if not clause:
+                continue
+            candidate = f"{clause_buffer}{clause}" if clause_buffer else clause
+            if len(candidate) <= max_len:
+                clause_buffer = candidate
+                continue
+            if clause_buffer:
+                pieces.append(clause_buffer.strip())
+                clause_buffer = ""
+            if len(clause) <= max_len:
+                clause_buffer = clause
+            else:
+                for start in range(0, len(clause), max_len):
+                    tail = clause[start : start + max_len].strip()
+                    if tail:
+                        pieces.append(tail)
+        if clause_buffer:
+            pieces.append(clause_buffer.strip())
+
+    return pieces
+
+
+def chunk_text(text: str, file_id: int, chunk_size: int = 800, chunk_overlap: int = 50) -> list[dict]:
+    """Split text into semantic chunks that prefer headings, paragraphs, and sentences."""
+    text = "" if text is None else str(text)
     if not text.strip():
         return []
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunk_text_value = text[start:end].strip()
+
+    normalized_text = text.replace("\r\n", "\n").replace("\r", "\n")
+    raw_blocks = [block.strip() for block in re.split(r"\n\s*\n+", normalized_text) if block.strip()]
+
+    segments: list[str] = []
+    for block in raw_blocks:
+        block_lines = [line.strip() for line in block.split("\n") if line.strip()]
+        if not block_lines:
+            continue
+        if len(block_lines) == 1:
+            segments.extend(_split_long_segment(block_lines[0], chunk_size))
+            continue
+
+        for line in block_lines:
+            if _is_section_heading(line) or _is_list_item(line):
+                segments.append(line)
+            else:
+                segments.extend(_split_long_segment(line, chunk_size))
+
+    chunks: list[dict] = []
+    current_lines: list[str] = []
+    current_section: str = ""
+    previous_tail: str = ""
+
+    def flush_chunk() -> None:
+        nonlocal current_lines, previous_tail
+        if not current_lines:
+            return
+        chunk_text_value = "\n".join(current_lines).strip()
         if chunk_text_value:
-            chunks.append({"id": f"{start}", "text": chunk_text_value})
-        start += (chunk_size - chunk_overlap)
+            chunks.append({"id": f"{len(chunks)}", "text": chunk_text_value})
+        tail_candidate = ""
+        for candidate in reversed(current_lines):
+            if candidate and not _is_section_heading(candidate):
+                tail_candidate = candidate
+                break
+        previous_tail = tail_candidate if len(tail_candidate) <= chunk_overlap else ""
+        current_lines = []
+
+    for segment in segments:
+        if _is_section_heading(segment):
+            flush_chunk()
+            current_section = segment
+            current_lines = [segment]
+            previous_tail = ""
+            continue
+
+        if not current_lines and current_section:
+            current_lines.append(current_section)
+            if previous_tail and previous_tail != current_section:
+                current_lines.append(previous_tail)
+
+        projected_length = len("\n".join(current_lines + [segment]).strip()) if current_lines else len(segment)
+        if current_lines and projected_length > chunk_size:
+            flush_chunk()
+            current_lines = [current_section] if current_section else []
+            if previous_tail and previous_tail != current_section and previous_tail != segment:
+                current_lines.append(previous_tail)
+
+        if not current_lines and current_section:
+            current_lines = [current_section]
+
+        if current_lines and current_lines[-1] == current_section and segment == current_section:
+            continue
+        current_lines.append(segment)
+
+    flush_chunk()
     return chunks
 

@@ -171,9 +171,10 @@ import {
   Plus,
   Reading,
 } from '@element-plus/icons-vue'
-import { ElMessageBox } from 'element-plus'
 import { useChatStore } from '@/stores/chat'
 import { useUserStore } from '@/stores/user'
+import { confirmCenteredDelete } from '@/utils/confirm'
+import { normalizeApiAssetUrl } from '@/utils/url'
 
 const route = useRoute()
 const router = useRouter()
@@ -185,7 +186,7 @@ const activeMenu = computed(() => {
   if (route.path.startsWith('/knowledge')) return '/knowledge'
   return '/chat'
 })
-const avatarSrc = computed(() => normalizeAvatarUrl(userStore.avatarUrl))
+const avatarSrc = computed(() => normalizeApiAssetUrl(userStore.avatarUrl))
 const allConversationsSelected = computed(() =>
   Boolean(chatStore.conversations.length) &&
   chatStore.selectedConversationIds.length === chatStore.conversations.length
@@ -234,14 +235,9 @@ function toggleHistoryManageMode() {
 async function removeSelectedConversations() {
   if (!chatStore.selectedConversationIds.length) return
 
-  await ElMessageBox.confirm(
+  await confirmCenteredDelete(
     `确定删除选中的 ${chatStore.selectedConversationIds.length} 条历史对话吗？删除后不可恢复。`,
-    '批量删除对话',
-    {
-      confirmButtonText: '删除',
-      cancelButtonText: '取消',
-      type: 'warning',
-    }
+    '批量删除对话'
   )
 
   const deletingIds = [...chatStore.selectedConversationIds]
@@ -252,14 +248,6 @@ async function removeSelectedConversations() {
     }
   }
   chatStore.exitHistoryManageMode()
-}
-
-function normalizeAvatarUrl(url) {
-  if (!url) return ''
-  if (/^https?:\/\//.test(url)) return url
-  const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || '/api'
-  const origin = apiBaseUrl.replace(/\/api\/?$/, '')
-  return `${origin}${url}`
 }
 
 async function handleUserCommand(command) {

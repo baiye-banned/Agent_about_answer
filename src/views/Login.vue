@@ -60,6 +60,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { Connection, Lock, User } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { useUserStore } from '@/stores/user'
+import { getApiErrorMessage } from '@/utils/httpError'
 
 const route = useRoute()
 const router = useRouter()
@@ -90,11 +91,7 @@ async function handleLogin() {
     ElMessage.success('登录成功')
     router.replace(route.query.redirect || '/chat')
   } catch (error) {
-    const message =
-      error.response?.data?.detail ||
-      error.response?.data?.message ||
-      '用户名或密码错误'
-    ElMessage.error(message)
+    ElMessage.error(getApiErrorMessage(error, '用户名或密码错误'))
   } finally {
     loading.value = false
   }

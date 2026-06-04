@@ -233,6 +233,10 @@ import {
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { knowledgeAPI } from '@/api/knowledge'
 import { useKnowledgeStore } from '@/stores/knowledge'
+import { confirmCenteredDelete } from '@/utils/confirm'
+import { copyText } from '@/utils/clipboard'
+import { getApiErrorMessage } from '@/utils/httpError'
+import { formatDateTime, formatFileSize } from '@/utils'
 
 const allFiles = ref([])
 const currentKnowledgeBaseId = ref(null)
@@ -263,6 +267,8 @@ const knowledgeStore = useKnowledgeStore()
 const knowledgeBases = computed(() => knowledgeStore.knowledgeBases)
 
 const acceptTypes = '.txt,.md,.json,.csv,.yaml,.yml,.xml,.log,.pdf,.docx'
+const PICTURE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'])
+const ARCHIVE_EXTENSIONS = new Set(['zip', 'rar', '7z'])
 const knowledgeBaseRules = {
   name: [
     {
@@ -394,7 +400,7 @@ async function submitKnowledgeBaseDialog() {
   knowledgeBaseSubmitting.value = true
   try {
     if (knowledgeBaseDialogMode.value === 'create') {
-      const created = await knowledgeAPI.createBase(name)
+      const created = await knowledgeAPI.createBase(name, { silent: true })
       knowledgeStore.upsertKnowledgeBase(created)
       currentKnowledgeBaseId.value = created.id
       selectedFiles.value = []
@@ -404,7 +410,7 @@ async function submitKnowledgeBaseDialog() {
       await refreshKnowledgeBasesPreserving(created)
       await fetchFiles()
     } else if (current) {
-      const renamed = await knowledgeAPI.renameBase(current.id, name)
+      const renamed = await knowledgeAPI.renameBase(current.id, name, { silent: true })
       knowledgeStore.upsertKnowledgeBase(renamed)
       ElMessage.success('知识库已重命名')
       await refreshKnowledgeBasesPreserving(renamed)
@@ -412,7 +418,7 @@ async function submitKnowledgeBaseDialog() {
 
     knowledgeBaseDialogVisible.value = false
   } catch (error) {
-    const message = error.response?.data?.detail || error.response?.data?.message || '操作失败，请稍后重试'
+    const message = getApiErrorMessage(error, '操作失败，请稍后重试')
     if (isDuplicateKnowledgeBaseError(error, message)) {
       try {
         await ElMessageBox.alert('知识库已存在', '提示', {
@@ -469,7 +475,7 @@ function resetKnowledgeBaseDialog() {
 async function deleteKnowledgeBase() {
   const current = knowledgeBases.value.find((item) => item.id === currentKnowledgeBaseId.value)
   if (!current) return
-  const response = await confirmCentered(
+  const response = await confirmCenteredDelete(
     `确定删除知识库「${current.name}」吗？该知识库下的资料会一并删除，已有对话将切换到其他知识库。`,
     '删除知识库'
   ).then(() => knowledgeAPI.deleteBase(current.id))
@@ -515,20 +521,24 @@ async function handleUpload(files) {
 
   try {
     for (const [index, file] of validFiles.entries()) {
-      await knowledgeAPI.upload(file, currentKnowledgeBaseId.value, (event) => {
-        if (event.total) {
-          const fileProgress = event.loaded / event.total
-          uploadPercent.value = Math.round(((index + fileProgress) / validFiles.length) * 100)
-        }
-      })
+      await knowledgeAPI.upload(
+        file,
+        currentKnowledgeBaseId.value,
+        (event) => {
+          if (event.total) {
+            const fileProgress = event.loaded / event.total
+            uploadPercent.value = Math.round(((index + fileProgress) / validFiles.length) * 100)
+          }
+        },
+        { silent: true }
+      )
       uploadPercent.value = Math.round(((index + 1) / validFiles.length) * 100)
     }
 
     ElMessage.success(validFiles.length > 1 ? `已上传 ${validFiles.length} 个文件` : '上传成功')
     await refreshKnowledgeBaseAndFiles()
   } catch (error) {
-    const message = error.response?.data?.detail || error.response?.data?.message || '上传失败，请稍后重试'
-    ElMessage.error(message)
+    ElMessage.error(getApiErrorMessage(error, '上传失败，请稍后重试'))
   } finally {
     uploading.value = false
     uploadPercent.value = 0
@@ -541,7 +551,7 @@ function openUploadDialog() {
 }
 
 async function confirmDelete(file) {
-  await confirmCentered(`确定删除「${file.name}」吗？删除后不可恢复。`, '删除文件')
+  await confirmCenteredDelete(`确定删除「${file.name}」吗？删除后不可恢复。`, '删除文件')
   await knowledgeAPI.delete(file.id)
   ElMessage.success('删除成功')
   await refreshKnowledgeBaseAndFiles()
@@ -549,23 +559,20 @@ async function confirmDelete(file) {
 
 async function confirmBatchDelete() {
   if (!selectedFiles.value.length) return
-  await confirmCentered(`确定删除选中的 ${selectedFiles.value.length} 个资料吗？删除后不可恢复。`, '批量删除资料')
-  await knowledgeAPI.batchDelete(selectedFiles.value.map((file) => file.id))
-  ElMessage.success('已删除选中资料')
+  await confirmCenteredDelete(`确定删除选中的 ${selectedFiles.value.length} 个资料吗？删除后不可恢复。`, '批量删除资料')
+  const result = await knowledgeAPI.batchDelete(selectedFiles.value.map((file) => file.id), { silent: true })
+  if (result.failed) {
+    const message = `已删除 ${result.succeeded} 个资料，${result.failed} 个删除失败`
+    if (result.succeeded) {
+      ElMessage.warning(message)
+    } else {
+      ElMessage.error(message)
+    }
+  } else {
+    ElMessage.success('已删除选中资料')
+  }
   selectedFiles.value = []
   await refreshKnowledgeBaseAndFiles()
-}
-
-function confirmCentered(message, title) {
-  return ElMessageBox.confirm(message, title, {
-    confirmButtonText: '删除',
-    cancelButtonText: '取消',
-    type: 'warning',
-    draggable: false,
-    appendTo: 'body',
-    customClass: 'center-delete-dialog',
-    showClose: false,
-  })
 }
 
 async function refreshKnowledgeBaseAndFiles() {
@@ -588,19 +595,16 @@ async function showDetail(file) {
 }
 
 async function copyContent() {
-  try {
-    await navigator.clipboard.writeText(detailContent.value)
-    ElMessage.success('已复制到剪贴板')
-  } catch {
-    ElMessage.warning('复制失败，请手动选择内容')
-  }
+  await copyText(detailContent.value, {
+    successMessage: '已复制到剪贴板',
+    failureMessage: '复制失败，请手动选择内容',
+  })
 }
 
 function getFileIcon(name) {
   const ext = getFileExt(name).toLowerCase()
-  const pictureExts = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp']
-  if (pictureExts.includes(ext)) return Picture
-  if (['zip', 'rar', '7z'].includes(ext)) return Files
+  if (PICTURE_EXTENSIONS.has(ext)) return Picture
+  if (ARCHIVE_EXTENSIONS.has(ext)) return Files
   return Document
 }
 
@@ -608,30 +612,8 @@ function getFileExt(name) {
   return String(name || '').split('.').pop() || 'unknown'
 }
 
-function formatSize(bytes) {
-  if (!bytes) return '-'
-  const units = ['B', 'KB', 'MB', 'GB']
-  let size = Number(bytes)
-  let index = 0
-
-  while (size >= 1024 && index < units.length - 1) {
-    size /= 1024
-    index += 1
-  }
-
-  return `${size.toFixed(index === 0 ? 0 : 1)} ${units[index]}`
-}
-
-function formatTime(value) {
-  if (!value) return '-'
-  return new Date(value).toLocaleString('zh-CN', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
-}
+const formatSize = formatFileSize
+const formatTime = formatDateTime
 </script>
 
 <style scoped>
@@ -643,99 +625,6 @@ function formatTime(value) {
 </style>
 
 <style>
-.center-delete-dialog {
-  position: fixed;
-  top: 50%;
-  left: 50%;
-  margin: 0;
-  padding: 0;
-  transform: translate(-50%, -50%);
-  width: min(440px, calc(100vw - 32px));
-  overflow: hidden;
-  border: 1px solid #e2e8f0;
-  border-radius: 8px;
-  background: #ffffff;
-  box-shadow: 0 20px 45px rgb(15 23 42 / 16%);
-}
-
-.center-delete-dialog .el-message-box__header {
-  padding: 22px 24px 0;
-}
-
-.center-delete-dialog .el-message-box__title {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  color: #0f172a;
-  font-size: 18px;
-  font-weight: 650;
-  line-height: 1.35;
-}
-
-.center-delete-dialog .el-message-box__title::before {
-  display: inline-flex;
-  flex: 0 0 auto;
-  width: 34px;
-  height: 34px;
-  align-items: center;
-  justify-content: center;
-  border-radius: 8px;
-  background: #fef2f2;
-  color: #dc2626;
-  content: "!";
-  font-size: 18px;
-  font-weight: 700;
-}
-
-.center-delete-dialog .el-message-box__content {
-  padding: 14px 24px 0;
-  color: #475569;
-  font-size: 14px;
-  line-height: 1.75;
-}
-
-.center-delete-dialog .el-message-box__container {
-  display: block;
-}
-
-.center-delete-dialog .el-message-box__status {
-  display: none;
-}
-
-.center-delete-dialog .el-message-box__message {
-  margin: 0;
-}
-
-.center-delete-dialog .el-message-box__message p {
-  margin: 0;
-  word-break: break-word;
-}
-
-.center-delete-dialog .el-message-box__btns {
-  display: flex;
-  justify-content: flex-end;
-  gap: 10px;
-  padding: 22px 24px 24px;
-}
-
-.center-delete-dialog .el-button {
-  min-width: 76px;
-  height: 36px;
-  border-radius: 6px;
-  font-weight: 500;
-}
-
-.center-delete-dialog .el-button--primary {
-  border-color: #dc2626;
-  background: #dc2626;
-}
-
-.center-delete-dialog .el-button--primary:hover,
-.center-delete-dialog .el-button--primary:focus {
-  border-color: #b91c1c;
-  background: #b91c1c;
-}
-
 .knowledge-base-alert-dialog {
   position: fixed;
   top: 50%;

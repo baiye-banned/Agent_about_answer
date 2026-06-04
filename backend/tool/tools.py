@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -10,10 +11,18 @@ from langchain.tools import tool
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from rag.chroma_client import embedding_backend_status, query_vectors
-from config import RETRIEVAL_RERANK_TOP_N, RETRIEVAL_ROUTE_TOP_K
+from rag.milvus_client import embedding_backend_status, query_vectors
+from config import (
+    RETRIEVAL_ROUTE_TOP_K,
+)
 from model.models import KnowledgeFile
 from rag.llm import call_chat_json, call_router_json
+from tool.rerank import (
+    chunk_key,
+    rerank_chunks,
+    select_final_chunks,
+    trace_chunk,
+)
 
 
 ROUTE_CONFIDENCE_THRESHOLD = 0.55
@@ -74,9 +83,9 @@ async def decide_need_rag(
 ) -> dict:
     attachments = attachments or []
     payload = {
-        "question": (question or "").strip(),
+        "question": ("" if question is None else str(question)).strip(),
         "memory_context": _clip(memory_context, 1800),
-        "knowledge_base_name": knowledge_base_name or "",
+        "knowledge_base_name": "" if knowledge_base_name is None else str(knowledge_base_name),
         "attachments_count": len(attachments),
     }
     try:
@@ -129,7 +138,7 @@ async def retrieve_knowledge_tool(question: str) -> str:
     return json.dumps(
         {
             "chunks_count": len(chunks),
-            "top_chunks": [_trace_chunk(item) for item in chunks[:5]],
+            "top_chunks": [trace_chunk(item) for item in chunks[:5]],
             "trace": {
                 "query_plan": trace.get("query_plan", {}),
                 "routes_count": len(trace.get("routes") or []),
@@ -145,6 +154,7 @@ async def retrieve_knowledge(
     knowledge_base_id: int,
     db: Session,
     trace_recorder: Any = None,
+    query_plan: dict | None = None,
 ) -> tuple[list[dict], dict]:
     _trace_add(
         trace_recorder,
@@ -153,7 +163,7 @@ async def retrieve_knowledge(
         params={"question": question, "knowledge_base_id": knowledge_base_id},
         note="LangChain Agent 调用 retrieve_knowledge 工具，进入多路召回、融合和重排。",
     )
-    query_plan = await build_query_plan(question)
+    query_plan = _normalize_external_query_plan(query_plan, question) if query_plan else await build_query_plan(question)
     trace = {
         "embedding": embedding_backend_status(),
         "query_plan": query_plan,
@@ -163,11 +173,7 @@ async def retrieve_knowledge(
     }
 
     route_results: list[tuple[str, list[dict]]] = []
-    route_specs = [("original", question)]
-    if query_plan.get("hyde_document"):
-        route_specs.append(("hyde", query_plan["hyde_document"]))
-    for index, rewrite in enumerate(query_plan.get("rewrites") or [], start=1):
-        route_specs.append((f"rewrite_{index}", rewrite))
+    route_specs = _build_route_specs(question, query_plan)
 
     for route, query in route_specs:
         chunks = query_vectors(
@@ -182,27 +188,36 @@ async def retrieve_knowledge(
                 "route": route,
                 "query": query,
                 "count": len(chunks),
-                "items": [_trace_chunk(item) for item in chunks[:5]],
+                "items": [trace_chunk(item) for item in chunks[:5]],
             }
         )
 
-    keyword_terms = _merge_keywords(query_plan.get("keywords") or [], question)
-    keyword_chunks = keyword_recall(db, knowledge_base_id, keyword_terms, RETRIEVAL_ROUTE_TOP_K)
-    route_results.append(("keyword", keyword_chunks))
-    trace["routes"].append(
-        {
-            "route": "keyword",
-            "query": " ".join(keyword_terms),
-            "count": len(keyword_chunks),
-            "items": [_trace_chunk(item) for item in keyword_chunks[:5]],
-        }
+    keyword_terms = _merge_keywords(
+        [
+            *(query_plan.get("keywords") or []),
+            *(query_plan.get("required_evidence") or []),
+        ],
+        question,
     )
+    keyword_chunks = []
+    if keyword_terms:
+        keyword_chunks = keyword_recall(db, knowledge_base_id, keyword_terms, RETRIEVAL_ROUTE_TOP_K)
+        route_results.append(("keyword", keyword_chunks))
+        trace["routes"].append(
+            {
+                "route": "keyword",
+                "query": " ".join(keyword_terms),
+                "count": len(keyword_chunks),
+                "items": [trace_chunk(item) for item in keyword_chunks[:5]],
+            }
+        )
 
     fused = rrf_fuse(route_results)
-    trace["rrf"] = [_trace_chunk(item) for item in fused[:10]]
-    reranked, rerank_trace = await rerank_chunks(question, fused[:12])
+    trace["rrf"] = [trace_chunk(item) for item in fused[:10]]
+    ranking_question = query_plan.get("original_question") or question
+    reranked, rerank_trace = await rerank_chunks(ranking_question, fused[:12])
     trace["rerank"] = rerank_trace
-    final_chunks = _select_final_chunks(reranked or fused, keyword_chunks)
+    final_chunks = select_final_chunks(reranked or fused, keyword_chunks)
     _trace_add(
         trace_recorder,
         "langchain_retriever_done",
@@ -219,12 +234,64 @@ async def retrieve_knowledge(
     return final_chunks, trace
 
 
+def _normalize_external_query_plan(plan: dict | None, question: str) -> dict:
+    if not isinstance(plan, dict):
+        return {
+            "hyde_document": "",
+            "rewrites": [],
+            "keywords": _fallback_keywords(question),
+            "error": "external query_plan is invalid",
+        }
+    question_text = _text_value(question).strip()
+    simplified_question = _text_value(plan.get("simplified_question")).strip() or question_text
+    rewrites = _clean_list(plan.get("rewrites"))[:3]
+    sub_questions = _clean_list(plan.get("sub_questions"))[:3]
+    required_evidence = _clean_list(plan.get("required_evidence"))[:6]
+    keywords = _merge_keywords(_clean_list(plan.get("keywords")), " ".join([question_text, simplified_question]))
+    return {
+        **plan,
+        "original_question": _text_value(plan.get("original_question")).strip() or question_text,
+        "simplified_question": simplified_question or question_text,
+        "sub_questions": sub_questions,
+        "hyde_document": _text_value(plan.get("hyde_document")).strip(),
+        "rewrites": rewrites,
+        "keywords": keywords[:24],
+        "required_evidence": required_evidence,
+        "error": _text_value(plan.get("error")),
+    }
+
+
+def _build_route_specs(question: str, query_plan: dict) -> list[tuple[str, str]]:
+    route_specs: list[tuple[str, str]] = []
+    _append_route(route_specs, "planned", question)
+    simplified_question = _text_value(query_plan.get("simplified_question")).strip()
+    if simplified_question and simplified_question != question:
+        _append_route(route_specs, "simplified", simplified_question)
+    for index, sub_question in enumerate(query_plan.get("sub_questions") or [], start=1):
+        _append_route(route_specs, f"sub_question_{index}", sub_question)
+    if query_plan.get("hyde_document"):
+        _append_route(route_specs, "hyde", query_plan["hyde_document"])
+    for index, rewrite in enumerate(query_plan.get("rewrites") or [], start=1):
+        _append_route(route_specs, f"rewrite_{index}", rewrite)
+    return route_specs
+
+
+def _append_route(route_specs: list[tuple[str, str]], route: str, query: str) -> None:
+    text = _text_value(query).strip()
+    if not text:
+        return
+    normalized = _normalize_for_match(text)
+    if any(_normalize_for_match(existing_query) == normalized for _, existing_query in route_specs):
+        return
+    route_specs.append((route, text))
+
+
 @tool("keyword_recall", args_schema=KeywordRecallInput)
 def keyword_recall_tool(keywords: list[str], top_k: int = RETRIEVAL_ROUTE_TOP_K) -> str:
     """Recall text chunks by keyword from the current runtime knowledge base."""
     runtime = _runtime()
     chunks = keyword_recall(runtime.db, runtime.knowledge_base_id, keywords, top_k)
-    return json.dumps({"chunks": [_trace_chunk(item) for item in chunks]}, ensure_ascii=False)
+    return json.dumps({"chunks": [trace_chunk(item) for item in chunks]}, ensure_ascii=False)
 
 
 def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top_k: int) -> list[dict]:
@@ -260,15 +327,25 @@ def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top
 @tool("rrf_fuse")
 def rrf_fuse_tool(route_results_json: str, k: int = 60) -> str:
     """Fuse multiple retrieval routes with reciprocal rank fusion."""
-    route_results = json.loads(route_results_json)
+    try:
+        route_results = json.loads(route_results_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        return json.dumps({"chunks": [], "error": str(exc)}, ensure_ascii=False)
     return json.dumps({"chunks": rrf_fuse(route_results, k)}, ensure_ascii=False)
 
 
 def rrf_fuse(route_results: list[tuple[str, list[dict]]], k: int = 60) -> list[dict]:
     fused: dict[str, dict] = {}
-    for route, chunks in route_results:
+    for route_entry in route_results:
+        if not isinstance(route_entry, (list, tuple)) or len(route_entry) != 2:
+            continue
+        route, chunks = route_entry
+        if not isinstance(chunks, list):
+            continue
         for rank, chunk in enumerate(chunks, start=1):
-            key = _chunk_key(chunk)
+            if not isinstance(chunk, dict):
+                continue
+            key = chunk_key(chunk)
             entry = fused.setdefault(key, {**chunk, "routes": [], "rrf_score": 0.0})
             entry["rrf_score"] += 1.0 / (k + rank)
             entry["routes"].append({"route": route, "rank": rank})
@@ -279,52 +356,8 @@ def rrf_fuse(route_results: list[tuple[str, list[dict]]], k: int = 60) -> list[d
 async def rerank_chunks_tool(question: str, chunks: list[dict]) -> str:
     """Rerank retrieved chunks against the user question."""
     reranked, trace = await rerank_chunks(question, chunks)
-    return json.dumps({"chunks": [_trace_chunk(item) for item in reranked], "trace": trace}, ensure_ascii=False)
+    return json.dumps({"chunks": [trace_chunk(item) for item in reranked], "trace": trace}, ensure_ascii=False)
 
-
-async def rerank_chunks(question: str, chunks: list[dict]) -> tuple[list[dict], dict]:
-    if not chunks:
-        return [], {"status": "skipped", "items": []}
-    compact_candidates = [
-        {
-            "id": index,
-            "file_name": chunk.get("file_name", ""),
-            "content": (chunk.get("content") or "")[:700],
-        }
-        for index, chunk in enumerate(chunks, start=1)
-    ]
-    system_prompt = (
-        "你是企业知识库 RAG 重排器。只输出 JSON，不要输出 Markdown。"
-        "根据用户问题评估候选片段相关性，返回字段 results，数组元素包含 id、score、reason。"
-        "score 范围 0 到 1。"
-    )
-    user_prompt = json.dumps(
-        {
-            "question": question,
-            "candidates": compact_candidates,
-            "top_n": RETRIEVAL_RERANK_TOP_N,
-        },
-        ensure_ascii=False,
-    )
-    try:
-        data = await call_chat_json(system_prompt, user_prompt, max_tokens=1200)
-        rows = data.get("results") or []
-        by_id = {index: chunk for index, chunk in enumerate(chunks, start=1)}
-        reranked = []
-        trace_items = []
-        for row in rows:
-            candidate_id = int(row.get("id"))
-            chunk = by_id.get(candidate_id)
-            if not chunk:
-                continue
-            score = float(row.get("score", 0))
-            next_chunk = {**chunk, "rerank_score": score, "rerank_reason": str(row.get("reason", ""))}
-            reranked.append(next_chunk)
-            trace_items.append(_trace_chunk(next_chunk))
-        reranked.sort(key=lambda item: item.get("rerank_score", 0), reverse=True)
-        return reranked, {"status": "done", "items": trace_items}
-    except Exception as exc:
-        return [], {"status": "failed", "error": str(exc), "items": []}
 
 
 LANGCHAIN_RETRIEVAL_TOOLS = [
@@ -406,14 +439,20 @@ def _to_confidence(value) -> float:
         number = float(value)
     except (TypeError, ValueError):
         return 0.0
+    if not math.isfinite(number):
+        return 0.0
     return max(0.0, min(1.0, number))
 
 
 def _clip(value: str, max_chars: int) -> str:
-    text = str(value or "")
+    text = "" if value is None else str(value)
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "...(truncated)"
+
+
+def _text_value(value: Any) -> str:
+    return "" if value is None else str(value)
 
 
 def _clean_list(value) -> list[str]:
@@ -423,7 +462,7 @@ def _clean_list(value) -> list[str]:
 
 
 def _fallback_keywords(question: str) -> list[str]:
-    text = question or ""
+    text = _text_value(question)
     keywords: list[str] = []
     numeric_phrases = re.findall(r"\d+\s*(?:分钟|元|次|天|小时)(?:以内|以上|以下|内|外)?", text)
     keywords.extend(numeric_phrases)
@@ -461,7 +500,7 @@ def _dedupe_keywords(keywords: list[str]) -> list[str]:
     result = []
     seen = set()
     for keyword in keywords:
-        value = str(keyword or "").strip()
+        value = _text_value(keyword).strip()
         normalized = _normalize_for_match(value)
         if len(normalized) < 2 or normalized in seen:
             continue
@@ -473,7 +512,7 @@ def _dedupe_keywords(keywords: list[str]) -> list[str]:
 def _expand_keywords(keywords: list[str]) -> list[str]:
     expanded = []
     for keyword in keywords:
-        value = str(keyword or "").strip()
+        value = _text_value(keyword).strip()
         if not value:
             continue
         expanded.append(value)
@@ -535,26 +574,10 @@ def _has_close_matches(content: str, keywords: list[str], window: int = 120) -> 
 
 
 def _normalize_for_match(text: str) -> str:
-    return re.sub(r"\s+", "", str(text or "").lower())
+    value = "" if text is None else str(text)
+    return re.sub(r"\s+", "", value.lower())
 
 
-def _select_final_chunks(ranked_chunks: list[dict], keyword_chunks: list[dict]) -> list[dict]:
-    selected = list(ranked_chunks[:RETRIEVAL_RERANK_TOP_N])
-    if keyword_chunks:
-        best_keyword = keyword_chunks[0]
-        best_score = float(best_keyword.get("keyword_score") or 0)
-        already_selected = any(_chunk_key(chunk) == _chunk_key(best_keyword) for chunk in selected)
-        if best_score >= 10 and not already_selected:
-            selected = [best_keyword, *selected]
-    deduped = []
-    seen = set()
-    for chunk in selected:
-        key = _chunk_key(chunk)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(chunk)
-    return deduped[:RETRIEVAL_RERANK_TOP_N]
 
 
 def _split_keyword_chunks(content: str, chunk_size: int = 900, chunk_overlap: int = 180) -> list[dict]:
@@ -567,23 +590,6 @@ def _split_keyword_chunks(content: str, chunk_size: int = 900, chunk_overlap: in
     return chunks
 
 
-def _chunk_key(chunk: dict) -> str:
-    return f"{chunk.get('file_id', 0)}:{chunk.get('chunk_id') or chunk.get('id')}"
-
-
-def _trace_chunk(chunk: dict) -> dict:
-    return {
-        "file_id": chunk.get("file_id", 0),
-        "file_name": chunk.get("file_name", ""),
-        "chunk_id": chunk.get("chunk_id", ""),
-        "route": chunk.get("route", ""),
-        "routes": chunk.get("routes", []),
-        "rrf_score": chunk.get("rrf_score"),
-        "rerank_score": chunk.get("rerank_score"),
-        "rerank_reason": chunk.get("rerank_reason", ""),
-        "keyword_score": chunk.get("keyword_score"),
-        "excerpt": (chunk.get("content") or "")[:120],
-    }
 
 
 def _trace_add(trace_recorder: Any, *args, **kwargs) -> None:

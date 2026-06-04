@@ -231,7 +231,8 @@
 <script setup>
 import { computed, defineComponent, h, ref, watch } from 'vue'
 import { ArrowRight, CopyDocument } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { copyText } from '@/utils/clipboard'
+import { formatJson } from '@/utils'
 
 const GROUP_ORDER = ['params', 'uses', 'creates', 'result']
 const INPUT_GROUPS = ['params', 'uses']
@@ -330,8 +331,11 @@ function buildVariables(event, groups) {
   const rows = []
   for (const group of groups) {
     const value = event?.[group]
-    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
-    for (const [name, rawValue] of Object.entries(value)) {
+    if (value === null || value === undefined) continue
+    const entries = typeof value === 'object' && !Array.isArray(value)
+      ? Object.entries(value)
+      : [['value', value]]
+    for (const [name, rawValue] of entries) {
       rows.push({
         id: `${event.index ?? 'x'}-${group}-${name}`,
         name,
@@ -419,12 +423,9 @@ function selectVariable(id) {
 
 async function copySelectedVariable() {
   if (!selectedVariable.value) return
-  try {
-    await navigator.clipboard.writeText(selectedVariable.value.fullValue)
-    ElMessage.success('变量值已复制')
-  } catch {
-    ElMessage.warning('复制失败，请手动选择文本')
-  }
+  await copyText(selectedVariable.value.fullValue, {
+    successMessage: '变量值已复制',
+  })
 }
 
 function formatNeighbor(item, emptyText) {
@@ -433,11 +434,9 @@ function formatNeighbor(item, emptyText) {
 }
 
 function stringifyFull(value) {
-  try {
-    return typeof value === 'string' ? value : JSON.stringify(value ?? {}, null, 2)
-  } catch {
-    return String(value ?? '--')
-  }
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'string') return value
+  return formatJson(value)
 }
 
 function stringifyBrief(value, maxLength = 120) {

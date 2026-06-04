@@ -42,9 +42,7 @@ async def _build_recent_memory_text(
 
 
 def _build_memory_context(
-    db: Session,
     conversation: Conversation,
-    current_message_id: int,
     recent_text: str | None = None,
 ) -> str:
     summary = (conversation.memory_summary or "").strip()
@@ -305,7 +303,7 @@ async def _compact_summary_if_needed(db: Session, conversation: Conversation, tr
 def _format_messages_for_summary(messages: list[Message]) -> str:
     lines = []
     for message in messages:
-        content = _clip_text((message.content or "").strip(), 1200)
+        content = _clip_text(message.content, 1200)
         if not content:
             continue
         role = "用户" if message.role == "user" else "助手"
@@ -341,7 +339,7 @@ def _group_message_texts_into_turns(messages: list[Message]) -> list[list[str]]:
     for turn in _group_messages_into_turns(messages):
         rendered_turn = []
         for message in turn:
-            content = (message.content or "").strip()
+            content = _clip_text(message.content, 1200)
             if not content:
                 continue
             role = "用户" if message.role == "user" else "助手"

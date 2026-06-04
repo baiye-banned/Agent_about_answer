@@ -1,12 +1,11 @@
-import json
-
 from sqlalchemy.orm import Session
 
 from model.models import ChatTraceSession, Conversation, Message
+from service.json_utils import load_json_value
 
 
 def serialize_message(message: Message) -> dict:
-    retrieval_trace = _loads_json(message.retrieval_trace, {})
+    retrieval_trace = load_json_value(message.retrieval_trace, {})
     if not isinstance(retrieval_trace, dict):
         retrieval_trace = {}
 
@@ -14,10 +13,10 @@ def serialize_message(message: Message) -> dict:
         "id": message.id,
         "role": message.role,
         "content": message.content,
-        "sources": _loads_json(message.sources, []),
-        "attachments": _loads_json(message.attachments, []),
+        "sources": load_json_value(message.sources, []),
+        "attachments": load_json_value(message.attachments, []),
         "ragas_status": message.ragas_status or "",
-        "ragas_scores": _loads_json(message.ragas_scores, {}),
+        "ragas_scores": load_json_value(message.ragas_scores, {}),
         "ragas_error": message.ragas_error or "",
         "retrieval_trace": retrieval_trace,
         "image_analysis_status": retrieval_trace.get("image_analysis_status", ""),
@@ -77,12 +76,3 @@ def get_message_by_user(db: Session, message_id: int, user_id: int) -> Message |
 
 def get_trace_session_by_message(db: Session, message_id: int, user_id: int) -> ChatTraceSession | None:
     return db.query(ChatTraceSession).filter_by(message_id=message_id, user_id=user_id).first()
-
-
-def _loads_json(value, default):
-    if not value:
-        return default
-    try:
-        return json.loads(value)
-    except Exception:
-        return default

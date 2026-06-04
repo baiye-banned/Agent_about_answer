@@ -6,7 +6,7 @@ import httpx
 
 from config import VISION_API_KEY, VISION_BASE_URL, VISION_MODEL
 from service.oss_service import _public_oss_url
-from rag.llm_service import _openai_chat_url
+from rag.llm import openai_chat_url
 
 
 logger = logging.getLogger(__name__)
@@ -136,7 +136,7 @@ async def _request_image_description(prompt: str, image_urls: list[str]) -> str:
     }
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(_openai_chat_url(VISION_BASE_URL), json=payload, headers=headers)
+            response = await client.post(openai_chat_url(VISION_BASE_URL), json=payload, headers=headers)
         if response.status_code >= 400:
             detail = response.text[:300]
             logger.warning("Vision description failed: status=%s detail=%s", response.status_code, detail)

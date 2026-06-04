@@ -11,7 +11,7 @@ from database.session import get_db
 from rag.learning_trace import TraceRecorder, get_trace_snapshot, serialize_trace_session as _serialize_trace_session
 from model.models import User
 from service.auth_service import get_current_user
-from service.utils_service import _loads_json
+from service.json_utils import load_json_value
 
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,7 @@ def get_message_trace(message_id: int, user: User = Depends(get_current_user),
     if not message:
         raise HTTPException(404, "消息不存在")
 
-    retrieval_trace = _loads_json(message.retrieval_trace, {})
+    retrieval_trace = load_json_value(message.retrieval_trace, {})
     learning_trace = retrieval_trace.get("learning_trace", {}) if isinstance(retrieval_trace, dict) else {}
     trace_id = learning_trace.get("trace_id")
     if trace_id:

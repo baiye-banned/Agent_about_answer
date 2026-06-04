@@ -12,7 +12,7 @@ def _now_iso() -> str:
 
 def _clip_text(value: str, max_chars: int | None = None) -> str:
     limit = max_chars or LEARNING_TRACE_MAX_TEXT_CHARS
-    text = str(value or "")
+    text = "" if value is None else str(value)
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "...(已截断)"
@@ -48,6 +48,10 @@ def sanitize_trace_value(value, key: str | None = None):
     return value
 
 
+def _trace_object(value):
+    return {} if value is None else value
+
+
 def compact_trace_reference(trace: dict | None) -> dict:
     trace = trace or {}
     events = trace.get("events") or []
@@ -69,7 +73,7 @@ def summarize_messages(messages) -> list[dict]:
         rows.append({
             "id": getattr(message, "id", None),
             "role": getattr(message, "role", ""),
-            "content": summarize_text(getattr(message, "content", "") or "", 260),
+            "content": summarize_text(getattr(message, "content", ""), 260),
         })
     return rows
 
@@ -103,10 +107,10 @@ class TraceRecorder:
             "time": _now_iso(),
             "stage": stage,
             "function": function,
-            "creates": sanitize_trace_value(creates or {}),
-            "uses": sanitize_trace_value(uses or {}),
-            "params": sanitize_trace_value(params or {}),
-            "result": sanitize_trace_value(result or {}),
+            "creates": sanitize_trace_value(_trace_object(creates)),
+            "uses": sanitize_trace_value(_trace_object(uses)),
+            "params": sanitize_trace_value(_trace_object(params)),
+            "result": sanitize_trace_value(_trace_object(result)),
             "note": note,
         }
         self.events.append(event)
@@ -174,10 +178,10 @@ def append_trace_event(trace_id: str | None, stage: str, function: str, **kwargs
         "time": _now_iso(),
         "stage": stage,
         "function": function,
-        "creates": sanitize_trace_value(kwargs.get("creates") or {}),
-        "uses": sanitize_trace_value(kwargs.get("uses") or {}),
-        "params": sanitize_trace_value(kwargs.get("params") or {}),
-        "result": sanitize_trace_value(kwargs.get("result") or {}),
+        "creates": sanitize_trace_value(_trace_object(kwargs.get("creates"))),
+        "uses": sanitize_trace_value(_trace_object(kwargs.get("uses"))),
+        "params": sanitize_trace_value(_trace_object(kwargs.get("params"))),
+        "result": sanitize_trace_value(_trace_object(kwargs.get("result"))),
         "note": kwargs.get("note", ""),
     }
     crud_trace.append_trace_event(trace_id, event, status=kwargs.get("status"))

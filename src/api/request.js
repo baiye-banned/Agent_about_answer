@@ -1,6 +1,7 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import router from '@/router'
+import { getApiErrorMessage } from '@/utils/httpError'
 
 const request = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
@@ -19,11 +20,7 @@ request.interceptors.response.use(
   (response) => response.data,
   (error) => {
     const status = error.response?.status
-    const message =
-      error.response?.data?.detail ||
-      error.response?.data?.message ||
-      error.message ||
-      '请求失败，请稍后重试'
+    const message = getApiErrorMessage(error)
 
     if (status === 401) {
       if (router.currentRoute.value.path !== '/login') {

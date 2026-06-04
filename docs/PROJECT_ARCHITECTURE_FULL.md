@@ -38,7 +38,7 @@ flowchart LR
     VisionSvc["backend/rag/vision_service.py<br/>图片分析"]
     LangChainAgent["backend/agent/agent.py<br/>受限检索规划"]
     Tool["backend/tool/tools.py<br/>路由判断 / 检索工具 / 重排"]
-    Chroma["backend/rag/chroma_client.py<br/>向量库 + Embedding"]
+    MilvusClient["backend/rag/milvus_client.py<br/>向量库 + Embedding"]
     Ragas["backend/rag/ragas_eval.py<br/>在线 RAGAS"]
     Trace["backend/rag/learning_trace.py<br/>TraceRecorder"]
     Checkpointer["backend/database/checkpointer.py<br/>SQLite checkpoint"]
@@ -49,7 +49,7 @@ flowchart LR
     MainPy --> VisionSvc
     MainPy --> LangChainAgent
     MainPy --> Tool
-    MainPy --> Chroma
+    MainPy --> MilvusClient
     MainPy --> Ragas
     MainPy --> Trace
     MainPy --> Checkpointer
@@ -58,7 +58,7 @@ flowchart LR
   subgraph Storage["持久化层"]
     direction TB
     MySQL["MySQL<br/>users / knowledge_bases / conversations / messages / knowledge_files / chat_trace_sessions"]
-    ChromaDB["ChromaDB<br/>knowledge chunks"]
+    Milvus["Milvus / Milvus Lite<br/>knowledge chunks"]
     SQLite["SQLite<br/>checkpointer.db"]
   end
 
@@ -77,11 +77,11 @@ flowchart LR
   ChatSvc --> LangChainAgent
   ChatSvc --> Tool
   LangChainAgent --> Tool
-  KnowledgeSvc --> Chroma
-  Tool --> ChromaDB
+  KnowledgeSvc --> MilvusClient
+  Tool --> Milvus
   Tool --> DeepSeek
   LangChainAgent --> DeepSeek
-  Chroma --> DashScope
+  MilvusClient --> DashScope
   ChatSvc --> OSS
   VisionSvc --> OSS
   Trace --> MySQL
@@ -127,10 +127,10 @@ flowchart TD
   end
 
   subgraph LearnFlow["学习中心子系统"]
-    FlowSpec["src/views/learnFlowSpec.js<br/>flowSpec / demoPath / branchSpecs"]
-    Canvas["src/views/LearnCanvas.vue"]
-    TracePanel["src/views/LearnTracePanel.vue"]
-    FlowDoc["docs/PROJECT_FLOW_DIAGRAM.md<br/>五条主线流程图"]
+    LearnHome["src/views/Learn.vue<br/>视图切换容器"]
+    AgentPaper["src/views/AgenticRetrievePaper.vue<br/>agentic_retrieve_knowledge 流程图"]
+    RetrievePaper["src/views/RetrieveKnowledgePaper.vue<br/>retrieve_knowledge 流程图"]
+    FlowDoc["docs/PROJECT_FLOW_DIAGRAM.md<br/>主线流程图"]
   end
 
   MainJS --> AppVue --> Router --> LayoutVue
@@ -154,11 +154,10 @@ flowchart TD
   ChatStore --> ChatAPI
   KnowledgeStore --> KnowledgeAPI
 
-  Learn --> FlowSpec
-  Learn --> Canvas
-  Learn --> TracePanel
+  Learn --> LearnHome
+  LearnHome --> AgentPaper
+  LearnHome --> RetrievePaper
   Learn --> FlowDoc
-  Learn --> ChatAPI
 ```
 
 ## 3. 后端架构图
@@ -182,7 +181,7 @@ flowchart LR
     VisionSvc["backend/rag/vision_service.py<br/>_build_effective_question / image analysis"]
     LangChainAgent["backend/agent/agent.py<br/>agentic_retrieve_knowledge / create_agent"]
     Tool["backend/tool/tools.py<br/>@tool decide_need_rag / retrieve_knowledge / rerank"]
-    Chroma["backend/rag/chroma_client.py<br/>query_vectors / add_chunks"]
+    MilvusClient["backend/rag/milvus_client.py<br/>query_vectors / add_chunks"]
     Trace["backend/rag/learning_trace.py<br/>TraceRecorder / snapshot"]
     Ragas["backend/rag/ragas_eval.py<br/>evaluate_message_async"]
     Checkpointer["backend/database/checkpointer.py"]
@@ -190,7 +189,7 @@ flowchart LR
 
   subgraph Services["外部 / 存储"]
     MySQL["MySQL"]
-    ChromaDB["ChromaDB"]
+    Milvus["Milvus / Milvus Lite"]
     OSS["OSS"]
     DeepSeek["DeepSeek"]
     DashScope["DashScope embeddings"]
@@ -205,10 +204,10 @@ flowchart LR
   ChatSvc --> VisionSvc
   ChatSvc --> LangChainAgent
   ChatSvc --> Tool
-  KnowledgeSvc --> Chroma
+  KnowledgeSvc --> MilvusClient
   KnowledgeSvc --> DB
   LangChainAgent --> Tool
-  Tool --> Chroma
+  Tool --> MilvusClient
   Chat --> Trace
   Chat --> Ragas
   Chat --> DB
@@ -220,7 +219,7 @@ flowchart LR
   KnowledgeSvc --> MySQL
   Tool --> DeepSeek
   LangChainAgent --> DeepSeek
-  Chroma --> DashScope
+  MilvusClient --> DashScope
   Trace --> MySQL
   Ragas --> DeepSeek
   Ragas --> DashScope
@@ -333,7 +332,7 @@ sequenceDiagram
   participant API as knowledgeAPI
   participant B as FastAPI main.py
   participant DB as database.py / models.py
-  participant C as chroma_client.py
+  participant C as milvus_client.py
   participant M as MySQL
 
   U->>K: 新建知识库 / 上传文件
@@ -358,9 +357,9 @@ sequenceDiagram
   participant X as streamChat()
   participant B as chat_service.stream_chat()
   participant K as knowledge_service.py
-  participant E as vision_service.py / memory_service.py / langchain_rag.tools.py
-  participant V as langchain_rag.tools.py / chroma_client.py
-  participant A as langchain_rag.agent.py
+  participant E as vision_service.py / memory_service.py / backend/tool/tools.py
+  participant V as backend/tool/tools.py / milvus_client.py
+  participant A as backend/agent/agent.py
   participant D as DeepSeek
   participant T as TraceRecorder
   participant M as MySQL
@@ -388,12 +387,12 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-  Learn["src/views/Learn.vue"] --> Input["输入 trace_id"]
-  Input --> API["chatAPI.getTrace(traceId)"]
-  API --> Route["GET /api/chat/traces/{trace_id}"]
+  Chat["src/views/Chat.vue"] --> Button["消息 / 生成中流程按钮"]
+  Button --> API["chatAPI.getTrace() / getMessageTrace()"]
+  API --> Route["GET /api/chat/traces/{trace_id}<br/>GET /api/chat/messages/{message_id}/trace"]
   Route --> Session["learning_trace.py / ChatTraceSession"]
-  Session --> Panel["LearnTracePanel.vue"]
-  Panel --> Timeline["时间线 / 变量表 / 当前事件 JSON"]
+  Session --> Drawer["Chat.vue 流程抽屉"]
+  Drawer --> Timeline["时间线 / 变量流 / 原始 JSON"]
 ```
 
 ## 6. 运行配置与外部依赖
@@ -402,7 +401,7 @@ flowchart LR
 |---|---|---|
 | 前端 | `VITE_API_BASE_URL` | 前端请求后端 API 的基础路径 |
 | MySQL | `MYSQL_USER / MYSQL_PASSWORD / MYSQL_HOST / MYSQL_PORT / MYSQL_DATABASE` | 业务主库 |
-| Chroma | `CHROMA_PERSIST_DIR` | 向量库持久化目录 |
+| Milvus | `MILVUS_URI / MILVUS_LITE_URI / MILVUS_COLLECTION_NAME` | 向量库连接与集合 |
 | DeepSeek | `DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL` | 规划、重排、回答生成 |
 | Embedding | `EMBEDDING_BASE_URL / EMBEDDING_API_KEY / EMBEDDING_MODEL / EMBEDDING_DIM` | DashScope 向量化 |
 | RAGAS | `RAGAS_ENABLED / RAGAS_LLM_MODEL / RAGAS_TIMEOUT_SECONDS` 等 | 在线评估 |
@@ -634,54 +633,28 @@ flowchart LR
 | `normalizedTrace` | `ref` | 归一化后的真实 trace |
 | `selectedTraceIndex` | `ref` | 当前选中的 trace event |
 | `nodeMap` / `currentDemoNode` / `selectedNode` | computed | 画布节点查找与详情 |
-| `activeNodeIds` | computed | 演示或回放时高亮路径 |
-| `upstreamRelations` / `downstreamRelations` | computed | 选中节点上下游 |
-| `startDemoTimer()` / `stopDemoTimer()` / `toggleDemoPlay()` / `resetDemo()` | 方法 | 演示播放控制 |
-| `handleNodeSelect()` | 方法 | 画布点选同步 |
-| `normalizeTrace()` | 方法 | Trace 归一化 |
-| `clearTrace()` / `loadTrace()` | 方法 | 真实回放加载与清空 |
-| `handleTraceEventSelect()` | 方法 | 时间线点选同步 |
-| `isBranchRelevant()` | 方法 | 分支槽高亮判断 |
+| `activeView` | `ref` | 当前展示 `agentic_retrieve_knowledge` 还是 `retrieve_knowledge` |
+| `viewOptions` | 常量 | 学习中心顶部两个切换按钮 |
+| `AgenticRetrievePaper` | 组件 | 展示 Agent 检索规划、反思和最终选择 |
+| `RetrieveKnowledgePaper` | 组件 | 展示查询规划、多路召回、关键词补召回、RRF 和 rerank |
 
-> `Learn.vue` 现在是“真实符号回放页”：demo 模式播放 `learnFlowSpec.js` 里的当前链路，trace 模式读取后端真实事件。
+> `Learn.vue` 现在是轻量流程图容器；真实 Trace 回放已经收敛到 `Chat.vue` 的消息流程抽屉。
 
-### `src/views/learnFlowSpec.js`
+### `src/views/AgenticRetrievePaper.vue`
 
 | 符号 | 类型 | 作用 |
 |---|---|---|
-| `exampleQuestion` | 常量 | 默认示例问题 |
-| `flowSpec` | 常量 | 画布节点、位置、连线的总配置 |
-| `demoPath` | 常量 | 示例演示主路径 |
-| `branchSpecs` | 常量 | 失败分支槽 |
-| `symbolToNodeId` | 常量 | 真实符号到画布节点的映射 |
-| `getNodeById()` | 方法 | 根据节点 ID 查找节点 |
-| `getNodeIdBySymbol()` | 方法 | 根据真实符号名找节点 |
+| `selectedId` | `ref` | 当前选中的流程节点 |
+| `nodeDetails` | 常量 | 节点说明、来源文件和伪代码 |
+| `DiagramNode` / `BranchRow` / `MiniFlow` | 内部组件 | 绘制纵向主线、左右分叉和小流程节点 |
 
-### `src/views/LearnCanvas.vue`
+### `src/views/RetrieveKnowledgePaper.vue`
 
 | 符号 | 类型 | 作用 |
 |---|---|---|
-| `props` | 组件入参 | `nodes / edges / selectedNodeId / activeNodeIds / width / height` |
-| `activeSet` | computed | 高亮节点集合 |
-| `nodeSize()` | 方法 | 变量气泡 / 方法矩形尺寸 |
-| `renderedNodes` | computed | 把 spec 变成可渲染节点 |
-| `resolveNode()` | 方法 | 通过节点 ID 找节点 |
-| `makePath()` | 方法 | 计算贝塞尔连线 |
-| `renderedEdges` | computed | 画布连线和标签 |
-| `canvasStyle` | computed | 画布尺寸 |
-
-### `src/views/LearnTracePanel.vue`
-
-| 符号 | 类型 | 作用 |
-|---|---|---|
-| `props` | 组件入参 | `trace / selectedIndex` |
-| `activeTab` | `ref` | 时间线 / 变量表 / 当前事件 |
-| `events` | computed | trace 事件数组 |
-| `selectedEvent` | computed | 当前选中的事件 |
-| `variableRows` | computed | `params / uses / creates / result` 展平表 |
-| `selectedEventJson` | computed | 当前事件 JSON |
-| `stringifyJson()` | 方法 | 安全 JSON 序列化 |
-| `stringifyBrief()` | 方法 | 截断展示值 |
+| `selectedId` | `ref` | 当前选中的流程节点 |
+| `nodeDetails` | 常量 | 节点说明、来源文件和伪代码 |
+| `DiagramNode` / `BranchRow` / `MiniFlow` | 内部组件 | 展示 retrieve_knowledge 的检索主线 |
 
 ### `src/components/MarkdownRenderer.vue`
 
@@ -705,7 +678,7 @@ flowchart LR
 | 符号 | 类型 | 作用 |
 |---|---|---|
 | `DATABASE_URL` | 常量 | MySQL 连接串 |
-| `CHROMA_PERSIST_DIR` | 常量 | Chroma 持久化目录 |
+| `MILVUS_URI` / `MILVUS_LITE_URI` / `MILVUS_COLLECTION_NAME` | 常量 | Milvus 连接与集合配置 |
 | `REBUILD_KNOWLEDGE_INDEX_ON_STARTUP` | 常量 | 是否启动时重建索引 |
 | `CHECKPOINTER_DB_PATH` | 常量 | SQLite checkpoint 路径 |
 | `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` | 常量 | DeepSeek 配置 |
@@ -746,22 +719,20 @@ flowchart LR
 | `_get_mysql_column_info()` | 方法 | 读取 information_schema |
 | `_ensure_default_knowledge_base()` | 方法 | 初始化默认知识库 |
 
-### `backend/rag/chroma_client.py`
+### `backend/rag/milvus_client.py`
 
 | 符号 | 类型 | 作用 |
 |---|---|---|
-| `LEGACY_COLLECTION_NAME` | 常量 | 旧集合名 |
 | `COLLECTION_NAME` | 常量 | 当前集合名 |
 | `_HashEmbeddingFunction` | 类 | 本地哈希兜底 embedding |
 | `_OpenAICompatibleEmbeddingFunction` | 类 | OpenAI 兼容 embedding |
 | `_hash_embedding_fn` / `_embedding_fn` | 对象 | embedding 函数实例 |
 | `embedding_backend_status()` | 方法 | 返回 embedding 配置状态 |
-| `get_chroma_client()` | 方法 | 获取持久化客户端 |
-| `get_collection()` | 方法 | 获取集合 |
-| `add_chunks()` | 方法 | 写入 chunk 到 Chroma |
+| `_connect_milvus()` | 方法 | 获取 Milvus 客户端 |
+| `_ensure_collection()` | 方法 | 确保 Milvus 集合存在并加载 |
+| `add_chunks()` | 方法 | 按 file_id 替换写入 chunk 到 Milvus |
 | `delete_file_chunks()` | 方法 | 删除文件对应 chunk |
 | `query_vectors()` | 方法 | 向量召回 |
-| `search_knowledge()` | 方法 | 旧接口风格召回 |
 
 ### `backend/agent + backend/tool + backend/rag`
 
@@ -808,7 +779,7 @@ flowchart LR
 | `_mark_message()` | 方法 | 写回 message 的评估状态 |
 | `_format_metric_errors()` | 方法 | 格式化部分失败信息 |
 | `_friendly_error()` | 方法 | 异常转中文错误 |
-| `_openai_base_url()` | 方法 | OpenAI 兼容 base_url |
+| `openai_base_url()` | 方法 | OpenAI 兼容 base_url |
 | `_prepare_contexts()` | 方法 | 上下文裁剪 |
 | `_truncate_text()` | 方法 | 文本裁剪 |
 
@@ -836,7 +807,7 @@ flowchart LR
 | `app.include_router(...)` | 调用 | 把认证、用户、聊天、知识库、checkpointer 路由挂进应用 |
 | `init_db()` | 调用 | 初始化表结构与轻量迁移 |
 | `seed_default_users()` | 调用 | 初始化默认用户 |
-| `rebuild_existing_knowledge_index()` | 调用 | 在显式开启配置时重建 Chroma 索引 |
+| `rebuild_existing_knowledge_index()` | 调用 | 在显式开启配置时重建 Milvus 索引 |
 
 #### 认证与用户
 
@@ -909,7 +880,7 @@ flowchart LR
 |---|---|---|
 | `_ensure_oss_config()` / `_oss_host()` / `_oss_object_path()` / `_oss_signature()` | 方法 | OSS 签名和地址拼装 |
 | `_put_oss_object()` / `_sign_oss_url()` / `_public_oss_url()` | 方法 | 上传与签名 URL |
-| `_openai_chat_url()` | 方法 | OpenAI 兼容地址 |
+| `openai_chat_url()` | 方法 | OpenAI 兼容地址 |
 | `_build_effective_question()` | 方法 | question + 图片描述 |
 | `_analyze_image_attachments()` | 方法 | 图片分析编排 |
 | `_image_analysis_prompts()` / `_request_image_description()` / `_classify_image_analysis()` | 方法 | 视觉分析 |
@@ -934,10 +905,10 @@ flowchart LR
 
 1. 先找页面入口：`src/main.js -> src/App.vue -> src/router/index.js -> src/views/Layout.vue`。
 2. 再看状态流：`src/stores/*.js` 负责数据，`src/api/*.js` 负责请求。
-3. 再回到后端：`backend/main.py` 主要负责路由汇聚和启动，业务细节分散到 `service/*.py`、`rag/*.py`、`agent/tool/rag/tools.py`、`chroma_client.py`、`ragas_eval.py`、`learning_trace.py`。
+3. 再回到后端：`backend/main.py` 主要负责路由汇聚和启动，业务细节分散到 `service/*.py`、`rag/*.py`、`backend/agent/agent.py`、`backend/tool/tools.py`、`milvus_client.py`、`ragas_eval.py`、`learning_trace.py`。
 4. 看数据库时，优先对照 `backend/model/models.py`，再回看 `database.py` 的字符集迁移逻辑。
 
 ## 10. 一句话总结
 
-这个项目本质上是一个“前端会话工作台 + FastAPI RAG 编排器 + MySQL/Chroma 持久化 + DeepSeek/DashScope/RAGAS 外部能力”的完整闭环。  
+这个项目本质上是一个“前端会话工作台 + FastAPI RAG 编排器 + MySQL/Milvus 持久化 + DeepSeek/DashScope/RAGAS 外部能力”的完整闭环。
 用户在前端输入的问题，最终会沿着“请求封装 -> 鉴权 -> 业务编排 -> 检索 -> SSE 输出 -> 落库 -> 异步评估 -> Trace 回放”的链路跑完整一圈。

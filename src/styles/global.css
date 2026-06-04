@@ -22,3 +22,96 @@ body {
 .el-card {
   --el-card-border-radius: 8px;
 }
+
+.center-delete-dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  margin: 0;
+  padding: 0;
+  transform: translate(-50%, -50%);
+  width: min(440px, calc(100vw - 32px));
+  overflow: hidden;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 20px 45px rgb(15 23 42 / 16%);
+}
+
+.center-delete-dialog .el-message-box__header {
+  padding: 22px 24px 0;
+}
+
+.center-delete-dialog .el-message-box__title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #0f172a;
+  font-size: 18px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.center-delete-dialog .el-message-box__title::before {
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: #fef2f2;
+  color: #dc2626;
+  content: "!";
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.center-delete-dialog .el-message-box__content {
+  padding: 14px 24px 0;
+  color: #475569;
+  font-size: 14px;
+  line-height: 1.75;
+}
+
+.center-delete-dialog .el-message-box__container {
+  display: block;
+}
+
+.center-delete-dialog .el-message-box__status {
+  display: none;
+}
+
+.center-delete-dialog .el-message-box__message {
+  margin: 0;
+}
+
+.center-delete-dialog .el-message-box__message p {
+  margin: 0;
+  word-break: break-word;
+}
+
+.center-delete-dialog .el-message-box__btns {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 22px 24px 24px;
+}
+
+.center-delete-dialog .el-button {
+  min-width: 76px;
+  height: 36px;
+  border-radius: 6px;
+  font-weight: 500;
+}
+
+.center-delete-dialog .el-button--primary {
+  border-color: #dc2626;
+  background: #dc2626;
+}
+
+.center-delete-dialog .el-button--primary:hover,
+.center-delete-dialog .el-button--primary:focus {
+  border-color: #b91c1c;
+  background: #b91c1c;
+}

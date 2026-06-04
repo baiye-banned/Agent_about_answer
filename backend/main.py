@@ -67,10 +67,6 @@ if __name__ == "__main__":
         port=8002,
         reload=True,
         reload_excludes=[
-            "chroma_data/*",
-            "chroma_data/**",
-            "backend/chroma_data/*",
-            "backend/chroma_data/**",
             "uploads/*",
             "uploads/**",
             "backend/uploads/*",

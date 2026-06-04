@@ -42,7 +42,13 @@ def load_checkpoint(thread_id: str, key: str) -> dict | None:
             "SELECT state FROM checkpoints WHERE thread_id = ? AND checkpoint_key = ?",
             (thread_id, key),
         ).fetchone()
-        return json.loads(row["state"]) if row else None
+        if not row:
+            return None
+        try:
+            state = json.loads(row["state"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return state if isinstance(state, dict) else None
     finally:
         conn.close()
 

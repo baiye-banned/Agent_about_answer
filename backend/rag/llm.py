@@ -27,8 +27,8 @@ def normalize_deepseek_model(model: str) -> str:
     return aliases.get((model or "").lower(), model)
 
 
-def _openai_base_url(base_url: str) -> str:
-    base_url = (base_url or "").rstrip("/")
+def openai_base_url(base_url: str) -> str:
+    base_url = (base_url or "").strip().rstrip("/")
     if base_url.endswith("/chat/completions"):
         base_url = base_url[: -len("/chat/completions")]
     if not base_url.endswith("/v1"):
@@ -37,7 +37,11 @@ def _openai_base_url(base_url: str) -> str:
 
 
 def deepseek_chat_url() -> str:
-    return f"{_openai_base_url(DEEPSEEK_BASE_URL)}/chat/completions"
+    return f"{openai_base_url(DEEPSEEK_BASE_URL)}/chat/completions"
+
+
+def openai_chat_url(base_url: str) -> str:
+    return f"{openai_base_url(base_url)}/chat/completions"
 
 
 def get_deepseek_model(*, streaming: bool = False, temperature: float = 0.1, max_tokens: int | None = None):
@@ -45,7 +49,7 @@ def get_deepseek_model(*, streaming: bool = False, temperature: float = 0.1, max
         raise RuntimeError("DeepSeek API Key 未配置")
     kwargs = {
         "api_key": DEEPSEEK_API_KEY,
-        "base_url": _openai_base_url(DEEPSEEK_BASE_URL),
+        "base_url": openai_base_url(DEEPSEEK_BASE_URL),
         "model": normalize_deepseek_model(DEEPSEEK_MODEL),
         "temperature": temperature,
         "streaming": streaming,
@@ -62,7 +66,7 @@ def get_text_fallback_model(*, streaming: bool = False, temperature: float = 0.1
         raise RuntimeError("文本后备模型 API Key 未配置")
     kwargs = {
         "api_key": TEXT_FALLBACK_API_KEY,
-        "base_url": _openai_base_url(TEXT_FALLBACK_BASE_URL),
+        "base_url": openai_base_url(TEXT_FALLBACK_BASE_URL),
         "model": TEXT_FALLBACK_MODEL,
         "temperature": temperature,
         "streaming": streaming,
@@ -85,7 +89,12 @@ async def call_chat_text(system_prompt: str, user_prompt: str, *, max_tokens: in
 
 async def call_chat_json(system_prompt: str, user_prompt: str, *, max_tokens: int = 800) -> dict:
     content = await call_chat_text(system_prompt, user_prompt, max_tokens=max_tokens)
-    return parse_json_object(content)
+    parsed = parse_json_object(content)
+    if isinstance(parsed, dict) and parsed.get("error") and "content" in parsed:
+        raise ValueError("chat model returned invalid JSON")
+    if not isinstance(parsed, dict):
+        raise ValueError("chat model returned non-object JSON")
+    return parsed
 
 
 async def call_router_json(payload: dict) -> dict:
@@ -105,7 +114,13 @@ async def call_router_json(payload: dict) -> dict:
         ("system", system_prompt),
         ("user", json.dumps(payload, ensure_ascii=False)),
     ])
-    return parse_json_object(_message_text(message.content))
+    content = _message_text(message.content)
+    parsed = parse_json_object(content)
+    if isinstance(parsed, dict) and parsed.get("error") and "content" in parsed:
+        raise ValueError("router model returned invalid JSON")
+    if not isinstance(parsed, dict):
+        raise ValueError("router model returned non-object JSON")
+    return parsed
 
 
 async def stream_answer_events(
@@ -213,14 +228,19 @@ async def _stream_model_chunks(model: ChatOpenAI, messages: list[tuple[str, str]
 
 
 def parse_json_object(content: str) -> dict:
-    content = (content or "").strip()
+    if isinstance(content, (dict, list, int, float, bool)):
+        return content
+    content = _text_value(content).strip()
     if content.startswith("```"):
         content = re.sub(r"^```(?:json)?", "", content).strip()
         content = re.sub(r"```$", "", content).strip()
     match = re.search(r"\{.*\}", content, flags=re.S)
     if match:
         content = match.group(0)
-    return json.loads(content)
+    try:
+        return json.loads(content)
+    except (TypeError, json.JSONDecodeError) as exc:
+        return {"error": str(exc), "content": content}
 
 
 def _message_text(content) -> str:
@@ -230,11 +250,18 @@ def _message_text(content) -> str:
         parts = []
         for item in content:
             if isinstance(item, dict):
-                parts.append(str(item.get("text") or item.get("content") or ""))
+                if item.get("text") is not None:
+                    parts.append(_text_value(item.get("text")))
+                else:
+                    parts.append(_text_value(item.get("content")))
             else:
-                parts.append(str(item or ""))
+                parts.append(_text_value(item))
         return "".join(parts)
-    return str(content or "")
+    return _text_value(content)
+
+
+def _text_value(value) -> str:
+    return "" if value is None else str(value)
 
 
 def _trace_add(trace: Any, *args, **kwargs) -> None:

@@ -1,4 +1,6 @@
 import request from './request'
+import { assertStreamResponse } from '@/utils/streamResponse'
+import { readStreamEvents } from '@/utils/streamEvents'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api'
 
@@ -32,6 +34,8 @@ export const chatAPI = {
   },
 }
 
+export { assertStreamResponse }
+
 export async function streamChat({
   conversationId,
   knowledgeBaseId,
@@ -60,56 +64,9 @@ export async function streamChat({
       signal,
     })
 
-    if (!response.ok || !response.body) {
-      const errorBody = await response.json().catch(() => ({}))
-      throw new Error(errorBody.detail || errorBody.message || '娴佸紡璇锋眰澶辫触')
-    }
+    await assertStreamResponse(response)
 
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    let doneReceived = false
-
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-
-      buffer += decoder.decode(value, { stream: true })
-      const events = buffer.split('\n\n')
-      buffer = events.pop() || ''
-
-      for (const event of events) {
-        const dataLines = event
-          .split('\n')
-          .filter((line) => line.startsWith('data:'))
-          .map((line) => line.replace(/^data:\s?/, ''))
-
-        for (const data of dataLines) {
-          if (data === '[DONE]') {
-            doneReceived = true
-            onDone?.()
-            return
-          }
-
-          let parsed
-          try {
-            parsed = JSON.parse(data)
-          } catch {
-            onMessage?.(data)
-            continue
-          }
-
-          if (parsed.type === 'error') {
-            throw new Error(parsed.message || parsed.content || '模型请求失败')
-          }
-          if (['sources', 'conversation', 'image_analysis', 'trace'].includes(parsed.type)) {
-            onMessage?.('', parsed)
-          } else {
-            onMessage?.(parsed.content ?? '', parsed)
-          }
-        }
-      }
-    }
+    const doneReceived = await readStreamEvents(response.body, onMessage)
 
     if (doneReceived) {
       onDone?.()
@@ -120,4 +77,3 @@ export async function streamChat({
     onError?.(error)
   }
 }
-

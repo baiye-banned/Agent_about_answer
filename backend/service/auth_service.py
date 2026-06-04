@@ -38,7 +38,10 @@ def _decode_token(authorization: str) -> str:
         raise HTTPException(401, "Invalid authorization header")
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload.get("sub", "")
+        username = payload.get("sub")
+        if not isinstance(username, str) or not username.strip():
+            raise HTTPException(401, "Invalid token")
+        return username
     except JWTError:
         raise HTTPException(401, "Invalid token")
 

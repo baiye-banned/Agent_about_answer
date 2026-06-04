@@ -8,7 +8,7 @@
 - 后端聊天：`backend/service/chat_service.py`
 - LangChain RAG：`backend/agent/agent.py`、`tools.py`、`chains.py`、`llm.py`
 - 记忆与图片：`backend/rag/memory_service.py`、`vision_service.py`
-- 知识库：`backend/service/knowledge_service.py`、`backend/crud/knowledge_file.py`、`backend/rag/chroma_client.py`
+- 知识库：`backend/service/knowledge_service.py`、`backend/crud/knowledge_file.py`、`backend/rag/milvus_client.py`
 
 ## 1. 纯文字问答
 
@@ -143,11 +143,11 @@ flowchart TD
   I --> K
   J --> K
   K --> L["chunk_text()"]
-  L --> M["chroma_client.add_chunks()"]
-  M --> N["Chroma metadata 带 knowledge_base_id"]
+  L --> M["milvus_client.add_chunks()"]
+  M --> N["Milvus row 带 knowledge_base_id"]
   M -- "异常" --> O["delete_file_chunks() + 删除 MySQL 文件记录"]
   N --> P["返回文件信息并刷新列表"]
   O --> Q["HTTP 500 上传失败"]
 ```
 
-入库仍是 MySQL 元数据先落库，再写 Chroma；向量写入失败会回滚文件记录和已写入 chunk。
+入库仍是 MySQL 元数据先落库，再按 `file_id` 替换写入 Milvus；向量写入失败会回滚文件记录和已写入 chunk。

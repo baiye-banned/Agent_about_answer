@@ -22,7 +22,7 @@ from config import (
 from database.session import SessionLocal
 from rag.learning_trace import append_trace_event, summarize_text
 from model.models import Message
-from rag.llm import normalize_deepseek_model
+from rag.llm import normalize_deepseek_model, openai_base_url
 
 
 logger = logging.getLogger(__name__)
@@ -162,7 +162,7 @@ def _evaluate_message_sync(question: str, answer: str, contexts: list[str], trac
 
     embedding_client = OpenAI(
         api_key=EMBEDDING_API_KEY,
-        base_url=_openai_base_url(EMBEDDING_BASE_URL),
+        base_url=openai_base_url(EMBEDDING_BASE_URL),
     )
     embeddings = _ResponseRelevancyEmbeddingsAdapter(
         OpenAIEmbeddings(client=embedding_client, model=EMBEDDING_MODEL)
@@ -170,7 +170,7 @@ def _evaluate_message_sync(question: str, answer: str, contexts: list[str], trac
 
     llm_client = OpenAI(
         api_key=DEEPSEEK_API_KEY,
-        base_url=_openai_base_url(DEEPSEEK_BASE_URL),
+        base_url=openai_base_url(DEEPSEEK_BASE_URL),
     )
     llm = _make_ragas_llm(llm_factory, llm_client)
     sample = SingleTurnSample(
@@ -289,15 +289,6 @@ def _friendly_error(exc: Exception) -> str:
     if "deepseek" in lowered or "connection" in lowered or "connect" in lowered:
         return f"DeepSeek 调用失败：{text}"
     return text
-
-
-def _openai_base_url(base_url: str) -> str:
-    base_url = (base_url or "").rstrip("/")
-    if base_url.endswith("/v1"):
-        return base_url
-    return f"{base_url}/v1"
-
-
 def _prepare_contexts(contexts: list[str]) -> list[str]:
     prepared = []
     for item in contexts or []:
@@ -310,9 +301,13 @@ def _prepare_contexts(contexts: list[str]) -> list[str]:
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
-    value = (text or "").strip()
+    value = _text_value(text).strip()
     if not value or max_chars <= 0:
         return ""
     if len(value) <= max_chars:
         return value
     return value[:max_chars].rstrip() + "\n...(已截断)"
+
+
+def _text_value(value) -> str:
+    return "" if value is None else str(value)

@@ -65,7 +65,7 @@
           <p class="mt-2 text-sm text-slate-500">向企业知识库提问，系统会结合已上传资料生成答案。</p>
           <div class="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2">
             <button
-              v-for="suggestion in suggestions"
+              v-for="suggestion in CHAT_SUGGESTIONS"
               :key="suggestion"
               type="button"
               class="rounded-lg border border-slate-200 bg-white px-4 py-3 text-left text-sm text-slate-700 transition-colors hover:border-brand-500 hover:text-brand-700"
@@ -137,20 +137,20 @@
                     {{ ragasStatusText(message.ragas_status) }}
                   </span>
                 </div>
-                <div v-if="message.ragas_status === 'done'" class="grid grid-cols-3 gap-2">
-                  <div v-for="metric in ragasMetrics" :key="metric.key">
+                <div v-if="message.ragas_status === RAGAS_STATUS.DONE" class="grid grid-cols-3 gap-2">
+                  <div v-for="metric in RAGAS_METRICS" :key="metric.key">
                     <p class="text-slate-400">{{ metric.label }}</p>
                     <p class="mt-0.5 font-medium text-slate-800">{{ formatScore(message.ragas_scores?.[metric.key]) }}</p>
                   </div>
                 </div>
-                <p v-else-if="message.ragas_status === 'failed'" class="leading-5 text-red-500">
+                <p v-else-if="message.ragas_status === RAGAS_STATUS.FAILED" class="leading-5 text-red-500">
                   {{ message.ragas_error || '评测失败' }}
                 </p>
                 <p v-else class="text-slate-400">评测中...</p>
               </div>
             </template>
             <div v-else class="space-y-2">
-              <div v-if="message.content" class="whitespace-pre-wrap text-sm leading-6">{{ message.content }}</div>
+              <div v-if="hasDisplayValue(message.content)" class="whitespace-pre-wrap text-sm leading-6">{{ message.content }}</div>
               <div v-if="message.attachments?.length" class="grid max-w-sm grid-cols-2 gap-2">
                 <img
                   v-for="attachment in message.attachments"
@@ -248,7 +248,7 @@
             <el-upload
               :show-file-list="false"
               :before-upload="handleImageUpload"
-              accept="image/png,image/jpeg,image/webp"
+              :accept="ACCEPTED_IMAGE_INPUT"
               :disabled="chatStore.streaming || uploadingAttachment"
             >
               <el-button :icon="Picture" :loading="uploadingAttachment" :disabled="chatStore.streaming">
@@ -283,7 +283,7 @@
             </span>
             <div class="min-w-0">
               <h3 class="truncate text-sm font-medium text-slate-900">{{ source.file_name || '未命名资料' }}</h3>
-              <p class="mt-1 whitespace-pre-wrap text-xs leading-5 text-slate-500">{{ source.content || source.excerpt }}</p>
+              <p class="mt-1 whitespace-pre-wrap text-xs leading-5 text-slate-500">{{ sourceText(source) }}</p>
               <div class="mt-2 flex flex-wrap gap-1 text-[11px] text-slate-400">
                 <span
                   v-if="source.rerank_score !== null && source.rerank_score !== undefined"
@@ -291,7 +291,7 @@
                 >
                   rerank {{ formatScore(source.rerank_score) }}
                 </span>
-                <span v-if="source.rrf_score" class="rounded bg-slate-100 px-1.5 py-0.5">
+                <span v-if="hasDisplayValue(source.rrf_score)" class="rounded bg-slate-100 px-1.5 py-0.5">
                   RRF {{ Number(source.rrf_score).toFixed(3) }}
                 </span>
                 <span
@@ -409,7 +409,7 @@
               >
                 <p class="font-medium text-slate-800">{{ event.stage }}</p>
                 <p class="mt-1">{{ event.note }}</p>
-                <pre class="mt-2 max-h-56 overflow-auto rounded bg-slate-50 p-2">{{ formatJson(event.result || event.params || event.creates) }}</pre>
+                <pre class="mt-2 max-h-56 overflow-auto rounded bg-slate-50 p-2">{{ formatJson(traceEventPayload(event)) }}</pre>
               </div>
               <el-empty v-if="!ragasEvents.length" description="暂无 RAGAS 事件" />
             </div>
@@ -445,6 +445,26 @@ import TraceVariableFlow from '@/components/TraceVariableFlow.vue'
 import { useChatStore } from '@/stores/chat'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import { chatAPI } from '@/api/chat'
+import { CHAT_SUGGESTIONS } from '@/utils/chatSuggestions'
+import { copyText } from '@/utils/clipboard'
+import { ACCEPTED_IMAGE_INPUT, validateImageFile } from '@/utils/fileValidation'
+import {
+  imageAnalysisWarningText as getImageAnalysisWarningText,
+  shouldShowImageAnalysisWarning as isImageAnalysisWarningStatus,
+} from '@/utils/imageAnalysisStatus'
+import {
+  MEMORY_VARIABLE_DESCRIPTIONS,
+  buildMemoryVariables,
+  filterTraceEventsByStageText,
+  findRetrievalRoutes,
+  findLatestMemoryValue,
+  formatMemoryValue,
+  memoryValueSize,
+  normalizeTrace,
+  traceEventPayload,
+} from '@/utils/memoryTrace'
+import { RAGAS_METRICS, RAGAS_STATUS, ragasStatusClass, ragasStatusText } from '@/utils/ragasStatus'
+import { formatJson, formatScore } from '@/utils'
 
 const route = useRoute()
 const router = useRouter()
@@ -481,44 +501,13 @@ const currentKnowledgeBaseName = computed(() => {
   return selectedBase?.name || '未选择知识库'
 })
 
-const suggestions = [
-  '请总结企业知识库中的核心制度',
-  '知识库中有哪些项目交付规范？',
-  '根据已有资料生成一份培训提纲',
-  '帮我提炼文档里的常见问题',
-]
-
-const ragasMetrics = [
-  { key: 'faithfulness', label: 'Faithfulness' },
-  { key: 'response_relevancy', label: 'Relevancy' },
-  { key: 'context_precision_without_reference', label: 'Context precision' },
-]
-
 const traceEvents = computed(() => activeTrace.value?.events || [])
 
-const retrievalRoutes = computed(() => {
-  const event = [...traceEvents.value].reverse().find((item) => item.stage === 'retrieval_completed')
-  return event?.creates?.routes || []
-})
+const retrievalRoutes = computed(() => findRetrievalRoutes(traceEvents.value))
 
 const memoryEvents = computed(() =>
-  traceEvents.value.filter((event) => event.stage?.includes('memory'))
+  filterTraceEventsByStageText(traceEvents.value, 'memory')
 )
-
-const memoryVariableDescriptions = {
-  recent_text: '短期记忆变量。本轮从 messages 表按最近窗口实时读取并格式化生成，不单独持久化。',
-  'conv.memory_summary': '长期记忆摘要，持久化在 conversations.memory_summary 字段中。',
-  'conv.memory_summary_upto_message_id': '长期记忆已摘要到的消息 ID，避免近期窗口重复包含已摘要消息。',
-  memory_context: '本轮实际注入回答链路的会话记忆，由长期摘要和最近对话窗口拼接生成。',
-  retrieval_question: '结合 memory_context 改写后的检索问题，用于 RAG 检索时消解指代和省略。',
-  memory_used: '本轮是否存在可用的会话记忆上下文。',
-  used_for_retrieval: '本轮检索问题是否因为记忆上下文而不同于原始问题。',
-  window_turns: '近期记忆滑动窗口保留的对话轮数。',
-  summary_length: '当前长期记忆摘要的字符长度。',
-  summary_limit: '长期记忆摘要允许保留的最大字符数。',
-  reason: '本次长期记忆更新或压缩被跳过、失败的原因。',
-  memory_summary: '长期记忆摘要变量，持久化在 conversations.memory_summary 字段中。',
-}
 
 const memoryVariables = computed(() =>
   memoryEvents.value
@@ -533,21 +522,21 @@ const memoryFocusVariables = computed(() => {
       key: 'short-term-recent-text',
       label: '短期记忆',
       name: 'recent_text',
-      description: memoryVariableDescriptions.recent_text,
+      description: MEMORY_VARIABLE_DESCRIPTIONS.recent_text,
       value: findLatestMemoryValue(variables, 'recent_text'),
     },
     {
       key: 'long-term-memory-summary',
       label: '长期记忆',
       name: 'conv.memory_summary',
-      description: memoryVariableDescriptions['conv.memory_summary'],
+      description: MEMORY_VARIABLE_DESCRIPTIONS['conv.memory_summary'],
       value: findLatestMemoryValue(variables, 'conv.memory_summary'),
     },
   ]
 })
 
 const ragasEvents = computed(() =>
-  traceEvents.value.filter((event) => event.stage?.includes('ragas'))
+  filterTraceEventsByStageText(traceEvents.value, 'ragas')
 )
 
 const prettyTrace = computed(() => formatJson(activeTrace.value))
@@ -651,12 +640,7 @@ function stopGeneration() {
 }
 
 async function copyMessage(content) {
-  try {
-    await navigator.clipboard.writeText(content)
-    ElMessage.success('已复制')
-  } catch {
-    ElMessage.warning('复制失败，请手动选择文本')
-  }
+  await copyText(content)
 }
 
 async function regenerate(index) {
@@ -705,6 +689,16 @@ function openSources(sources) {
   sourcesVisible.value = true
 }
 
+function hasDisplayValue(value) {
+  return value !== null && value !== undefined && value !== ''
+}
+
+function sourceText(source) {
+  if (hasDisplayValue(source?.content)) return source.content
+  if (hasDisplayValue(source?.excerpt)) return source.excerpt
+  return ''
+}
+
 function hasTrace(message) {
   const trace = message?.learning_trace || message?.retrieval_trace?.learning_trace || {}
   return Boolean(message?.trace_id || trace.trace_id || trace.events?.length)
@@ -733,112 +727,15 @@ async function openTrace(message) {
   }
 }
 
-function normalizeTrace(trace = {}) {
-  return {
-    trace_id: trace.trace_id || '',
-    status: trace.status || '',
-    events: Array.isArray(trace.events) ? trace.events : [],
-  }
-}
-
-function formatJson(value) {
-  try {
-    return JSON.stringify(value || {}, null, 2)
-  } catch {
-    return String(value || '')
-  }
-}
-
-function formatMemoryValue(value) {
-  if (value === null || value === undefined || value === '') return '（空）'
-  if (typeof value === 'string') return value
-  return formatJson(value)
-}
-
-function memoryValueSize(value) {
-  if (value === null || value === undefined || value === '') return '0 字'
-  if (typeof value === 'string') return `${value.length} 字`
-  return `${formatJson(value).length} 字`
-}
-
-function findLatestMemoryValue(variables, name) {
-  const variable = [...variables].reverse().find((item) => item.name === name)
-  return variable?.value || ''
-}
-
-function buildMemoryVariables(event) {
-  const variables = []
-  const addGroup = (group, prefix = '') => {
-    if (!group || typeof group !== 'object') return
-    Object.entries(group).forEach(([name, value]) => {
-      const variableName = prefix ? `${prefix}.${name}` : name
-      variables.push({
-        key: `${event.index}-${prefix || 'value'}-${name}`,
-        name: memoryVariableName(variableName),
-        description: memoryVariableDescription(variableName),
-        value,
-      })
-    })
-  }
-
-  addGroup(event.uses, 'uses')
-  addGroup(event.creates, 'creates')
-  addGroup(event.result, 'result')
-  addGroup(event.params, 'params')
-  return variables
-}
-
-function memoryVariableName(name) {
-  const cleanName = name.replace(/^(uses|creates|result|params)\./, '')
-  const nameMap = {
-    memory_summary: 'conv.memory_summary',
-    summary_upto_message_id: 'conv.memory_summary_upto_message_id',
-  }
-  return nameMap[cleanName] || cleanName
-}
-
-function memoryVariableDescription(name) {
-  return memoryVariableDescriptions[memoryVariableName(name)] || '记忆管理链路中的真实运行时变量。'
-}
-
-function formatScore(score) {
-  if (score === null || score === undefined || score === '') return '--'
-  const numeric = Number(score)
-  if (Number.isNaN(numeric)) return '--'
-  return numeric.toFixed(2)
-}
-
-function ragasStatusText(status) {
-  const textMap = {
-    pending: '等待中',
-    running: '评测中',
-    done: '已完成',
-    failed: '失败',
-  }
-  return textMap[status] || status
-}
-
-function ragasStatusClass(status) {
-  return {
-    pending: 'text-slate-400',
-    running: 'text-brand-600',
-    done: 'text-emerald-600',
-    failed: 'text-red-500',
-  }[status] || 'text-slate-400'
-}
-
 function shouldShowImageAnalysisWarning(message) {
-  return ['partial', 'failed'].includes(message?.image_analysis_status)
+  return isImageAnalysisWarningStatus(message?.image_analysis_status)
 }
 
 function imageAnalysisWarningText(message) {
-  if (message?.image_analysis_error) {
-    return message.image_analysis_error
-  }
-  if (message?.image_analysis_status === 'failed') {
-    return '图片部分未能识别，当前回答可能仅基于文字问题生成。'
-  }
-  return '图片内容仅部分识别，已结合可识别信息继续回答。'
+  return getImageAnalysisWarningText(
+    message?.image_analysis_status,
+    message?.image_analysis_error
+  )
 }
 
 async function refreshKnowledgeBases() {
@@ -860,13 +757,13 @@ function changeKnowledgeBase(id) {
 }
 
 async function handleImageUpload(file) {
-  const allowedTypes = ['image/png', 'image/jpeg', 'image/webp']
-  if (!allowedTypes.includes(file.type)) {
-    ElMessage.error('仅支持 png、jpg、jpeg、webp 图片')
-    return false
-  }
-  if (file.size > 5 * 1024 * 1024) {
-    ElMessage.error('图片不能超过 5MB')
+  const validationMessage = validateImageFile(file, {
+    maxSizeMb: 5,
+    typeMessage: '仅支持 png、jpg、jpeg、webp 图片',
+    sizeMessage: '图片不能超过 5MB',
+  })
+  if (validationMessage) {
+    ElMessage.error(validationMessage)
     return false
   }
 

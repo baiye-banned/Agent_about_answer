@@ -46,7 +46,7 @@ flowchart LR
   API --> FastAPI["FastAPI 路由"]
   FastAPI --> MySQL["MySQL"]
   FastAPI --> Retrieval["RAG 检索"]
-  Retrieval --> Chroma["Chroma 向量库"]
+  Retrieval --> Milvus["Milvus 向量库"]
   Retrieval --> DeepSeek["DeepSeek 规划/重排"]
   FastAPI --> SSE["SSE 流式返回"]
   SSE --> Store
@@ -55,7 +55,7 @@ flowchart LR
 
 你只需要先形成一句话理解：
 
-> 这是一个 Vue 前端工作台，调用 FastAPI 后端；后端把企业文件存到 MySQL 和 Chroma，聊天时检索知识库，再用 DeepSeek 流式生成答案，并把 Trace 和 RAGAS 评估结果保存下来。
+> 这是一个 Vue 前端工作台，调用 FastAPI 后端；后端把企业文件存到 MySQL 和 Milvus，聊天时检索知识库，再用 DeepSeek 流式生成答案，并把 Trace 和 RAGAS 评估结果保存下来。
 
 ## 2. 第一轮：读前端启动链
 
@@ -340,19 +340,18 @@ flowchart TD
 
 ### 4.4 `Learn.vue`
 
-这是学习中心，用来帮助你看懂主流程和真实 Trace 回放。
+这是学习中心，用来帮助你看懂 `agentic_retrieve_knowledge` 和 `retrieve_knowledge` 两条检索流程。
 
 重点变量：
 
 | 符号 | 作用 |
 |---|---|
-| `mode` | 示例演示 / 真实回放 |
-| `demoPath` | 示例链路节点顺序 |
-| `flowSpec` | 画布节点和连线 |
-| `traceIdInput` | 用户输入的 trace_id |
-| `normalizedTrace` | 后端返回的真实 trace |
+| `activeView` | 当前显示 Agent 流程图还是 retrieve_knowledge 流程图 |
+| `viewOptions` | 顶部两个切换按钮 |
+| `AgenticRetrievePaper` | Agent 检索规划、反思和选择流程 |
+| `RetrieveKnowledgePaper` | 查询规划、多路召回、RRF、rerank 流程 |
 
-如果你刚开始读代码，`Learn.vue` 可以当“可视化目录”用，但它展示的是当前真实节点与事件，不是抽象示意图。
+如果你刚开始读代码，`Learn.vue` 可以当“检索链路可视化目录”用；真实 Trace 回放在 `Chat.vue` 的消息流程抽屉里查看。
 
 ## 5. 第四轮：读后端入口、模型、数据库
 
@@ -374,7 +373,7 @@ flowchart TD
 | 分组 | 作用 |
 |---|---|
 | MySQL | 主数据库 |
-| Chroma | 向量库 |
+| Milvus | 向量库 |
 | DeepSeek | 聊天、规划、重排 |
 | DashScope embedding | 文本向量化 |
 | RAGAS | 回答质量评估 |
@@ -446,14 +445,14 @@ sequenceDiagram
   participant B as upload_knowledge()
   participant E as _extract_file_text()
   participant M as MySQL
-  participant C as chroma_client.add_chunks()
+  participant C as milvus_client.add_chunks()
 
   F->>A: file + knowledge_base_id
   A->>B: FormData
   B->>E: 根据文件类型提取文本
   B->>M: 保存 KnowledgeFile
   B->>B: chunk_text()
-  B->>C: 写入 Chroma
+  B->>C: 按 file_id 替换写入 Milvus
 ```
 
 按这个顺序读：
@@ -464,7 +463,7 @@ sequenceDiagram
 4. `backend/crud/knowledge_file.py` 的 `extract_file_text()`
 5. `extract_docx_text()` / `extract_pdf_text()`
 6. `chunk_text()`
-7. `chroma_client.add_chunks()`
+7. `milvus_client.add_chunks()`
 
 关键变量追踪：
 
@@ -473,13 +472,13 @@ sequenceDiagram
 | `file` | 用户选择的文件 | `FormData` |
 | `knowledge_base_id` | 当前知识库 ID | 后端绑定文件 |
 | `text` / `content` | 文件提取结果 | `KnowledgeFile.content` |
-| `chunks` | `chunk_text()` | `add_chunks()` |
-| `file_id` | MySQL 插入后生成 | Chroma metadata |
+| `chunks` | `chunk_text()` | `add_chunks()` 按 file_id 替换写入 |
+| `file_id` | MySQL 插入后生成 | Milvus row |
 
 读完要能回答：
 
-1. 为什么先保存 MySQL，再写 Chroma？
-2. 如果数据库保存失败，为什么不应该继续写 Chroma？
+1. 为什么先保存 MySQL，再写 Milvus？
+2. 如果数据库保存失败，为什么不应该继续写 Milvus？
 3. `knowledge_base_id` 如何保证多知识库隔离？
 
 ## 7. 第六轮：读聊天与 RAG 主链路
@@ -500,9 +499,9 @@ sequenceDiagram
   participant Store as chatStore
   participant API as streamChat()
   participant B as chat_service.stream_chat()
-  participant A as langchain_rag.agent.py
-  participant R as langchain_rag.tools.retrieve_knowledge()
-  participant V as chroma_client.query_vectors()
+  participant A as backend/agent/agent.py
+  participant R as backend/tool/tools.retrieve_knowledge()
+  participant V as milvus_client.query_vectors()
   participant L as DeepSeek
   participant DB as MySQL
 
@@ -534,12 +533,12 @@ sequenceDiagram
 9. `backend/agent/agent.py` 的 `agentic_retrieve_knowledge() / create_agent()`
 10. `backend/tool/tools.py` 的 `retrieve_knowledge()`
 11. `backend/tool/tools.py` 的 `build_query_plan()`
-12. `backend/rag/chroma_client.py` 的 `query_vectors()`
+12. `backend/rag/milvus_client.py` 的 `query_vectors()`
 13. `backend/tool/tools.py` 的 `keyword_recall()`
 14. `backend/tool/tools.py` 的 `rrf_fuse()`
 15. `backend/tool/tools.py` 的 `rerank_chunks()`
 16. `backend/service/utils_service.py` 的 `_build_sources()`
-17. `backend/rag/llm_service.py` 的 `stream_rag_answer()`
+17. `backend/rag/llm.py` 的 `stream_answer_events()`
 18. assistant message 保存逻辑
 19. `schedule_ragas_evaluation()`
 
@@ -563,7 +562,7 @@ sequenceDiagram
 
 ## 8. 第七轮：读 Trace 和 RAGAS
 
-目标：知道为什么学习中心能回放流程，为什么回答后还能显示评估分数。
+目标：知道为什么聊天消息能查看执行流程，为什么回答后还能显示评估分数。
 
 ### 8.1 Trace
 
@@ -572,8 +571,8 @@ sequenceDiagram
 1. `backend/rag/learning_trace.py`
 2. `backend/service/chat_service.py` 里的 `trace.add(...)`
 3. `chat_service.stream_chat()` 中所有 trace 事件
-4. `src/views/Learn.vue`
-5. `src/views/LearnTracePanel.vue`
+4. `src/views/Chat.vue` 的流程抽屉
+5. `src/components/TraceVariableFlow.vue`
 
 Trace 事件结构：
 
@@ -642,7 +641,7 @@ flowchart LR
 
 - 新建知识库成功后，前端为什么要 `upsertKnowledgeBase()`？
 - 上传文件时，`knowledge_base_id` 从哪里来？
-- 文件内容为什么既存在 MySQL 又写入 Chroma？
+- 文件内容为什么既存在 MySQL 又写入 Milvus？
 
 ### 聊天
 
@@ -672,7 +671,7 @@ flowchart LR
 | 第 3 天 | 2-3 小时 | 看懂 Chat 主页面和 SSE 前端处理 |
 | 第 4 天 | 2 小时 | 看懂 models、database、知识库上传 |
 | 第 5 天 | 3 小时 | 看懂 `chat_service.stream_chat()` 主链路 |
-| 第 6 天 | 2-3 小时 | 看懂 retrieval、Chroma、关键词增强 |
+| 第 6 天 | 2-3 小时 | 看懂 retrieval、Milvus、关键词增强 |
 | 第 7 天 | 2 小时 | 看懂 Trace、RAGAS、学习中心 |
 
 ## 12. 读源码时的标记方法
@@ -735,7 +734,7 @@ flowchart TD
   Memory --> RQ["retrieval_question"]
   Gate --> Agentic["agentic_retrieve_knowledge() / create_agent()"]
   RQ --> Agentic
-  Agentic --> Retrieve["langchain_rag.tools.retrieve_knowledge()"]
+  Agentic --> Retrieve["backend/tool/tools.retrieve_knowledge()"]
   Retrieve --> Plan["build_query_plan()"]
   Retrieve --> Vector["query_vectors()"]
   Retrieve --> Keyword["keyword_recall()"]

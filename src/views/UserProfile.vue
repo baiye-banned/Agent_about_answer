@@ -16,7 +16,7 @@
             <el-upload
               :show-file-list="false"
               :before-upload="handleAvatarUpload"
-              accept="image/png,image/jpeg,image/webp"
+              :accept="ACCEPTED_IMAGE_INPUT"
             >
               <button
                 type="button"
@@ -105,11 +105,15 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useUserStore } from '@/stores/user'
 import { userAPI } from '@/api/user'
+import { ACCEPTED_IMAGE_INPUT, validateImageFile } from '@/utils/fileValidation'
+import { getApiErrorMessage } from '@/utils/httpError'
+import { normalizeApiAssetUrl } from '@/utils/url'
+import { formatDateTime } from '@/utils'
 
 const userStore = useUserStore()
 const formRef = ref(null)
 const submitting = ref(false)
-const avatarSrc = computed(() => normalizeAvatarUrl(userStore.avatarUrl))
+const avatarSrc = computed(() => normalizeApiAssetUrl(userStore.avatarUrl))
 
 const form = reactive({
   oldPassword: '',
@@ -158,25 +162,20 @@ async function handleSubmit() {
     form.confirmPassword = ''
     formRef.value?.clearValidate()
   } catch (error) {
-    const message =
-      error.response?.data?.detail ||
-      error.response?.data?.message ||
-      '密码修改失败，请检查当前密码后重试'
-    ElMessage.error(message)
+    ElMessage.error(getApiErrorMessage(error, '密码修改失败，请检查当前密码后重试'))
   } finally {
     submitting.value = false
   }
 }
 
 async function handleAvatarUpload(file) {
-  const allowedTypes = ['image/png', 'image/jpeg', 'image/webp']
-  if (!allowedTypes.includes(file.type)) {
-    ElMessage.error('仅支持 png、jpg、jpeg、webp 格式头像')
-    return false
-  }
-
-  if (file.size > 2 * 1024 * 1024) {
-    ElMessage.error('头像文件不能超过 2MB')
+  const validationMessage = validateImageFile(file, {
+    maxSizeMb: 2,
+    typeMessage: '仅支持 png、jpg、jpeg、webp 格式头像',
+    sizeMessage: '头像文件不能超过 2MB',
+  })
+  if (validationMessage) {
+    ElMessage.error(validationMessage)
     return false
   }
 
@@ -190,22 +189,5 @@ async function handleAvatarUpload(file) {
   return false
 }
 
-function normalizeAvatarUrl(url) {
-  if (!url) return ''
-  if (/^https?:\/\//.test(url)) return url
-  const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || '/api'
-  const origin = apiBaseUrl.replace(/\/api\/?$/, '')
-  return `${origin}${url}`
-}
-
-function formatTime(value) {
-  if (!value) return '-'
-  return new Date(value).toLocaleString('zh-CN', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
-}
+const formatTime = formatDateTime
 </script>

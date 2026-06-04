@@ -70,7 +70,7 @@
                   <MiniFlow id="queryPlan" title="build_query_plan" note="HyDE / rewrite / keywords" compact :selected="selectedId === 'queryPlan'" @select="selectNode" />
                   <Connector text="->" />
                   <div class="space-y-3">
-                    <MiniFlow id="vectorRecall" title="query_vectors" note="original / HyDE / rewrite 查 Chroma" compact :selected="selectedId === 'vectorRecall'" @select="selectNode" />
+                    <MiniFlow id="vectorRecall" title="query_vectors" note="original / HyDE / rewrite 查 Milvus" compact :selected="selectedId === 'vectorRecall'" @select="selectNode" />
                     <MiniFlow id="keywordRecall" title="keyword_recall" note="关键词查 MySQL 文件文本" compact :selected="selectedId === 'keywordRecall'" @select="selectNode" />
                   </div>
                   <Connector text="->" />
@@ -241,9 +241,9 @@ const nodeDetails = {
   vectorRecall: {
     title: 'query_vectors',
     kind: '向量召回',
-    file: 'backend/rag/chroma_client.py',
-    detail: '用 original、HyDE、rewrite 去 ChromaDB 中按语义相似度找 chunk，并用 knowledge_base_id 隔离知识库。',
-    code: 'collection.query(query_texts=[query], where={ knowledge_base_id })',
+    file: 'backend/rag/milvus_client.py',
+    detail: '用 original、HyDE、rewrite 去 Milvus 中按语义相似度找 chunk，并用 knowledge_base_id 隔离知识库。',
+    code: 'client.search(collection_name=COLLECTION_NAME, data=[query_embedding], filter=filter_expr)',
   },
   keywordRecall: {
     title: 'keyword_recall',

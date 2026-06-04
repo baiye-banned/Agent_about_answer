@@ -1,7 +1,6 @@
 
 import json
 import logging
-import mimetypes
 from datetime import datetime
 from uuid import uuid4
 
@@ -20,7 +19,12 @@ from schema.schemas import ChatRequest, RenameRequest
 from service.auth_service import decode_token, get_current_user
 from service.oss_service import _public_oss_url, _put_oss_object
 from service.trace_service import _safe_trace_add, _safe_trace_attach, _safe_trace_finish, _trace_sse_payloads
-from service.utils_service import _build_sources
+from service.utils_service import (
+    CHAT_ATTACHMENT_MAX_BYTES,
+    _build_sources,
+    _check_answer_grounding,
+    resolve_image_upload_type,
+)
 from service.knowledge_service import agentic_retrieve_knowledge, resolve_knowledge_base
 from rag.memory_service import (
     _build_memory_aware_retrieval_question,
@@ -29,7 +33,7 @@ from rag.memory_service import (
     _schedule_memory_summary_update,
 )
 from rag.vision_service import _build_effective_question
-from rag.chroma_client import embedding_backend_status
+from rag.milvus_client import embedding_backend_status
 from rag.chains import stream_rag_answer
 from tool.tools import decide_need_rag
 
@@ -79,20 +83,50 @@ def rename_conversation(cid: str, body: RenameRequest, user: User = Depends(get_
     return {"message": "ok"}
 
 
+def _attach_grounding_trace(
+    retrieval_trace: dict,
+    trace: TraceRecorder,
+    *,
+    answer: str,
+    retrieved_contexts: list[str],
+    need_rag: bool,
+) -> None:
+    if not need_rag:
+        retrieval_trace["grounding"] = {"status": "skipped", "reason": "direct mode"}
+        return
+
+    grounding = _check_answer_grounding(answer, retrieved_contexts)
+    retrieval_trace["grounding"] = grounding
+    _safe_trace_add(
+        trace,
+        "grounding_checked",
+        "_check_answer_grounding",
+        uses={
+            "answer_chars": len(answer),
+            "retrieved_contexts_count": len(retrieved_contexts),
+        },
+        creates={"grounding": grounding},
+        result={
+            "status": grounding.get("status", ""),
+            "unsupported_count": grounding.get("unsupported_count", 0),
+        },
+        note="系统对最终回答做轻量证据校验，并把结果写入 retrieval_trace.grounding。",
+    )
+
+
 async def upload_chat_attachment(file: UploadFile = File(...),
                                  _user: User = Depends(get_current_user)):
-    allowed_types = {
-        "image/png": ".png",
-        "image/jpeg": ".jpg",
-        "image/webp": ".webp",
-    }
-    content_type = file.content_type or mimetypes.guess_type(file.filename or "")[0] or ""
-    ext = allowed_types.get(content_type)
-    if not ext:
+    image_type = resolve_image_upload_type(
+        file.content_type,
+        file.filename,
+        allow_filename_fallback=True,
+    )
+    if not image_type:
         raise HTTPException(400, "仅支持 png、jpg、jpeg、webp 图片")
+    content_type, ext = image_type
 
     content = await file.read()
-    if len(content) > 5 * 1024 * 1024:
+    if len(content) > CHAT_ATTACHMENT_MAX_BYTES:
         raise HTTPException(400, "图片不能超过 5MB")
 
     object_key = f"rag-chat/{datetime.now().strftime('%Y/%m/%d')}/{uuid4().hex}{ext}"
@@ -260,9 +294,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             trace_id=trace.trace_id,
         )
         memory_context = _build_memory_context(
-            db,
             conv,
-            current_message_id=user_message.id,
             recent_text=recent_text,
         )
         retrieval_question = _build_memory_aware_retrieval_question(effective_question, memory_context)
@@ -523,6 +555,13 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                         if not need_rag
                         else "模型完整回答成功，系统准备保存 assistant 消息，并启动 RAGAS 和摘要判断。"
                     ),
+                )
+                _attach_grounding_trace(
+                    retrieval_trace,
+                    trace,
+                    answer=full,
+                    retrieved_contexts=retrieved_contexts,
+                    need_rag=need_rag,
                 )
                 retrieval_trace["learning_trace"] = compact_trace_reference(trace.snapshot())
                 assistant_message = None

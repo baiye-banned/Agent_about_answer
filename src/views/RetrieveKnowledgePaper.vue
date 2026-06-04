@@ -90,13 +90,13 @@
             <section class="rounded-[28px] border-2 border-slate-800 bg-slate-50 p-5">
               <button type="button" class="block w-full text-left" @click="selectNode('routeLoop')">
                 <div class="font-mono text-base font-semibold text-slate-900">for route, query in route_specs</div>
-                <div class="mt-1 text-sm text-slate-600">每一路都去 ChromaDB 查语义相似片段</div>
+                <div class="mt-1 text-sm text-slate-600">每一路都去 Milvus 查语义相似片段</div>
               </button>
 
               <div class="mt-5 grid grid-cols-[minmax(0,1fr)_36px_minmax(0,1fr)_36px_minmax(0,1fr)] items-stretch gap-3">
                 <MiniFlow id="queryVectors" title="query_vectors" note="top_k + knowledge_base_id + route" :selected="selectedId === 'queryVectors'" @select="selectNode" />
                 <Connector text="->" />
-                <MiniFlow id="chromaQuery" title="collection.query" note="where 限定当前知识库" :selected="selectedId === 'chromaQuery'" @select="selectNode" />
+                <MiniFlow id="milvusSearch" title="client.search" note="filter 限定当前知识库" :selected="selectedId === 'milvusSearch'" @select="selectNode" />
                 <Connector text="->" />
                 <MiniFlow id="routeResults" title="route_results.append" note="保存 route 与 chunks" :selected="selectedId === 'routeResults'" @select="selectNode" />
               </div>
@@ -110,10 +110,10 @@
                   query_vectors 内部像这样展开
                 </button>
                 <div class="grid grid-cols-[minmax(0,1fr)_28px_minmax(0,1fr)_28px_minmax(0,1fr)] gap-3">
-                  <MiniFlow id="getCollection" title="get_collection" note="打开语义向量集合" compact :selected="selectedId === 'getCollection'" @select="selectNode" />
+                    <MiniFlow id="ensureCollection" title="_connect_milvus + load_collection" note="打开语义向量集合" compact :selected="selectedId === 'ensureCollection'" @select="selectNode" />
                   <Connector text="->" />
                   <div class="space-y-3">
-                    <MiniFlow id="whereFilter" title="where filter" note="knowledge_base_id 隔离" compact :selected="selectedId === 'whereFilter'" @select="selectNode" />
+                    <MiniFlow id="filterExpr" title="filter_expr" note="knowledge_base_id 隔离" compact :selected="selectedId === 'filterExpr'" @select="selectNode" />
                     <MiniFlow id="distanceItems" title="distances + metadata" note="取距离、文件名、chunk_id" compact :selected="selectedId === 'distanceItems'" @select="selectNode" />
                   </div>
                   <Connector text="->" />
@@ -318,16 +318,16 @@ const nodeDetails = {
   queryVectors: {
     title: 'query_vectors',
     kind: '向量召回',
-    file: 'backend/rag/chroma_client.py',
-    detail: '用当前 query 到 ChromaDB 里做语义相似度搜索，top_k 受 RETRIEVAL_ROUTE_TOP_K 控制。',
+    file: 'backend/rag/milvus_client.py',
+    detail: '用当前 query 到 Milvus 里做语义相似度搜索，top_k 受 RETRIEVAL_ROUTE_TOP_K 控制。',
     code: 'query_vectors(query, top_k=RETRIEVAL_ROUTE_TOP_K, knowledge_base_id=knowledge_base_id, route=route)',
   },
-  chromaQuery: {
-    title: 'collection.query',
-    kind: 'Chroma 查询',
-    file: 'backend/rag/chroma_client.py',
-    detail: '真正访问向量集合。where={knowledge_base_id} 用来确保只查当前知识库的数据。',
-    code: 'collection.query(query_texts=[query], n_results=min(max(top_k, 1), 20), where=where)',
+  milvusSearch: {
+    title: 'client.search',
+    kind: 'Milvus 查询',
+    file: 'backend/rag/milvus_client.py',
+    detail: '真正访问向量集合。filter=knowledge_base_id 用来确保只查当前知识库的数据。',
+    code: 'client.search(collection_name=COLLECTION_NAME, data=[query_embedding], anns_field="embedding", limit=min(max(top_k, 1), 20), filter=filter_expr)',
   },
   routeResults: {
     title: 'route_results',
@@ -339,35 +339,35 @@ const nodeDetails = {
   queryVectorsInside: {
     title: 'query_vectors internals',
     kind: '子流程',
-    file: 'backend/rag/chroma_client.py',
-    detail: 'query_vectors 会打开集合、设置知识库过滤条件、调用 Chroma 查询，再把原始结果整理成统一 chunk 字典。',
-    code: 'get_collection -> where -> collection.query -> normalize chunks',
+    file: 'backend/rag/milvus_client.py',
+    detail: 'query_vectors 会打开集合、设置知识库过滤条件、调用 Milvus 查询，再把原始结果整理成统一 chunk 字典。',
+    code: '_connect_milvus -> load_collection -> filter_expr -> client.search -> normalize chunks',
   },
-  getCollection: {
-    title: 'get_collection',
+  ensureCollection: {
+    title: '_connect_milvus + load_collection',
     kind: '集合',
-    file: 'backend/rag/chroma_client.py',
-    detail: '懒加载或创建语义向量集合，集合名包含 embedding 模型和维度。',
-    code: 'client.get_or_create_collection(COLLECTION_NAME, embedding_function=_embedding_fn)',
+    file: 'backend/rag/milvus_client.py',
+    detail: '查询阶段复用已连接的 Milvus client；如果集合不存在直接返回空结果，存在则 load_collection 后检索。',
+    code: 'client = _connect_milvus()\nclient.load_collection(COLLECTION_NAME)',
   },
-  whereFilter: {
-    title: 'where filter',
+  filterExpr: {
+    title: 'filter_expr',
     kind: '隔离条件',
-    file: 'backend/rag/chroma_client.py',
-    detail: '有 knowledge_base_id 时设置 Chroma where 条件，避免跨知识库召回。',
-    code: 'where = {"knowledge_base_id": knowledge_base_id} if knowledge_base_id else None',
+    file: 'backend/rag/milvus_client.py',
+    detail: '有 knowledge_base_id 时设置 Milvus filter 条件，避免跨知识库召回。',
+    code: 'filter_expr = f"knowledge_base_id == {int(knowledge_base_id)}"',
   },
   distanceItems: {
     title: 'distances + metadata',
     kind: '原始结果',
-    file: 'backend/rag/chroma_client.py',
-    detail: '从 Chroma 返回值中取 documents、metadatas、distances、ids，用来组装统一 chunk。',
-    code: 'distance = distances[0][index]\nmeta = results["metadatas"][0][index]',
+    file: 'backend/rag/milvus_client.py',
+    detail: '从 Milvus hit 中取 entity、distance、id，用来组装统一 chunk。',
+    code: 'hit_data = _normalize_hit(hit)',
   },
   vectorChunks: {
     title: 'vector chunks',
     kind: '返回值',
-    file: 'backend/rag/chroma_client.py',
+    file: 'backend/rag/milvus_client.py',
     detail: '向量召回输出的标准片段，包含 content、file_name、file_id、chunk_id、route、distance。',
     code: '{ id, chunk_id, content, file_name, file_id, route, distance }',
   },

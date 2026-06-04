@@ -79,10 +79,12 @@ def serialize_trace_session(session: ChatTraceSession) -> dict:
     }
 
 
-def _load_events(raw_events: str | None) -> list[dict]:
+def _load_events(raw_events: str | list | None) -> list[dict]:
     try:
-        events = json.loads(raw_events or "[]")
-        return events if isinstance(events, list) else []
-    except json.JSONDecodeError:
+        events = raw_events if isinstance(raw_events, list) else json.loads(raw_events or "[]")
+        if not isinstance(events, list):
+            return []
+        return [event for event in events if isinstance(event, dict)]
+    except (TypeError, json.JSONDecodeError):
         return []
 
