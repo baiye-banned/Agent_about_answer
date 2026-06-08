@@ -217,6 +217,12 @@ DASHSCOPE_API_KEY=your_dashscope_api_key
 SECRET_KEY=replace-with-a-long-random-secret
 ```
 
+Render 后端 Web Service 建议额外设置 Python 版本，避免平台默认使用过新的 Python 版本：
+
+```env
+PYTHON_VERSION=3.10.11
+```
+
 如果使用 Aiven MySQL 这类要求 SSL 的云数据库，Render 环境变量里加：
 
 ```env
