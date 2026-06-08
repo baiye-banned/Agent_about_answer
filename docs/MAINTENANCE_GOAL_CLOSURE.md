@@ -27,12 +27,12 @@ Snapshot baseline:
 - Split stream response validation and SSE parsing out of `streamChat` into small utilities.
 - Extracted repeated UI support logic into utilities for error text, display text, file validation, image analysis status, RAGAS status, memory trace formatting, URL normalization, clipboard copy, confirmations, and chat suggestions.
 - Simplified `Chat.vue`, `Knowledge.vue`, `UserProfile.vue`, `Login.vue`, `Layout.vue`, and `TraceVariableFlow.vue` by moving repeated logic into shared helpers.
-- Migrated the learning center toward the Agentic/Retrieve paper-style flow views and removed the old trace replay components from the active route.
+- Removed the old learning-center trace replay components from the active route. The standalone learning-center page was later retired to keep the frontend surface smaller.
 
 ### Backend
 
 - Migrated the vector-store direction from Chroma to Milvus/Milvus Lite.
-- Added a controlled agentic planner mode with bounded retrieval planning and fallback modes.
+- Retired the controlled agentic planner path and kept retrieval planning inside `backend/rag/retrieval.py`.
 - Split rerank behavior into a dedicated helper with DashScope rerank and fallback behavior.
 - Centralized OpenAI-compatible URL helpers and JSON parsing behavior.
 - Improved semantic chunking, vector cleanup before SQL deletion, upload validation, auth token validation, and trace/grounding helpers.
@@ -40,8 +40,8 @@ Snapshot baseline:
 
 ### Docs, Config, And Tests
 
-- Updated README and project docs toward the current Milvus, LangChain layer, memory, RAGAS, and learning-center direction.
-- Updated example config and dependency direction for Milvus, rerank, RAGAS, planner mode, and dotenv support.
+- Updated README and project docs toward the current Milvus, LangChain layer, memory, and RAGAS direction.
+- Updated example config and dependency direction for Milvus, rerank, RAGAS, and dotenv support.
 - Added a Python and Node regression test net covering planner, Milvus client, rerank, config helpers, LLM URL/JSON parsing, knowledge deletion ordering, chunking, grounding, JSON utilities, auth, trace, memory, RAGAS text handling, upload validation, checkpointer behavior, frontend stream parsing, clipboard, and frontend utility helpers.
 - Added `tests/README.md` to define the executable test baseline and separate stageable tests from generated cache/design-only files.
 
@@ -78,7 +78,7 @@ Immediate next step:
 Next batch:
 
 2. Milvus acceptance goal: verify index rebuild, upload, query, knowledge-base isolation, and deletion cleanup end to end.
-3. Agentic planner goal: verify `controlled`, `langchain`, and `fallback` modes with focused behavior tests.
+3. Retrieval acceptance goal: verify query planning, vector recall, keyword recall, RRF fusion, and rerank with focused behavior tests.
 4. Rerank and provider goal: smoke-test DashScope rerank, LLM fallback, embedding, and DeepSeek connectivity in the target environment.
 5. Frontend behavior goal: add narrow tests for knowledge batch delete feedback and chat RAGAS polling/message merge behavior.
 6. Documentation alignment goal: reconcile ports, startup commands, and environment variables across README, docs, and project instructions.

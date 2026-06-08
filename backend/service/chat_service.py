@@ -25,7 +25,7 @@ from service.utils_service import (
     _check_answer_grounding,
     resolve_image_upload_type,
 )
-from service.knowledge_service import agentic_retrieve_knowledge, resolve_knowledge_base
+from service.knowledge_service import resolve_knowledge_base
 from rag.memory_service import (
     _build_memory_aware_retrieval_question,
     _build_memory_context,
@@ -35,7 +35,7 @@ from rag.memory_service import (
 from rag.vision_service import _build_effective_question
 from rag.milvus_client import embedding_backend_status
 from rag.chains import stream_rag_answer
-from tool.tools import decide_need_rag
+from rag.retrieval import decide_need_rag, retrieve_knowledge
 
 
 logger = logging.getLogger(__name__)
@@ -375,12 +375,10 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             retrieval_trace["image_description"] = image_analysis.get("description", "")
 
         if need_rag:
-            knowledge_chunks, retrieval_trace = await agentic_retrieve_knowledge(
+            knowledge_chunks, retrieval_trace = await retrieve_knowledge(
                 retrieval_question,
                 knowledge_base_id=knowledge_base.id,
                 db=db,
-                rag_gate=rag_gate,
-                memory_context=memory_context,
                 trace_recorder=trace,
             )
             retrieval_trace = retrieval_trace or {}
@@ -401,17 +399,16 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 retrieval_trace["image_description"] = image_analysis.get("description", "")
             trace.add(
                 "retrieval_completed",
-                "langchain_agentic_retrieve_knowledge",
+                "retrieve_knowledge",
                 params={"question": retrieval_question, "knowledge_base_id": knowledge_base.id},
                 creates={
                     "query_plan": retrieval_trace.get("query_plan", {}),
                     "routes": retrieval_trace.get("routes", []),
                     "rrf": retrieval_trace.get("rrf", []),
                     "rerank": retrieval_trace.get("rerank", {}),
-                    "agent": retrieval_trace.get("agent", {}),
                 },
                 result={"final_chunks_count": len(knowledge_chunks)},
-                note="LangChain Agent retrieval completed with bounded planning, tool calls, and selected context.",
+                note="Advanced RAG retrieval completed with query planning, multi-route recall, RRF fusion, and rerank.",
             )
             if knowledge_chunks:
                 context = "\n\n".join(

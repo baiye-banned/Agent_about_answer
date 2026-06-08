@@ -35,7 +35,6 @@ Discovery is fixed by the repository `pytest.ini`: `testpaths = tests` and
 
 Current files:
 
-- `test_agentic_planner.py`
 - `test_auth_service.py`
 - `test_checkpointer.py`
 - `test_chunking.py`
@@ -49,11 +48,12 @@ Current files:
 - `test_milvus_client.py`
 - `test_ragas_eval.py`
 - `test_rerank.py`
+- `test_retrieval.py`
 - `test_trace_crud.py`
 - `test_upload_validation.py`
 - `conftest.py`
 
-These tests cover the controlled agentic planner, auth token validation, checkpointer helpers, semantic chunking, config parsing, grounding helpers, JSON loading, knowledge deletion ordering, learning trace handling, OpenAI-compatible URL helpers, memory context, Milvus client behavior, RAGAS text handling, rerank fallback, trace CRUD, upload validation, and shared fixtures.
+These tests cover retrieval planning and fusion, auth token validation, checkpointer helpers, semantic chunking, config parsing, grounding helpers, JSON loading, knowledge deletion ordering, learning trace handling, OpenAI-compatible URL helpers, memory context, Milvus client behavior, RAGAS text handling, rerank fallback, trace CRUD, upload validation, and shared fixtures.
 
 ## Excluded Local Files
 

@@ -1,12 +1,12 @@
 # PROJECT_FLOW_DIAGRAM
 
-这份文档只画当前真实链路。聊天 RAG 编排已经迁移到 LangChain 运行时，不再保留旧 `agentic_rag.py`、`tool.py`、`retrieval.py`、`rag_gate.py` 空壳。
+这份文档只画当前真实链路。聊天 RAG 主链路已经收束到 `rag.retrieval.retrieve_knowledge()`，不再经过 Agent 或 LangChain Tool 包装。
 
 主要模块：
 
 - 前端聊天：`src/views/Chat.vue`、`src/stores/chat.js`、`src/api/chat.js`
 - 后端聊天：`backend/service/chat_service.py`
-- LangChain RAG：`backend/agent/agent.py`、`tools.py`、`chains.py`、`llm.py`
+- RAG 检索与生成：`backend/rag/retrieval.py`、`backend/rag/rerank.py`、`backend/rag/chains.py`、`backend/rag/llm.py`
 - 记忆与图片：`backend/rag/memory_service.py`、`vision_service.py`
 - 知识库：`backend/service/knowledge_service.py`、`backend/crud/knowledge_file.py`、`backend/rag/milvus_client.py`
 
@@ -29,11 +29,10 @@ flowchart TD
   K1 -- "否" --> L["_build_memory_context()"]
   K2 --> L
   L --> M["_build_memory_aware_retrieval_question()"]
-  M --> N["tools.py::decide_need_rag()"]
+  M --> N["retrieval.py::decide_need_rag()"]
   N --> O{"need_rag?"}
   O -- "否" --> P["chains.py::stream_rag_answer(use_rag=false)"]
-  O -- "是" --> Q["agent.py::create_agent() / agentic_retrieve_knowledge()"]
-  Q --> R["tools.py::retrieve_knowledge()"]
+  O -- "是" --> R["retrieval.py::retrieve_knowledge()"]
   R --> S["build_query_plan / query_vectors / keyword_recall / rrf_fuse / rerank_chunks"]
   S --> T["context + sources"]
   T --> U["chains.py::stream_rag_answer(use_rag=true)"]
@@ -46,7 +45,7 @@ flowchart TD
   Z -- "是" --> Z1["_compact_summary_if_needed() -> 二次摘要；失败才裁剪"]
 ```
 
-共用主链路仍是 `Chat.vue -> chatStore.sendMessage() -> streamChat() -> /api/chat/stream -> stream_chat()`。区别只在后端内部：路由、工具、Agent 和最终生成已经由 `agent/tool/rag` 承接。
+共用主链路仍是 `Chat.vue -> chatStore.sendMessage() -> streamChat() -> /api/chat/stream -> stream_chat()`。区别只在后端内部：RAG gate 决定是否检索；需要检索时直接进入 `retrieve_knowledge()`，再把上下文交给生成链。
 
 ## 2. 文字 + 图片问答
 
@@ -69,7 +68,7 @@ flowchart TD
   N --> O["memory_context + retrieval_question"]
   O --> P["decide_need_rag()"]
   P --> Q{"need_rag?"}
-  Q -- "是" --> R["LangChain Agent -> retrieve_knowledge()"]
+  Q -- "是" --> R["retrieve_knowledge()"]
   Q -- "否" --> S["stream_rag_answer(use_rag=false)"]
   R --> T["context + sources"]
   T --> U["stream_rag_answer(use_rag=true)"]
@@ -78,7 +77,7 @@ flowchart TD
   V --> W["保存 assistant Message；RAG 时启动 RAGAS"]
 ```
 
-图片只是前置分支。识别成功后，它会合并成文本问题进入同一条 LangChain 聊天主链路。
+图片只是前置分支。识别成功后，它会合并成文本问题进入同一条聊天主链路。
 
 ## 3. 纯图片问答
 
@@ -96,7 +95,7 @@ flowchart TD
   J --> K["memory_context + retrieval_question"]
   K --> L["decide_need_rag()"]
   L --> M{"need_rag?"}
-  M -- "是" --> N["LangChain Agent -> retrieve_knowledge()"]
+  M -- "是" --> N["retrieve_knowledge()"]
   M -- "否" --> O["stream_rag_answer(use_rag=false)"]
   N --> P["stream_rag_answer(use_rag=true)"]
   O --> Q["SSE content / trace"]

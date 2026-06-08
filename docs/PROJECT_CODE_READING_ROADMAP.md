@@ -99,7 +99,7 @@ flowchart LR
 
 | 符号 | 作用 |
 |---|---|
-| `routes` | 定义 `/login`、`/chat`、`/knowledge`、`/learn`、`/profile` |
+| `routes` | 定义 `/login`、`/chat`、`/knowledge`、`/profile` |
 | `Layout.vue` | 登录后的外壳页面 |
 | `router.beforeEach()` | 登录守卫 |
 | `userStore.isLoggedIn` | 判断 token 是否存在 |
@@ -120,10 +120,10 @@ flowchart LR
 
 | 区域 | 负责什么 |
 |---|---|
-| 左侧菜单 | 跳到智能问答、知识库管理、学习中心 |
+| 左侧菜单 | 跳到智能问答、知识库管理 |
 | 历史会话 | 展示 `chatStore.conversations` |
 | 用户入口 | 个人设置、退出登录 |
-| `<router-view />` | 显示 Chat / Knowledge / Learn / Profile |
+| `<router-view />` | 显示 Chat / Knowledge / Profile |
 
 重点变量：
 
@@ -338,21 +338,6 @@ flowchart TD
   StoreState --> UI["Chat.vue 自动响应式更新"]
 ```
 
-### 4.4 `Learn.vue`
-
-这是学习中心，用来帮助你看懂 `agentic_retrieve_knowledge` 和 `retrieve_knowledge` 两条检索流程。
-
-重点变量：
-
-| 符号 | 作用 |
-|---|---|
-| `activeView` | 当前显示 Agent 流程图还是 retrieve_knowledge 流程图 |
-| `viewOptions` | 顶部两个切换按钮 |
-| `AgenticRetrievePaper` | Agent 检索规划、反思和选择流程 |
-| `RetrieveKnowledgePaper` | 查询规划、多路召回、RRF、rerank 流程 |
-
-如果你刚开始读代码，`Learn.vue` 可以当“检索链路可视化目录”用；真实 Trace 回放在 `Chat.vue` 的消息流程抽屉里查看。
-
 ## 5. 第四轮：读后端入口、模型、数据库
 
 目标：知道后端如何接请求、如何鉴权、如何落库。
@@ -499,8 +484,7 @@ sequenceDiagram
   participant Store as chatStore
   participant API as streamChat()
   participant B as chat_service.stream_chat()
-  participant A as backend/agent/agent.py
-  participant R as backend/tool/tools.retrieve_knowledge()
+  participant R as backend/rag/retrieval.retrieve_knowledge()
   participant V as milvus_client.query_vectors()
   participant L as DeepSeek
   participant DB as MySQL
@@ -509,8 +493,7 @@ sequenceDiagram
   Store->>API: streamChat()
   API->>B: ChatRequest
   B->>B: _build_effective_question / memory / decide_need_rag
-  B->>A: retrieval_question + knowledge_base_id
-  A->>R: LangChain tool retrieve_knowledge()
+  B->>R: retrieval_question + knowledge_base_id
   R->>L: build_query_plan()
   R->>V: original / hyde / rewrite routes
   R->>R: keyword_recall()
@@ -529,14 +512,13 @@ sequenceDiagram
 5. `backend/rag/vision_service.py` 的 `_build_effective_question()`
 6. `backend/rag/memory_service.py` 的 `_build_memory_context()`
 7. `backend/rag/memory_service.py` 的 `_build_memory_aware_retrieval_question()`
-8. `backend/tool/tools.py` 的 `decide_need_rag()`
-9. `backend/agent/agent.py` 的 `agentic_retrieve_knowledge() / create_agent()`
-10. `backend/tool/tools.py` 的 `retrieve_knowledge()`
-11. `backend/tool/tools.py` 的 `build_query_plan()`
+8. `backend/rag/retrieval.py` 的 `decide_need_rag()`
+9. `backend/rag/retrieval.py` 的 `retrieve_knowledge()`
+10. `backend/rag/retrieval.py` 的 `build_query_plan()`
 12. `backend/rag/milvus_client.py` 的 `query_vectors()`
-13. `backend/tool/tools.py` 的 `keyword_recall()`
-14. `backend/tool/tools.py` 的 `rrf_fuse()`
-15. `backend/tool/tools.py` 的 `rerank_chunks()`
+13. `backend/rag/retrieval.py` 的 `keyword_recall()`
+14. `backend/rag/retrieval.py` 的 `rrf_fuse()`
+15. `backend/rag/rerank.py` 的 `rerank_chunks()`
 16. `backend/service/utils_service.py` 的 `_build_sources()`
 17. `backend/rag/llm.py` 的 `stream_answer_events()`
 18. assistant message 保存逻辑
@@ -618,7 +600,7 @@ flowchart LR
 | `selectedKnowledgeBaseId` | `src/stores/chat.js` / `Chat.vue` | 用户选择或会话绑定 | `knowledge_base_id` |
 | `streamContent` | `src/stores/chat.js` | SSE content chunk | Chat 页面正在生成回答 |
 | `streamSources` | `src/stores/chat.js` | SSE sources event | 参考资料按钮 |
-| `streamTrace` | `src/stores/chat.js` | SSE trace event | 流程按钮 / 学习中心 |
+| `streamTrace` | `src/stores/chat.js` | SSE trace event | Chat 页面 Trace 回放按钮 |
 | `retrieval_trace` | `backend/service/chat_service.py` / `messages` | `retrieve_knowledge()` 返回 | Message 表、Trace 回放 |
 | `ragas_status` | `messages` | assistant 保存时 pending，RAGAS 后更新 | RAG Evaluation 面板 |
 | `knowledge_base_id` | 前后端请求体/数据库 | 知识库选择 | 多知识库隔离 |
@@ -672,7 +654,7 @@ flowchart LR
 | 第 4 天 | 2 小时 | 看懂 models、database、知识库上传 |
 | 第 5 天 | 3 小时 | 看懂 `chat_service.stream_chat()` 主链路 |
 | 第 6 天 | 2-3 小时 | 看懂 retrieval、Milvus、关键词增强 |
-| 第 7 天 | 2 小时 | 看懂 Trace、RAGAS、学习中心 |
+| 第 7 天 | 2 小时 | 看懂 Trace 和 RAGAS |
 
 ## 12. 读源码时的标记方法
 
@@ -732,9 +714,8 @@ flowchart TD
   EQ --> Memory["_build_memory_context()"]
   Memory --> Gate["decide_need_rag()"]
   Memory --> RQ["retrieval_question"]
-  Gate --> Agentic["agentic_retrieve_knowledge() / create_agent()"]
-  RQ --> Agentic
-  Agentic --> Retrieve["backend/tool/tools.retrieve_knowledge()"]
+  Gate --> Retrieve["backend/rag/retrieval.retrieve_knowledge()"]
+  RQ --> Retrieve
   Retrieve --> Plan["build_query_plan()"]
   Retrieve --> Vector["query_vectors()"]
   Retrieve --> Keyword["keyword_recall()"]

@@ -1,23 +1,16 @@
 from __future__ import annotations
 
-import json
 import math
 import re
-from contextvars import ContextVar
-from dataclasses import dataclass
 from typing import Any
 
-from langchain.tools import tool
-from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from rag.milvus_client import embedding_backend_status, query_vectors
-from config import (
-    RETRIEVAL_ROUTE_TOP_K,
-)
+from config import RETRIEVAL_ROUTE_TOP_K
 from model.models import KnowledgeFile
 from rag.llm import call_chat_json, call_router_json
-from tool.rerank import (
+from rag.milvus_client import embedding_backend_status, query_vectors
+from rag.rerank import (
     chunk_key,
     rerank_chunks,
     select_final_chunks,
@@ -26,53 +19,6 @@ from tool.rerank import (
 
 
 ROUTE_CONFIDENCE_THRESHOLD = 0.55
-ROUTE_TIMEOUT_SECONDS = 20
-
-
-@dataclass
-class RetrievalRuntime:
-    db: Session
-    knowledge_base_id: int
-    trace_recorder: Any = None
-
-
-class RAGDecisionInput(BaseModel):
-    question: str
-    memory_context: str = ""
-    knowledge_base_name: str = ""
-    attachments: list[dict] = Field(default_factory=list)
-
-
-class QueryPlanInput(BaseModel):
-    question: str
-
-
-class RetrieveKnowledgeInput(BaseModel):
-    question: str
-
-
-class KeywordRecallInput(BaseModel):
-    keywords: list[str]
-    top_k: int = RETRIEVAL_ROUTE_TOP_K
-
-
-class RerankInput(BaseModel):
-    question: str
-    chunks: list[dict]
-
-
-@tool("decide_need_rag", args_schema=RAGDecisionInput)
-async def decide_need_rag_tool(
-    question: str,
-    memory_context: str = "",
-    knowledge_base_name: str = "",
-    attachments: list[dict] | None = None,
-) -> str:
-    """Decide whether a user question should use enterprise knowledge-base retrieval."""
-    return json.dumps(
-        await decide_need_rag(question, memory_context, knowledge_base_name, attachments or []),
-        ensure_ascii=False,
-    )
 
 
 async def decide_need_rag(
@@ -93,12 +39,6 @@ async def decide_need_rag(
         return _normalize_decision(data)
     except Exception as exc:
         return _fallback_decision(f"路由模型调用失败，保守进入 RAG：{exc}")
-
-
-@tool("build_query_plan", args_schema=QueryPlanInput)
-async def build_query_plan_tool(question: str) -> str:
-    """Build HyDE, rewrite, and keyword search plan for retrieval."""
-    return json.dumps(await build_query_plan(question), ensure_ascii=False)
 
 
 async def build_query_plan(question: str) -> dict:
@@ -130,25 +70,6 @@ async def build_query_plan(question: str) -> dict:
     }
 
 
-@tool("retrieve_knowledge", args_schema=RetrieveKnowledgeInput)
-async def retrieve_knowledge_tool(question: str) -> str:
-    """Retrieve relevant chunks from the current runtime knowledge base."""
-    runtime = _runtime()
-    chunks, trace = await retrieve_knowledge(question, runtime.knowledge_base_id, runtime.db, runtime.trace_recorder)
-    return json.dumps(
-        {
-            "chunks_count": len(chunks),
-            "top_chunks": [trace_chunk(item) for item in chunks[:5]],
-            "trace": {
-                "query_plan": trace.get("query_plan", {}),
-                "routes_count": len(trace.get("routes") or []),
-                "rerank": trace.get("rerank", {}),
-            },
-        },
-        ensure_ascii=False,
-    )
-
-
 async def retrieve_knowledge(
     question: str,
     knowledge_base_id: int,
@@ -158,10 +79,10 @@ async def retrieve_knowledge(
 ) -> tuple[list[dict], dict]:
     _trace_add(
         trace_recorder,
-        "langchain_tool_called",
+        "retriever_started",
         "retrieve_knowledge",
         params={"question": question, "knowledge_base_id": knowledge_base_id},
-        note="LangChain Agent 调用 retrieve_knowledge 工具，进入多路召回、融合和重排。",
+        note="开始执行 retrieve_knowledge，进入多路召回、融合和重排。",
     )
     query_plan = _normalize_external_query_plan(query_plan, question) if query_plan else await build_query_plan(question)
     trace = {
@@ -220,7 +141,7 @@ async def retrieve_knowledge(
     final_chunks = select_final_chunks(reranked or fused, keyword_chunks)
     _trace_add(
         trace_recorder,
-        "langchain_retriever_done",
+        "retriever_done",
         "retrieve_knowledge",
         creates={
             "query_plan": query_plan,
@@ -229,7 +150,7 @@ async def retrieve_knowledge(
             "rerank": rerank_trace,
         },
         result={"final_chunks_count": len(final_chunks)},
-        note="LangChain 检索工具完成，最终 chunk 会进入回答生成链。",
+        note="retrieve_knowledge 完成，最终 chunk 会进入回答生成链。",
     )
     return final_chunks, trace
 
@@ -286,14 +207,6 @@ def _append_route(route_specs: list[tuple[str, str]], route: str, query: str) ->
     route_specs.append((route, text))
 
 
-@tool("keyword_recall", args_schema=KeywordRecallInput)
-def keyword_recall_tool(keywords: list[str], top_k: int = RETRIEVAL_ROUTE_TOP_K) -> str:
-    """Recall text chunks by keyword from the current runtime knowledge base."""
-    runtime = _runtime()
-    chunks = keyword_recall(runtime.db, runtime.knowledge_base_id, keywords, top_k)
-    return json.dumps({"chunks": [trace_chunk(item) for item in chunks]}, ensure_ascii=False)
-
-
 def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top_k: int) -> list[dict]:
     clean_keywords = _expand_keywords(keywords)
     if not clean_keywords:
@@ -324,16 +237,6 @@ def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top
     return candidates[:top_k]
 
 
-@tool("rrf_fuse")
-def rrf_fuse_tool(route_results_json: str, k: int = 60) -> str:
-    """Fuse multiple retrieval routes with reciprocal rank fusion."""
-    try:
-        route_results = json.loads(route_results_json)
-    except (TypeError, json.JSONDecodeError) as exc:
-        return json.dumps({"chunks": [], "error": str(exc)}, ensure_ascii=False)
-    return json.dumps({"chunks": rrf_fuse(route_results, k)}, ensure_ascii=False)
-
-
 def rrf_fuse(route_results: list[tuple[str, list[dict]]], k: int = 60) -> list[dict]:
     fused: dict[str, dict] = {}
     for route_entry in route_results:
@@ -352,47 +255,6 @@ def rrf_fuse(route_results: list[tuple[str, list[dict]]], k: int = 60) -> list[d
     return sorted(fused.values(), key=lambda item: item["rrf_score"], reverse=True)
 
 
-@tool("rerank_chunks", args_schema=RerankInput)
-async def rerank_chunks_tool(question: str, chunks: list[dict]) -> str:
-    """Rerank retrieved chunks against the user question."""
-    reranked, trace = await rerank_chunks(question, chunks)
-    return json.dumps({"chunks": [trace_chunk(item) for item in reranked], "trace": trace}, ensure_ascii=False)
-
-
-
-LANGCHAIN_RETRIEVAL_TOOLS = [
-    retrieve_knowledge_tool,
-    build_query_plan_tool,
-    keyword_recall_tool,
-    rrf_fuse_tool,
-    rerank_chunks_tool,
-]
-
-_CURRENT_RUNTIME: ContextVar[RetrievalRuntime | None] = ContextVar("langchain_retrieval_runtime", default=None)
-
-
-class retrieval_runtime:
-    def __init__(self, db: Session, knowledge_base_id: int, trace_recorder: Any = None):
-        self.next_runtime = RetrievalRuntime(db=db, knowledge_base_id=knowledge_base_id, trace_recorder=trace_recorder)
-        self.token = None
-
-    def __enter__(self):
-        self.token = _CURRENT_RUNTIME.set(self.next_runtime)
-        return self.next_runtime
-
-    def __exit__(self, exc_type, exc, tb):
-        if self.token is not None:
-            _CURRENT_RUNTIME.reset(self.token)
-        return False
-
-
-def _runtime() -> RetrievalRuntime:
-    runtime = _CURRENT_RUNTIME.get()
-    if runtime is None:
-        raise RuntimeError("LangChain retrieval runtime is not initialized")
-    return runtime
-
-
 def _normalize_decision(data: dict) -> dict:
     if not isinstance(data, dict) or "need_rag" not in data:
         return _fallback_decision("路由模型未返回有效 JSON，保守进入 RAG。")
@@ -408,7 +270,7 @@ def _normalize_decision(data: dict) -> dict:
         "route": "rag" if need_rag else "direct",
         "confidence": confidence,
         "reason": reason,
-        "source": "langchain_model",
+        "source": "router_model",
     }
 
 
@@ -578,8 +440,6 @@ def _normalize_for_match(text: str) -> str:
     return re.sub(r"\s+", "", value.lower())
 
 
-
-
 def _split_keyword_chunks(content: str, chunk_size: int = 900, chunk_overlap: int = 180) -> list[dict]:
     chunks = []
     step = max(chunk_size - chunk_overlap, 1)
@@ -588,8 +448,6 @@ def _split_keyword_chunks(content: str, chunk_size: int = 900, chunk_overlap: in
         if text:
             chunks.append({"chunk_id": str(start), "content": text})
     return chunks
-
-
 
 
 def _trace_add(trace_recorder: Any, *args, **kwargs) -> None:

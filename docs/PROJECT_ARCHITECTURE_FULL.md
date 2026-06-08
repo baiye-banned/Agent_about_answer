@@ -21,7 +21,7 @@ flowchart LR
     App["src/App.vue<br/>router-view"]
     Router["src/router/index.js<br/>路由 + 登录守卫"]
     Layout["src/views/Layout.vue<br/>侧边栏 / 历史会话壳"]
-    Pages["页面层<br/>Login / Chat / Knowledge / Learn / UserProfile"]
+    Pages["页面层<br/>Login / Chat / Knowledge / UserProfile"]
     Stores["Pinia<br/>user / chat / knowledge"]
     APIs["API 封装<br/>request / authAPI / userAPI / knowledgeAPI / chatAPI"]
     Main --> App --> Router --> Layout --> Pages
@@ -36,8 +36,8 @@ flowchart LR
     ChatSvc["backend/service/chat_service.py<br/>聊天编排 / SSE / Trace / RAGAS"]
     KnowledgeSvc["backend/service/knowledge_service.py<br/>知识库 CRUD / 上传 / 索引"]
     VisionSvc["backend/rag/vision_service.py<br/>图片分析"]
-    LangChainAgent["backend/agent/agent.py<br/>受限检索规划"]
-    Tool["backend/tool/tools.py<br/>路由判断 / 检索工具 / 重排"]
+    Retrieval["backend/rag/retrieval.py<br/>路由判断 / 查询规划 / 检索融合"]
+    RerankSvc["backend/rag/rerank.py<br/>检索结果重排"]
     MilvusClient["backend/rag/milvus_client.py<br/>向量库 + Embedding"]
     Ragas["backend/rag/ragas_eval.py<br/>在线 RAGAS"]
     Trace["backend/rag/learning_trace.py<br/>TraceRecorder"]
@@ -47,8 +47,8 @@ flowchart LR
     MainPy --> ChatSvc
     MainPy --> KnowledgeSvc
     MainPy --> VisionSvc
-    MainPy --> LangChainAgent
-    MainPy --> Tool
+    MainPy --> Retrieval
+    MainPy --> RerankSvc
     MainPy --> MilvusClient
     MainPy --> Ragas
     MainPy --> Trace
@@ -74,13 +74,12 @@ flowchart LR
   ChatSvc --> MySQL
   KnowledgeSvc --> MySQL
   ChatSvc --> VisionSvc
-  ChatSvc --> LangChainAgent
-  ChatSvc --> Tool
-  LangChainAgent --> Tool
+  ChatSvc --> Retrieval
+  Retrieval --> RerankSvc
   KnowledgeSvc --> MilvusClient
-  Tool --> Milvus
-  Tool --> DeepSeek
-  LangChainAgent --> DeepSeek
+  Retrieval --> Milvus
+  Retrieval --> DeepSeek
+  RerankSvc --> DeepSeek
   MilvusClient --> DashScope
   ChatSvc --> OSS
   VisionSvc --> OSS
@@ -108,7 +107,6 @@ flowchart TD
     Login["src/views/Login.vue"]
     Chat["src/views/Chat.vue"]
     Knowledge["src/views/Knowledge.vue"]
-    Learn["src/views/Learn.vue"]
     Profile["src/views/UserProfile.vue"]
   end
 
@@ -126,17 +124,9 @@ flowchart TD
     ChatAPI["src/api/chat.js<br/>chatAPI + streamChat"]
   end
 
-  subgraph LearnFlow["学习中心子系统"]
-    LearnHome["src/views/Learn.vue<br/>视图切换容器"]
-    AgentPaper["src/views/AgenticRetrievePaper.vue<br/>agentic_retrieve_knowledge 流程图"]
-    RetrievePaper["src/views/RetrieveKnowledgePaper.vue<br/>retrieve_knowledge 流程图"]
-    FlowDoc["docs/PROJECT_FLOW_DIAGRAM.md<br/>主线流程图"]
-  end
-
   MainJS --> AppVue --> Router --> LayoutVue
   LayoutVue --> Chat
   LayoutVue --> Knowledge
-  LayoutVue --> Learn
   LayoutVue --> Profile
   Router --> Login
 
@@ -154,10 +144,6 @@ flowchart TD
   ChatStore --> ChatAPI
   KnowledgeStore --> KnowledgeAPI
 
-  Learn --> LearnHome
-  LearnHome --> AgentPaper
-  LearnHome --> RetrievePaper
-  Learn --> FlowDoc
 ```
 
 ## 3. 后端架构图
@@ -170,7 +156,7 @@ flowchart LR
     Chat["聊天<br/>/api/chat/conversations /stream /attachments /traces"]
     KB["知识库<br/>/api/knowledge-bases"]
     Files["知识文件<br/>/api/knowledge /upload /content"]
-    Tools["工具<br/>/api/checkpointer/threads"]
+    CheckpointerRoute["Checkpointer<br/>/api/checkpointer/threads"]
   end
 
   subgraph Core["业务核心"]
@@ -179,8 +165,8 @@ flowchart LR
     ChatSvc["backend/service/chat_service.py<br/>stream_chat / upload_chat_attachment / trace"]
     KnowledgeSvc["backend/service/knowledge_service.py<br/>knowledge CRUD / upload / rollback"]
     VisionSvc["backend/rag/vision_service.py<br/>_build_effective_question / image analysis"]
-    LangChainAgent["backend/agent/agent.py<br/>agentic_retrieve_knowledge / create_agent"]
-    Tool["backend/tool/tools.py<br/>@tool decide_need_rag / retrieve_knowledge / rerank"]
+    Retrieval["backend/rag/retrieval.py<br/>decide_need_rag / retrieve_knowledge / RRF"]
+    RerankSvc["backend/rag/rerank.py<br/>rerank_chunks"]
     MilvusClient["backend/rag/milvus_client.py<br/>query_vectors / add_chunks"]
     Trace["backend/rag/learning_trace.py<br/>TraceRecorder / snapshot"]
     Ragas["backend/rag/ragas_eval.py<br/>evaluate_message_async"]
@@ -202,23 +188,21 @@ flowchart LR
   KB --> KnowledgeSvc
   Files --> KnowledgeSvc
   ChatSvc --> VisionSvc
-  ChatSvc --> LangChainAgent
-  ChatSvc --> Tool
+  ChatSvc --> Retrieval
   KnowledgeSvc --> MilvusClient
   KnowledgeSvc --> DB
-  LangChainAgent --> Tool
-  Tool --> MilvusClient
+  Retrieval --> MilvusClient
+  Retrieval --> RerankSvc
   Chat --> Trace
   Chat --> Ragas
   Chat --> DB
-  Tools --> Checkpointer
+  CheckpointerRoute --> Checkpointer
 
   DB --> MySQL
   Models --> MySQL
   ChatSvc --> MySQL
   KnowledgeSvc --> MySQL
-  Tool --> DeepSeek
-  LangChainAgent --> DeepSeek
+  Retrieval --> DeepSeek
   MilvusClient --> DashScope
   Trace --> MySQL
   Ragas --> DeepSeek
@@ -357,9 +341,8 @@ sequenceDiagram
   participant X as streamChat()
   participant B as chat_service.stream_chat()
   participant K as knowledge_service.py
-  participant E as vision_service.py / memory_service.py / backend/tool/tools.py
-  participant V as backend/tool/tools.py / milvus_client.py
-  participant A as backend/agent/agent.py
+  participant E as vision_service.py / memory_service.py / retrieval.py
+  participant V as retrieval.py / milvus_client.py / rerank.py
   participant D as DeepSeek
   participant T as TraceRecorder
   participant M as MySQL
@@ -372,8 +355,7 @@ sequenceDiagram
   B->>T: TraceRecorder.add(request_received)
   B->>K: resolve_knowledge_base()
   B->>E: _build_effective_question() / _build_memory_context() / decide_need_rag()
-  B->>A: agentic_retrieve_knowledge() / create_agent()
-  A->>V: LangChain tool retrieve_knowledge() / query_vectors() / keyword_recall / rrf_fuse / rerank_chunks
+  B->>V: retrieve_knowledge() / query_vectors() / keyword_recall / rrf_fuse / rerank_chunks
   B->>D: stream_rag_answer() / ChatOpenAI.astream()
   D-->>B: SSE content chunks
   B-->>X: SSE conversation / sources / trace / [DONE]
@@ -406,7 +388,7 @@ flowchart LR
 | Embedding | `EMBEDDING_BASE_URL / EMBEDDING_API_KEY / EMBEDDING_MODEL / EMBEDDING_DIM` | DashScope 向量化 |
 | RAGAS | `RAGAS_ENABLED / RAGAS_LLM_MODEL / RAGAS_TIMEOUT_SECONDS` 等 | 在线评估 |
 | OSS | `OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET / OSS_BUCKET / OSS_ENDPOINT` | 图片附件和头像 |
-| Trace | `LEARNING_TRACE_ENABLED / LEARNING_TRACE_MAX_TEXT_CHARS` | 学习中心与回放 |
+| Trace | `LEARNING_TRACE_ENABLED / LEARNING_TRACE_MAX_TEXT_CHARS` | Chat 页面 Trace 回放 |
 
 ## 7. 文件级符号索引 - 前端
 
@@ -422,7 +404,7 @@ flowchart LR
 
 | 符号 | 类型 | 作用 |
 |---|---|---|
-| `routes` | 路由数组 | 定义 `/login`、`/chat`、`/knowledge`、`/learn`、`/profile` |
+| `routes` | 路由数组 | 定义 `/login`、`/chat`、`/knowledge`、`/profile` |
 | `router` | 路由实例 | `createRouter` + `createWebHistory` |
 | `beforeEach` | 守卫 | 未登录跳 `/login`，已登录回 `/chat` |
 
@@ -621,41 +603,6 @@ flowchart LR
 | `rules` | 常量 | 表单校验 |
 | `handleLogin()` | 方法 | 调用 `userStore.login()` |
 
-### `src/views/Learn.vue`
-
-| 符号 | 类型 | 作用 |
-|---|---|---|
-| `route` | 路由对象 | 支持 `trace_id` query 回放 |
-| `mode` | `ref` | `demo` / `trace` 模式 |
-| `demoIndex` / `demoPlaying` / `demoTimer` | `ref` | 示例演示播放状态 |
-| `selectedNodeId` | `ref` | 当前选中的画布节点 |
-| `traceIdInput` / `traceLoading` / `traceError` | `ref` | Trace 加载输入与错误 |
-| `normalizedTrace` | `ref` | 归一化后的真实 trace |
-| `selectedTraceIndex` | `ref` | 当前选中的 trace event |
-| `nodeMap` / `currentDemoNode` / `selectedNode` | computed | 画布节点查找与详情 |
-| `activeView` | `ref` | 当前展示 `agentic_retrieve_knowledge` 还是 `retrieve_knowledge` |
-| `viewOptions` | 常量 | 学习中心顶部两个切换按钮 |
-| `AgenticRetrievePaper` | 组件 | 展示 Agent 检索规划、反思和最终选择 |
-| `RetrieveKnowledgePaper` | 组件 | 展示查询规划、多路召回、关键词补召回、RRF 和 rerank |
-
-> `Learn.vue` 现在是轻量流程图容器；真实 Trace 回放已经收敛到 `Chat.vue` 的消息流程抽屉。
-
-### `src/views/AgenticRetrievePaper.vue`
-
-| 符号 | 类型 | 作用 |
-|---|---|---|
-| `selectedId` | `ref` | 当前选中的流程节点 |
-| `nodeDetails` | 常量 | 节点说明、来源文件和伪代码 |
-| `DiagramNode` / `BranchRow` / `MiniFlow` | 内部组件 | 绘制纵向主线、左右分叉和小流程节点 |
-
-### `src/views/RetrieveKnowledgePaper.vue`
-
-| 符号 | 类型 | 作用 |
-|---|---|---|
-| `selectedId` | `ref` | 当前选中的流程节点 |
-| `nodeDetails` | 常量 | 节点说明、来源文件和伪代码 |
-| `DiagramNode` / `BranchRow` / `MiniFlow` | 内部组件 | 展示 retrieve_knowledge 的检索主线 |
-
 ### `src/components/MarkdownRenderer.vue`
 
 | 符号 | 类型 | 作用 |
@@ -734,14 +681,14 @@ flowchart LR
 | `delete_file_chunks()` | 方法 | 删除文件对应 chunk |
 | `query_vectors()` | 方法 | 向量召回 |
 
-### `backend/agent + backend/tool + backend/rag`
+### `backend/rag`
 
 > LangChain RAG ????????? `agentic_rag.py`?`tool.py`?`retrieval.py`?`rag_gate.py` ??????
 
 | ?? | ?? |
 |---|---|
-| `agent.py` | `create_agent()` ????????? 2 ??? |
-| `tools.py` | LangChain `@tool`??????????????????RRF??? |
+| `retrieval.py` | RAG gate、查询规划、多路召回、关键词召回和 RRF 融合 |
+| `rerank.py` | DashScope rerank 与 LLM fallback 重排 |
 | `chains.py` | ?????????? `stream_rag_answer()` |
 | `llm.py` | `ChatOpenAI`?DeepSeek????????JSON ????????? |
 
@@ -905,7 +852,7 @@ flowchart LR
 
 1. 先找页面入口：`src/main.js -> src/App.vue -> src/router/index.js -> src/views/Layout.vue`。
 2. 再看状态流：`src/stores/*.js` 负责数据，`src/api/*.js` 负责请求。
-3. 再回到后端：`backend/main.py` 主要负责路由汇聚和启动，业务细节分散到 `service/*.py`、`rag/*.py`、`backend/agent/agent.py`、`backend/tool/tools.py`、`milvus_client.py`、`ragas_eval.py`、`learning_trace.py`。
+3. 再回到后端：`backend/main.py` 主要负责路由汇聚和启动，业务细节分散到 `service/*.py`、`rag/*.py`、`milvus_client.py`、`ragas_eval.py`、`learning_trace.py`。
 4. 看数据库时，优先对照 `backend/model/models.py`，再回看 `database.py` 的字符集迁移逻辑。
 
 ## 10. 一句话总结

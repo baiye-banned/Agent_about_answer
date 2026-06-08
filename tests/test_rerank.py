@@ -1,6 +1,6 @@
 import asyncio
 
-from tool import rerank
+from rag import rerank
 
 
 def _chunks():

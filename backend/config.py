@@ -106,12 +106,6 @@ RAGAS_MAX_ANSWER_CHARS = _env_int("RAGAS_MAX_ANSWER_CHARS", 2000)
 RETRIEVAL_ROUTE_TOP_K = _env_int("RETRIEVAL_ROUTE_TOP_K", 8)
 RETRIEVAL_RERANK_TOP_N = _env_int("RETRIEVAL_RERANK_TOP_N", 5)
 
-# Agentic retrieval planning.
-# controlled: structured query planning before retrieval, default for stability.
-# langchain: legacy open-ended LangChain agent planning, useful for experiments.
-# fallback: skip model planning and use the memory-aware retrieval question.
-AGENT_PLANNER_MODE = os.getenv("AGENT_PLANNER_MODE", "controlled").strip().lower()
-
 # Conversation memory.
 MEMORY_WINDOW_TURNS = _env_int("MEMORY_WINDOW_TURNS", 4)
 MEMORY_SUMMARY_MAX_CHARS = _env_int("MEMORY_SUMMARY_MAX_CHARS", 15000)

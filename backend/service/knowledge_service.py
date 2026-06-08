@@ -12,14 +12,9 @@ from database.session import SessionLocal, get_db
 from model.models import KnowledgeFile, User
 from schema.schemas import KnowledgeBaseRequest
 from service.auth_service import get_current_user
-from agent.agent import agentic_retrieve_knowledge as _agentic_retrieve_knowledge
 
 
 logger = logging.getLogger(__name__)
-
-
-async def agentic_retrieve_knowledge(*args, **kwargs):
-    return await _agentic_retrieve_knowledge(*args, **kwargs)
 
 
 def get_default_knowledge_base(db: Session):
