@@ -39,6 +39,15 @@
             />
           </el-form-item>
 
+          <el-alert
+            v-if="loginError"
+            class="mb-4"
+            type="error"
+            :title="loginError"
+            show-icon
+            :closable="false"
+          />
+
           <el-button
             type="primary"
             size="large"
@@ -68,6 +77,7 @@ const userStore = useUserStore()
 
 const formRef = ref(null)
 const loading = ref(false)
+const loginError = ref('')
 const form = reactive({
   username: '',
   password: '',
@@ -82,6 +92,7 @@ const rules = {
 }
 
 async function handleLogin() {
+  loginError.value = ''
   const valid = await formRef.value?.validate().catch(() => false)
   if (!valid || loading.value) return
 
@@ -91,7 +102,8 @@ async function handleLogin() {
     ElMessage.success('登录成功')
     router.replace(route.query.redirect || '/chat')
   } catch (error) {
-    ElMessage.error(getApiErrorMessage(error, '用户名或密码错误'))
+    loginError.value = getApiErrorMessage(error, '用户名或密码错误')
+    ElMessage.error(loginError.value)
   } finally {
     loading.value = false
   }

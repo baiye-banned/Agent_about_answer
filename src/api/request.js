@@ -21,17 +21,20 @@ request.interceptors.response.use(
   (error) => {
     const status = error.response?.status
     const message = getApiErrorMessage(error)
+    const silent = Boolean(error.config?.silent)
 
     if (status === 401) {
       if (router.currentRoute.value.path !== '/login') {
         localStorage.removeItem('token')
         localStorage.removeItem('username')
         router.replace('/login')
-        ElMessage.warning('登录已过期，请重新登录')
-      } else {
+        if (!silent) {
+          ElMessage.warning('登录已过期，请重新登录')
+        }
+      } else if (!silent) {
         ElMessage.error(message || '用户名或密码错误')
       }
-    } else if (!error.config?.silent) {
+    } else if (!silent) {
       ElMessage.error(message)
     }
 
