@@ -2,9 +2,9 @@ from sqlalchemy import create_engine
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
-from config import DATABASE_URL
+from config import DATABASE_URL, MYSQL_CONNECT_ARGS
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=3600)
+engine = create_engine(DATABASE_URL, connect_args=MYSQL_CONNECT_ARGS, pool_pre_ping=True, pool_recycle=3600)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 

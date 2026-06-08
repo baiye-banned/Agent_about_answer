@@ -208,11 +208,25 @@ MYSQL_PASSWORD=your_mysql_password
 MYSQL_HOST=localhost
 MYSQL_PORT=3306
 MYSQL_DATABASE=rag_system
+MYSQL_SSL_MODE=
+MYSQL_SSL_CA=
 
 DEEPSEEK_API_KEY=your_deepseek_api_key
 DASHSCOPE_API_KEY=your_dashscope_api_key
 
 SECRET_KEY=replace-with-a-long-random-secret
+```
+
+如果使用 Aiven MySQL 这类要求 SSL 的云数据库，Render 环境变量里加：
+
+```env
+MYSQL_SSL_MODE=required
+```
+
+如果服务商要求指定 CA 证书，可以把证书文件随部署环境挂载后设置：
+
+```env
+MYSQL_SSL_CA=/path/to/ca.pem
 ```
 
 如果使用本地 Milvus Lite：
@@ -444,6 +458,13 @@ Python 测试：
 
 ```bash
 python -m pytest -q tests
+```
+
+RAGAS 是可选评估能力。默认部署依赖不会安装 RAGAS，以减少 Render 构建时间；如果需要启用在线评估，请额外安装：
+
+```bash
+cd backend
+pip install -r requirements-ragas.txt
 ```
 
 前端构建：

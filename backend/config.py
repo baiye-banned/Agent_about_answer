@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
@@ -31,8 +32,19 @@ MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "change-me")
 MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
 MYSQL_PORT = os.getenv("MYSQL_PORT", "3306")
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "rag_system")
+MYSQL_SSL_MODE = os.getenv("MYSQL_SSL_MODE", "").strip().lower()
+MYSQL_SSL_CA = os.getenv("MYSQL_SSL_CA", "").strip()
 
-DATABASE_URL = f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}?charset=utf8mb4"
+DATABASE_URL = (
+    f"mysql+pymysql://{quote_plus(MYSQL_USER)}:{quote_plus(MYSQL_PASSWORD)}@"
+    f"{MYSQL_HOST}:{MYSQL_PORT}/{quote_plus(MYSQL_DATABASE)}?charset=utf8mb4"
+)
+
+MYSQL_CONNECT_ARGS = {}
+if MYSQL_SSL_CA:
+    MYSQL_CONNECT_ARGS["ssl"] = {"ca": MYSQL_SSL_CA}
+elif MYSQL_SSL_MODE in {"required", "require", "true", "1"}:
+    MYSQL_CONNECT_ARGS["ssl"] = {}
 
 # Milvus Lite / Milvus server
 REBUILD_KNOWLEDGE_INDEX_ON_STARTUP = _env_bool("REBUILD_KNOWLEDGE_INDEX_ON_STARTUP", False)
