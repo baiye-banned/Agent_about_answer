@@ -13,12 +13,20 @@ from service.auth_service import get_current_user, pwd_context
 from service.utils_service import AVATAR_MAX_BYTES, resolve_image_upload_type
 
 
+DEFAULT_USERS = (
+    ("admin", "admin123"),
+    ("demo", "demo123"),
+)
+
+
 def seed_default_users() -> None:
     db = SessionLocal()
     try:
-        if not db.query(User).first():
-            for username, password in [("admin", "admin123"), ("demo", "demo123")]:
+        for username, password in DEFAULT_USERS:
+            existing_user = db.query(User).filter_by(username=username).first()
+            if not existing_user:
                 db.add(User(username=username, password_hash=pwd_context.hash(password)))
+        if db.new:
             db.commit()
     finally:
         db.close()
