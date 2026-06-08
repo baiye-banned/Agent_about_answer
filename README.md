@@ -466,7 +466,7 @@ Python 测试：
 python -m pytest -q tests
 ```
 
-RAGAS 是可选评估能力。默认部署依赖不会安装 RAGAS，以减少 Render 构建时间；如果需要启用在线评估，请额外安装：
+RAGAS 是可选评估能力。默认部署依赖不会安装 RAGAS，以减少 Render 构建时间；默认配置建议保持 `RAGAS_ENABLED=false`。如果需要启用在线评估，请额外安装：
 
 ```bash
 cd backend
