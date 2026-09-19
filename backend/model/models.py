@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -26,9 +26,12 @@ class User(Base):
 
 class KnowledgeBase(Base):
     __tablename__ = "knowledge_bases"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_knowledge_bases_user_name"),)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String(100), unique=True, nullable=False, index=True)
+    # 归属用户；历史数据为 NULL（不可见），由 scripts/backfill_knowledge_owner.py 回填。
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    name = Column(String(100), nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -78,6 +81,8 @@ class KnowledgeFile(Base):
     __tablename__ = "knowledge_files"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    # 归属用户；历史数据为 NULL（不可见），由 scripts/backfill_knowledge_owner.py 回填。
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     knowledge_base_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=True)
     name = Column(String(255), nullable=False)
     size = Column(Integer, nullable=False)
