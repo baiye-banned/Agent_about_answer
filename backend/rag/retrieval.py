@@ -105,28 +105,27 @@ async def retrieve_knowledge(
         question,
     )
 
-    # query_vectors / keyword_recall 都是同步实现（阻塞式网络与数据库 IO）。
-    # 直接在协程里调用会独占事件循环，一轮多路检索期间整个进程无法处理其它请求，
-    # 因此统一交给线程池执行，并用 gather 让各路召回并发而不是串行等待。
-    keyword_chunks_task = (
-        asyncio.to_thread(keyword_recall, db, knowledge_base_id, keyword_terms, RETRIEVAL_ROUTE_TOP_K)
-        if keyword_terms
-        else None
-    )
-    route_chunks_list = await asyncio.gather(
-        *[
-            asyncio.to_thread(
-                query_vectors,
-                query,
-                top_k=RETRIEVAL_ROUTE_TOP_K,
-                knowledge_base_id=knowledge_base_id,
-                route=route,
-            )
-            for route, query in route_specs
-        ]
-    )
+    # query_vectors / keyword_recall 都是同步实现（阻塞式网络与数据库 IO），直接在协程里
+    # 调用会独占事件循环，一轮多路检索期间整个进程无法处理其它请求。注意 asyncio.to_thread
+    # 返回的是惰性 coroutine：只赋值不交给事件循环并不会让它先跑起来，所以所有召回（含关键字）
+    # 必须放进同一个 gather，否则关键字召回仍会排在向量召回之后串行执行。
+    recall_calls = [
+        asyncio.to_thread(
+            query_vectors,
+            query,
+            top_k=RETRIEVAL_ROUTE_TOP_K,
+            knowledge_base_id=knowledge_base_id,
+            route=route,
+        )
+        for route, query in route_specs
+    ]
+    if keyword_terms:
+        recall_calls.append(
+            asyncio.to_thread(keyword_recall, db, knowledge_base_id, keyword_terms, RETRIEVAL_ROUTE_TOP_K)
+        )
+    recall_results = await asyncio.gather(*recall_calls)
 
-    for (route, query), chunks in zip(route_specs, route_chunks_list):
+    for (route, query), chunks in zip(route_specs, recall_results):
         route_results.append((route, chunks))
         trace["routes"].append(
             {
@@ -137,9 +136,8 @@ async def retrieve_knowledge(
             }
         )
 
-    keyword_chunks = []
-    if keyword_chunks_task is not None:
-        keyword_chunks = await keyword_chunks_task
+    keyword_chunks = recall_results[len(route_specs)] if keyword_terms else []
+    if keyword_terms:
         route_results.append(("keyword", keyword_chunks))
         trace["routes"].append(
             {

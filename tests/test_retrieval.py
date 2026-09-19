@@ -60,8 +60,10 @@ def test_retrieve_knowledge_keeps_event_loop_responsive_and_recalls_concurrently
     """一轮多路检索期间事件循环必须仍在被调度，且各路召回是并发而不是串行等待。"""
     route_count = 8
     route_delay = 0.2
+    keyword_delay = 0.2
     lock = threading.Lock()
     inflight = {"now": 0, "max": 0}
+    windows = {"vectors_end": 0.0, "keyword_start": None}
     calls = []
 
     def fake_query_vectors(query, top_k, knowledge_base_id, route):
@@ -75,8 +77,12 @@ def test_retrieve_knowledge_keeps_event_loop_responsive_and_recalls_concurrently
         finally:
             with lock:
                 inflight["now"] -= 1
+                windows["vectors_end"] = max(windows["vectors_end"], time.perf_counter())
 
     def fake_keyword_recall(db, knowledge_base_id, keywords, top_k):
+        with lock:
+            windows["keyword_start"] = time.perf_counter()
+        time.sleep(keyword_delay)
         return []
 
     async def fake_rerank_chunks(question, chunks):
@@ -133,6 +139,9 @@ def test_retrieve_knowledge_keeps_event_loop_responsive_and_recalls_concurrently
     assert heartbeats_during_retrieval
     # 多路召回并发：任一时刻都有多路在途，而不是一路接一路。
     assert inflight["max"] >= 2
+    # 关键字召回也在同一个 gather 里：它必须在最后一路向量召回结束前就启动。
+    assert windows["keyword_start"] is not None
+    assert windows["keyword_start"] < windows["vectors_end"]
     # 8 路各 0.2s：串行需要 1.6s，并发后应明显低于串行耗时。
     assert elapsed < route_count * route_delay * 0.6
 
