@@ -214,8 +214,11 @@ MYSQL_SSL_CA=
 DEEPSEEK_API_KEY=your_deepseek_api_key
 DASHSCOPE_API_KEY=your_dashscope_api_key
 
-SECRET_KEY=replace-with-a-long-random-secret
+SECRET_KEY=change-this-secret-key-in-production
 ```
+
+上面 `SECRET_KEY` 写的是与 `.env.example` 一致的公开占位值，**必须替换**成随机值再启动：
+保持占位值（或留空）时后端会拒绝启动。生成方式见文末安全说明。
 
 Render 后端 Web Service 建议额外设置 Python 版本，避免平台默认使用过新的 Python 版本：
 
