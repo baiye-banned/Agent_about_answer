@@ -251,6 +251,25 @@ MILVUS_PASSWORD=
 MILVUS_DB_NAME=
 ```
 
+默认账号播种由环境变量控制：
+
+```env
+SEED_DEFAULT_USERS=true
+SEED_ADMIN_PASSWORD=
+SEED_DEMO_PASSWORD=
+```
+
+- `SEED_DEFAULT_USERS` 默认为 `true`，设为 `false` 后启动过程不会创建任何账号。
+- 账号口令只来自 `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD`，仓库中不存在固定口令；未配置对应变量时会生成不可预测的随机口令，随机口令不会写入日志。
+- 因此未显式配置口令的账号无法直接登录，需要通过下面的重置方式设置新口令（`新口令` 换成自定义值）：
+
+```bash
+cd backend
+python -c "from database.session import SessionLocal; from crud import user as crud_user; from model.models import User; from service.auth_service import pwd_context; db = SessionLocal(); u = db.query(User).filter_by(username='admin').first(); crud_user.update_password_hash(db, u, pwd_context.hash('新口令')); db.close(); print('password updated')"
+```
+
+- 对外提供服务前，建议设置 `SEED_DEFAULT_USERS=false`，或至少为启用的账号配置强口令。
+
 ### 4.3 初始化数据库
 
 创建 MySQL 数据库：
@@ -261,7 +280,9 @@ CREATE DATABASE IF NOT EXISTS rag_system
   COLLATE utf8mb4_unicode_ci;
 ```
 
-启动 FastAPI 时，`backend/main.py` 会调用 `init_db()` 创建表结构，并调用 `seed_default_users()` 初始化默认用户数据。
+启动 FastAPI 时，`backend/main.py` 会调用 `init_db()` 创建表结构，并调用 `seed_default_users()` 初始化默认账号。
+
+`seed_default_users()` 受 `SEED_DEFAULT_USERS` 控制：该开关为 `false` 时不创建任何账号；为 `true` 时仅为尚不存在的 `admin`、`demo` 创建账号，且不会覆盖已有账号的口令。账号口令取自 `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD`，未配置时使用随机生成的口令（不落日志），不再使用任何公开的固定口令。
 
 ### 4.4 本地启动
 
@@ -486,6 +507,7 @@ npm run build
 - `.env`、本地数据库、上传文件、日志、PID 文件、缓存、`node_modules` 和构建产物都应加入 Git 忽略规则。
 - `.env.example` 只保留占位配置，不应提交真实 API key、OSS 凭证、数据库密码或 JWT secret。
 - 生产环境需要替换默认本地配置，配置 HTTPS / 反向代理，强化 JWT secret 管理，并进行外部模型与对象存储连通性检查。
+- 启动播种的演示账号不再是公开固定口令：账号口令由 `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD` 提供，未配置时随机生成且不写入日志；不需要演示账号时设置 `SEED_DEFAULT_USERS=false`。
 
 ## 文档
 
