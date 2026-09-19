@@ -1,5 +1,6 @@
 import contextlib
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -159,6 +160,81 @@ def test_query_vectors_normalizes_invalid_hit_file_id(monkeypatch):
     chunks = milvus_client.query_vectors("query", knowledge_base_id=3)
 
     assert chunks[0]["file_id"] == 0
+
+
+def test_embedding_default_timeout_is_online_qa_scale():
+    """默认超时必须收敛到线上问答量级，否则一轮 9 路召回会被单次调用拖住。"""
+    if os.getenv("EMBEDDING_TIMEOUT_SECONDS", "").strip():
+        # 部署方显式覆盖时「默认值」已不存在，避免用例在合法配置下变红。
+        pytest.skip("EMBEDDING_TIMEOUT_SECONDS 已被环境显式覆盖")
+    assert 0 < milvus_client.EMBEDDING_TIMEOUT_SECONDS <= 10
+
+
+def test_embedding_client_uses_configured_timeout(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"index": 0, "embedding": [0.1] * milvus_client.EMBEDDING_DIM}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(milvus_client, "EMBEDDING_BASE_URL", "https://embedding.example/v1")
+    monkeypatch.setattr(milvus_client, "EMBEDDING_API_KEY", "test-key")
+    monkeypatch.setattr(milvus_client, "EMBEDDING_TIMEOUT_SECONDS", 7)
+    monkeypatch.setattr(milvus_client.httpx, "Client", FakeClient)
+
+    vectors = milvus_client._OpenAICompatibleEmbeddingFunction()(["hello"])
+
+    assert captured["timeout"] == 7
+    assert len(vectors) == 1
+
+
+def test_embedding_timeout_does_not_leak_raw_transport_error(monkeypatch):
+    """向量化接口超时必须抛出 EmbeddingBackendError，不能泄漏 httpx 原始异常。
+
+    已配置向量化后端时不再静默降级为哈希向量（跨向量空间检索），
+    该路由由召回段按 EmbeddingBackendError 逐路跳过。
+    """
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, *args, **kwargs):
+            raise httpx.TimeoutException("embedding request timed out")
+
+    monkeypatch.setattr(milvus_client, "EMBEDDING_BASE_URL", "https://embedding.example/v1")
+    monkeypatch.setattr(milvus_client, "EMBEDDING_API_KEY", "test-key")
+    monkeypatch.setattr(milvus_client, "EMBEDDING_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(milvus_client.httpx, "Client", FakeClient)
+
+    with pytest.raises(milvus_client.EmbeddingBackendError) as excinfo:
+        milvus_client._OpenAICompatibleEmbeddingFunction()(["hello"])
+
+    # 明确不是 httpx 原始异常泄漏，也不是静默降级成哈希向量。
+    assert not isinstance(excinfo.value, httpx.HTTPError)
+    assert str(excinfo.value)
 
 
 class _FakeHttpClient:

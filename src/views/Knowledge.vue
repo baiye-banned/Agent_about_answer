@@ -236,6 +236,11 @@ import { useKnowledgeStore } from '@/stores/knowledge'
 import { confirmCenteredDelete } from '@/utils/confirm'
 import { copyText } from '@/utils/clipboard'
 import { getApiErrorMessage } from '@/utils/httpError'
+import {
+  describeBatchDeleteResult,
+  describeUploadSuccess,
+  uploadFilesInOrder,
+} from '@/utils/knowledgeFeedback'
 import { formatDateTime, formatFileSize } from '@/utils'
 
 const allFiles = ref([])
@@ -520,22 +525,16 @@ async function handleUpload(files) {
   uploadPercent.value = 0
 
   try {
-    for (const [index, file] of validFiles.entries()) {
-      await knowledgeAPI.upload(
-        file,
-        currentKnowledgeBaseId.value,
-        (event) => {
-          if (event.total) {
-            const fileProgress = event.loaded / event.total
-            uploadPercent.value = Math.round(((index + fileProgress) / validFiles.length) * 100)
-          }
-        },
-        { silent: true }
-      )
-      uploadPercent.value = Math.round(((index + 1) / validFiles.length) * 100)
-    }
+    await uploadFilesInOrder(
+      validFiles,
+      (file, onProgress) =>
+        knowledgeAPI.upload(file, currentKnowledgeBaseId.value, onProgress, { silent: true }),
+      (percent) => {
+        uploadPercent.value = percent
+      }
+    )
 
-    ElMessage.success(validFiles.length > 1 ? `已上传 ${validFiles.length} 个文件` : '上传成功')
+    ElMessage.success(describeUploadSuccess(validFiles.length))
     await refreshKnowledgeBaseAndFiles()
   } catch (error) {
     ElMessage.error(getApiErrorMessage(error, '上传失败，请稍后重试'))
@@ -561,16 +560,8 @@ async function confirmBatchDelete() {
   if (!selectedFiles.value.length) return
   await confirmCenteredDelete(`确定删除选中的 ${selectedFiles.value.length} 个资料吗？删除后不可恢复。`, '批量删除资料')
   const result = await knowledgeAPI.batchDelete(selectedFiles.value.map((file) => file.id), { silent: true })
-  if (result.failed) {
-    const message = `已删除 ${result.succeeded} 个资料，${result.failed} 个删除失败`
-    if (result.succeeded) {
-      ElMessage.warning(message)
-    } else {
-      ElMessage.error(message)
-    }
-  } else {
-    ElMessage.success('已删除选中资料')
-  }
+  const feedback = describeBatchDeleteResult(result)
+  ElMessage[feedback.type](feedback.message)
   selectedFiles.value = []
   await refreshKnowledgeBaseAndFiles()
 }

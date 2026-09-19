@@ -65,6 +65,9 @@ CHECKPOINTER_DB_PATH = os.getenv("CHECKPOINTER_DB_PATH", "./checkpointer.db")
 # Account passwords come from SEED_<USERNAME>_PASSWORD and are never hardcoded.
 SEED_DEFAULT_USERS = _env_bool("SEED_DEFAULT_USERS", True)
 
+# Knowledge base upload
+KNOWLEDGE_UPLOAD_MAX_MB = _env_int("KNOWLEDGE_UPLOAD_MAX_MB", 10)
+
 # DeepSeek OpenAI-compatible chat API
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
@@ -99,6 +102,10 @@ EMBEDDING_BASE_URL = os.getenv(
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v4")
 EMBEDDING_DIM = _env_int("EMBEDDING_DIM", 1024)
+# Single embedding request timeout, in seconds. Retrieval issues up to 9 route
+# queries per round, so a 60s default can stall the whole round; keep it at
+# online-QA scale and let deployments raise it for bulk ingestion.
+EMBEDDING_TIMEOUT_SECONDS = _env_int("EMBEDDING_TIMEOUT_SECONDS", 10)
 
 # Dedicated reranker for retrieved chunks.
 RERANK_PROVIDER = os.getenv("RERANK_PROVIDER", "dashscope")
