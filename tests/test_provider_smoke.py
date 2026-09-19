@@ -3,8 +3,11 @@
 Every provider client the RAG chain talks to -- the OpenAI-compatible embedding API, the
 qwen3 reranker, the DeepSeek chat model and its two fallbacks -- is driven here against
 in-process stubs, covering the success contract, failures, timeouts and malformed
-responses. The point of the failure cases is that none of them may stay silent: each one
-must surface a warning, a failed trace entry or an explicit error event.
+responses. The point of the failure cases is that none of them may stay silent: a
+configured embedding backend raises EmbeddingBackendError instead of quietly switching to
+hash vectors (which live in a different vector space), a failed rerank reports a failed
+trace entry, and a failed answer stream either reports an error event or re-generates the
+whole answer behind a reset event.
 
 The last two tests run scripts/smoke_providers.py, the operator-facing entry point: once
 offline (every provider reported, zero exit code) and once in `--live` mode without
@@ -96,6 +99,11 @@ def _install_embedding_client(monkeypatch, behaviour):
     return _StubSyncClient.calls
 
 
+def _forbidden_hash_fallback(*_args, **_kwargs):  # pragma: no cover - must never run
+    """Fail loudly if a configured embedding backend degrades to local hash vectors."""
+    raise AssertionError("configured embedding backend fell back to hash vectors")
+
+
 def _install_rerank_client(monkeypatch, behaviour):
     _CapturingAsyncClient.calls = []
     monkeypatch.setattr(rerank, "RERANK_BASE_URL", RERANK_BASE_URL)
@@ -147,38 +155,55 @@ def test_embedding_without_credentials_never_opens_a_connection(monkeypatch):
     assert len(vectors[0]) == milvus_client.EMBEDDING_DIM
 
 
-def test_embedding_timeout_is_warned_and_falls_back(monkeypatch, caplog):
+def test_embedding_timeout_raises_instead_of_falling_back(monkeypatch, caplog):
     def behaviour(_count):
         raise httpx.ConnectTimeout("embedding endpoint timed out")
 
     _install_embedding_client(monkeypatch, behaviour)
+    monkeypatch.setattr(milvus_client, "_hash_embedding_fn", _forbidden_hash_fallback)
 
-    with caplog.at_level(logging.WARNING, logger=milvus_client.__name__):
-        vectors = milvus_client._OpenAICompatibleEmbeddingFunction()(["迟到处罚"])
+    with caplog.at_level(logging.ERROR, logger=milvus_client.__name__):
+        with pytest.raises(milvus_client.EmbeddingBackendError) as exc_info:
+            milvus_client._OpenAICompatibleEmbeddingFunction()(["迟到处罚"])
 
-    assert "Embedding API failed; using hash fallback" in caplog.text
+    message = str(exc_info.value)
+    assert "向量化接口调用失败" in message
+    assert "embedding endpoint timed out" in message
+    # The failure must reach the operator, not just the caller.
+    assert "向量化接口调用失败" in caplog.text
     assert "embedding endpoint timed out" in caplog.text
-    assert len(vectors[0]) == milvus_client.EMBEDDING_DIM
 
 
 @pytest.mark.parametrize(
-    "payload",
+    "payload, detail",
     [
-        {"data": []},
-        {"data": [{"index": 0, "embedding": []}]},
-        {"data": [{"index": 0, "embedding": [0.1] * milvus_client.EMBEDDING_DIM}]},
+        ({"data": []}, "期望 2 条向量，实际得到 0 条"),
+        ({"data": [{"index": 0, "embedding": []}]}, "期望 2 条向量，实际得到 1 条"),
+        ({"data": [{"index": 0, "embedding": [0.1] * milvus_client.EMBEDDING_DIM}]}, "期望 2 条向量，实际得到 1 条"),
+        (
+            {
+                "data": [
+                    {"index": 0, "embedding": [0.1] * milvus_client.EMBEDDING_DIM},
+                    {"index": 1, "embedding": [0.1]},
+                ]
+            },
+            f"期望 {milvus_client.EMBEDDING_DIM} 维向量，实际得到 {[milvus_client.EMBEDDING_DIM, 1]}",
+        ),
     ],
-    ids=["empty-data", "empty-vector", "count-mismatch"],
+    ids=["empty-data", "empty-vector", "count-mismatch", "dimension-mismatch"],
 )
-def test_embedding_malformed_response_is_warned_and_falls_back(monkeypatch, caplog, payload):
+def test_embedding_malformed_response_raises_instead_of_falling_back(monkeypatch, caplog, payload, detail):
     _install_embedding_client(monkeypatch, lambda _count: _Response(payload))
+    monkeypatch.setattr(milvus_client, "_hash_embedding_fn", _forbidden_hash_fallback)
 
-    with caplog.at_level(logging.WARNING, logger=milvus_client.__name__):
-        vectors = milvus_client._OpenAICompatibleEmbeddingFunction()(["迟到处罚", "报销流程"])
+    with caplog.at_level(logging.ERROR, logger=milvus_client.__name__):
+        with pytest.raises(milvus_client.EmbeddingBackendError) as exc_info:
+            milvus_client._OpenAICompatibleEmbeddingFunction()(["迟到处罚", "报销流程"])
 
-    assert "Embedding API failed; using hash fallback" in caplog.text
-    assert len(vectors) == 2
-    assert all(len(vector) == milvus_client.EMBEDDING_DIM for vector in vectors)
+    message = str(exc_info.value)
+    assert "向量化接口响应结构异常" in message
+    assert detail in message
+    assert "向量化接口响应结构异常" in caplog.text
 
 
 def test_rerank_request_contract_clamps_and_sorts_scores(monkeypatch):
@@ -387,10 +412,19 @@ def test_answer_stream_switches_to_text_fallback_model(monkeypatch):
 
     events = _collect_events(question="迟到怎么处罚", context="迟到罚款50元", trace=trace)
 
-    assert "".join(events) == "后备模型回答"
+    # The fallback model regenerates the whole answer, so the consumer has to be told to
+    # discard whatever the failed stream already emitted before the new text arrives.
+    assert len(events) >= 2
+    reset, chunks = events[0], events[1:]
+    assert isinstance(reset, dict)
+    assert reset["type"] == "reset"
+    assert reset["reason"] == "text_fallback"
+    assert all(isinstance(chunk, str) for chunk in chunks)
+    assert "".join(chunks) == "后备模型回答"
     assert [event["event"] for event in trace.events] == [
         "langchain_generation_prompt_built",
         "langchain_generation_failed",
+        "langchain_stream_reset",
         "langchain_text_fallback_started",
     ]
 
