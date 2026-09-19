@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import re
@@ -99,30 +100,6 @@ async def retrieve_knowledge(
     route_results: list[tuple[str, list[dict]]] = []
     route_specs = _build_route_specs(question, query_plan)
 
-    for route, query in route_specs:
-        try:
-            chunks = query_vectors(
-                query,
-                top_k=RETRIEVAL_ROUTE_TOP_K,
-                knowledge_base_id=knowledge_base_id,
-                route=route,
-            )
-        except EmbeddingBackendError as exc:
-            # 查询向量化失败时绝不退化为哈希向量（会造成跨空间检索），
-            # 显式跳过向量路由并记录原因，后续仍可用关键词路由召回。
-            logger.warning("Vector route skipped, embedding backend unavailable: route=%s error=%s", route, exc)
-            trace["embedding_error"] = str(exc)
-            chunks = []
-        route_results.append((route, chunks))
-        trace["routes"].append(
-            {
-                "route": route,
-                "query": query,
-                "count": len(chunks),
-                "items": [trace_chunk(item) for item in chunks[:5]],
-            }
-        )
-
     keyword_terms = _merge_keywords(
         [
             *(query_plan.get("keywords") or []),
@@ -130,16 +107,65 @@ async def retrieve_knowledge(
         ],
         question,
     )
-    keyword_chunks = []
+
+    # query_vectors / keyword_recall 都是同步实现（阻塞式网络与数据库 IO），直接在协程里
+    # 调用会独占事件循环，一轮多路检索期间整个进程无法处理其它请求。注意 asyncio.to_thread
+    # 返回的是惰性 coroutine：只赋值不交给事件循环并不会让它先跑起来，所以所有召回（含关键字）
+    # 必须放进同一个 gather，否则关键字召回仍会排在向量召回之后串行执行。
+    # (route, query, 召回调用) 三元组把描述信息与调用绑在一起，结果按描述符配对，
+    # 不依赖「关键词结果恒为列表最后一个元素」的位置约定。
+    recall_specs: list[tuple[str, str, Any]] = [
+        (
+            route,
+            query,
+            asyncio.to_thread(
+                query_vectors,
+                query,
+                top_k=RETRIEVAL_ROUTE_TOP_K,
+                knowledge_base_id=knowledge_base_id,
+                route=route,
+            ),
+        )
+        for route, query in route_specs
+    ]
     if keyword_terms:
-        keyword_chunks = keyword_recall(db, knowledge_base_id, keyword_terms, RETRIEVAL_ROUTE_TOP_K)
-        route_results.append(("keyword", keyword_chunks))
+        recall_specs.append(
+            (
+                "keyword",
+                " ".join(keyword_terms),
+                asyncio.to_thread(keyword_recall, db, knowledge_base_id, keyword_terms, RETRIEVAL_ROUTE_TOP_K),
+            )
+        )
+
+    # return_exceptions=True 是「并发」与「逐路降级」的交点：向量化后端不可用时只让该路拿到
+    # EmbeddingBackendError，其余路与关键词路照常返回；同时 gather 会等全部召回结束才返回，
+    # 不会留下仍在触碰请求级 Session 的孤儿线程。非 EmbeddingBackendError 的异常仍按原语义上抛。
+    recall_results = await asyncio.gather(*(spec[2] for spec in recall_specs), return_exceptions=True)
+
+    keyword_chunks: list[dict] = []
+    for (route, query, _), result in zip(recall_specs, recall_results, strict=True):
+        if isinstance(result, EmbeddingBackendError):
+            # 查询向量化失败时绝不退化为哈希向量（会造成跨空间检索），
+            # 显式跳过该路并记录原因，后续仍可用关键词路由召回。
+            logger.warning("Vector route skipped, embedding backend unavailable: route=%s error=%s", route, result)
+            trace["embedding_error"] = str(result)
+            result = []
+        elif isinstance(result, BaseException):
+            raise result
+        chunks: list[dict] = result
+        # 关键词路复用固定名字 "keyword"（_build_route_specs 只产出
+        # planned/simplified/sub_question_N/hyde/rewrite_N），按名字分流而非按下标。
+        # 关键词路同样进入 route_results 参与 RRF 融合，并且始终排在向量路之后
+        # （recall_specs 末尾追加），与两侧既有语义一致。
+        if route == "keyword":
+            keyword_chunks = chunks
+        route_results.append((route, chunks))
         trace["routes"].append(
             {
-                "route": "keyword",
-                "query": " ".join(keyword_terms),
-                "count": len(keyword_chunks),
-                "items": [trace_chunk(item) for item in keyword_chunks[:5]],
+                "route": route,
+                "query": query,
+                "count": len(chunks),
+                "items": [trace_chunk(item) for item in chunks[:5]],
             }
         )
 
