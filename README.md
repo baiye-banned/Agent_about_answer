@@ -396,24 +396,29 @@ server {
 ```nginx
     # Swagger UI 页面本身是 /docs，它还会请求 /docs/oauth2-redirect，
     # 因此精确匹配 /docs 之外还要放行 /docs/ 子路径。
+    # proxy_set_header 不能跨 location 继承，每个块都要各写一次。
     location = /docs {
         proxy_pass http://127.0.0.1:8002/docs;
+        proxy_set_header Host $host;
     }
 
     location /docs/ {
         proxy_pass http://127.0.0.1:8002/docs/;
+        proxy_set_header Host $host;
     }
 
     location = /redoc {
         proxy_pass http://127.0.0.1:8002/redoc;
+        proxy_set_header Host $host;
     }
 
     location = /openapi.json {
         proxy_pass http://127.0.0.1:8002/openapi.json;
+        proxy_set_header Host $host;
     }
 ```
 
-这里统一用 `=` 精确匹配，避免 `/docsXYZ` 这类并不存在的路径也被转发到后端。开启前建议配合 IP 白名单（`allow` / `deny`）或额外的鉴权，不要直接暴露在公网。
+这里统一用 `=` 精确匹配，避免 `/docsXYZ` 这类并不存在的路径也被转发到后端。`proxy_set_header Host $host;` 同样是必须的：不写的话 Nginx 默认把 `Host` 设成上游地址（`127.0.0.1:8002`），而 Starlette 对 `/docs/` 会回一个 `307` 跳转到 `/docs`，跳转目标里就会带上 `http://127.0.0.1:8002` 这个只在服务器内部可达的地址，浏览器拿到后会跳不过去。开启前建议配合 IP 白名单（`allow` / `deny`）或额外的鉴权，不要直接暴露在公网。
 
 ### 4.7 DNS 配置
 
@@ -457,7 +462,7 @@ server {
 }
 ```
 
-上面是 HTTP → HTTPS 跳转。443 的 server 块由 `certbot --nginx` 改写生成，**4.6 里的 `location = /health` 不会被自动带过去**，需要手工确认它在 443 块里也存在，否则 HTTPS 入口的健康检查仍会被 `location /` 兜成前端页面：
+上面是 HTTP → HTTPS 跳转。`certbot --nginx` 是**原地改写**匹配到 `example.com` 的那个 server 块（也就是 4.6 里监听 80 的那一个），所以 4.6 的 `location = /health` 通常会被一并保留；但如果你另行编写了 443 的 server 块，或换用了其它证书签发方式，就必须逐条确认 443 块里也有这条规则，否则 HTTPS 入口的健康检查仍会被 `location /` 兜成前端页面：
 
 ```nginx
 server {
