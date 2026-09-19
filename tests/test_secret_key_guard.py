@@ -225,9 +225,13 @@ def test_service_startup_exits_without_secret_key():
 
     result = _run_in_subprocess(script)
 
+    output = result.stdout + result.stderr
     assert result.returncode != 0
     assert "STARTUP_SUCCEEDED" not in result.stdout
-    assert "SECRET_KEY" in (result.stdout + result.stderr)
+    assert "SECRET_KEY" in output
+    # 必须死于门禁本身：少了这一条，把 lifespan 里的 ensure_secret_key_configured() 删掉后
+    # 用例仍会通过（此时进程是连不上数据库才退出的），门禁被移除的回归就没人拦得住。
+    assert "SecretKeyError" in output
 
 
 def test_service_startup_check_passes_with_explicit_secret_key():
