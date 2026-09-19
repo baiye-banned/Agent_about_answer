@@ -61,6 +61,9 @@ MILVUS_COLLECTION_NAME = os.getenv("MILVUS_COLLECTION_NAME", "")
 # SQLite checkpointer
 CHECKPOINTER_DB_PATH = os.getenv("CHECKPOINTER_DB_PATH", "./checkpointer.db")
 
+# Knowledge base upload
+KNOWLEDGE_UPLOAD_MAX_MB = _env_int("KNOWLEDGE_UPLOAD_MAX_MB", 10)
+
 # DeepSeek OpenAI-compatible chat API
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")

@@ -1,7 +1,7 @@
 
 import logging
 
-from fastapi import Depends, File, Form, HTTPException, UploadFile
+from fastapi import Depends, File, Form, HTTPException, Request, UploadFile
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -12,9 +12,43 @@ from database.session import SessionLocal, get_db
 from model.models import KnowledgeFile, User
 from schema.schemas import KnowledgeBaseRequest
 from service.auth_service import get_current_user
+from service.utils_service import (
+    KNOWLEDGE_UPLOAD_MAX_BYTES,
+    KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE,
+    knowledge_upload_too_large_message,
+    resolve_knowledge_upload_type,
+)
 
 
 logger = logging.getLogger(__name__)
+
+UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+# multipart 的 content-length 含边界和表单字段等开销，预检留出余量，避免误伤刚好达标的文件。
+MULTIPART_OVERHEAD_ALLOWANCE_BYTES = 4096
+
+
+def upload_body_exceeds_limit(content_length: str | None, max_bytes: int) -> bool:
+    """content-length 预检：只在声明长度明显超过上限时才判定超限。"""
+    try:
+        declared_length = int(content_length)
+    except (TypeError, ValueError):
+        return False
+    return declared_length > max_bytes + MULTIPART_OVERHEAD_ALLOWANCE_BYTES
+
+
+async def read_upload_within_limit(file: UploadFile, max_bytes: int) -> bytes:
+    """分块读取并累计计量，超限立刻中断，避免把超大文件整体读进内存。"""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(UPLOAD_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(400, knowledge_upload_too_large_message())
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def get_default_knowledge_base(db: Session, user_id: int):
@@ -113,9 +147,17 @@ def list_knowledge(knowledge_base_id: int | None = None, user: User = Depends(ge
     return [crud_knowledge_file.serialize_knowledge_file(item) for item in files]
 
 
-async def upload_knowledge(file: UploadFile = File(...), knowledge_base_id: int | None = Form(None), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def upload_knowledge(request: Request, file: UploadFile = File(...), knowledge_base_id: int | None = Form(None), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     knowledge_base = resolve_knowledge_base(db, knowledge_base_id, user.id)
-    content = await file.read()
+
+    # 类型校验在读取之前完成：白名单外的文件既不解码也不落库。
+    if resolve_knowledge_upload_type(file.content_type, file.filename) is None:
+        raise HTTPException(400, KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE)
+    # content-length 预检 + 分块读取时二次核验，双保险拦截超限文件。
+    if upload_body_exceeds_limit(request.headers.get("content-length"), KNOWLEDGE_UPLOAD_MAX_BYTES):
+        raise HTTPException(400, knowledge_upload_too_large_message())
+
+    content = await read_upload_within_limit(file, KNOWLEDGE_UPLOAD_MAX_BYTES)
     text = crud_knowledge_file.extract_file_text(file.filename or "", content)
 
     try:
