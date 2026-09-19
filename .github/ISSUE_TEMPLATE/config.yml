@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用与部署说明
+    url: https://github.com/baiye-banned/Agent_about_answer/blob/develop/README.md
+    about: 环境准备、配置、本地启动与部署步骤，先看这里可能就有答案。
+  - name: 项目文档
+    url: https://github.com/baiye-banned/Agent_about_answer/tree/develop/docs
+    about: 架构说明、代码阅读路线与主流程示意图。

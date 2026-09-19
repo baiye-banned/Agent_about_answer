@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
@@ -59,8 +60,17 @@ def _collection_name() -> str:
 COLLECTION_NAME = _collection_name()
 
 
+class EmbeddingBackendError(RuntimeError):
+    """向量化后端不可用或返回异常。
+
+    调用方必须显式处理该异常（失败上传/检索降级/如实上报），
+    禁止回退到哈希向量——哈希向量与语义向量不在同一空间，
+    混写会让索引里的历史向量永远无法与查询向量正确比较。
+    """
+
+
 class _HashEmbeddingFunction:
-    """Fallback embedding so local development still runs without API config."""
+    """Local development embedding used only when no embedding API is configured."""
 
     def __call__(self, texts: list[str]) -> list[list[float]]:
         result = []
@@ -75,13 +85,50 @@ class _HashEmbeddingFunction:
         return result
 
 
+def _embedding_configured() -> bool:
+    return bool(EMBEDDING_BASE_URL and EMBEDDING_API_KEY)
+
+
+def _embeddings_url() -> str:
+    base_url = EMBEDDING_BASE_URL.rstrip("/")
+    return f"{base_url}/embeddings" if base_url.endswith("/v1") else f"{base_url}/v1/embeddings"
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# 最近一次实际生效的向量来源与失败信息（进程内），供状态接口如实上报。
+_embedding_state: dict[str, str] = {
+    "source": "",
+    "last_error": "",
+    "last_error_at": "",
+    "last_used_at": "",
+}
+
+
+def _record_embedding_success(source: str) -> None:
+    _embedding_state["source"] = source
+    _embedding_state["last_error"] = ""
+    _embedding_state["last_used_at"] = _utc_now()
+
+
+def _embedding_failure(message: str) -> EmbeddingBackendError:
+    _embedding_state["last_error"] = message
+    _embedding_state["last_error_at"] = _utc_now()
+    logger.error("%s", message)
+    return EmbeddingBackendError(message)
+
+
 class _OpenAICompatibleEmbeddingFunction:
     def __call__(self, texts: list[str]) -> list[list[float]]:
-        if not EMBEDDING_BASE_URL or not EMBEDDING_API_KEY:
-            return _hash_embedding_fn(texts)
+        if not _embedding_configured():
+            logger.info("Embedding API is not configured; using local hash vectors (development only)")
+            vectors = _hash_embedding_fn(texts)
+            _record_embedding_success("hash-fallback")
+            return vectors
 
-        base_url = EMBEDDING_BASE_URL.rstrip("/")
-        url = f"{base_url}/embeddings" if base_url.endswith("/v1") else f"{base_url}/v1/embeddings"
+        url = _embeddings_url()
         headers = {
             "Authorization": f"Bearer {EMBEDDING_API_KEY}",
             "Content-Type": "application/json",
@@ -96,14 +143,24 @@ class _OpenAICompatibleEmbeddingFunction:
                 response = client.post(url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
-            vectors = sorted(data.get("data", []), key=lambda item: item.get("index", 0))
-            embeddings = [item.get("embedding", []) for item in vectors]
-            if len(embeddings) != len(texts) or not all(embeddings):
-                raise ValueError("embedding response shape invalid")
-            return embeddings
+            # 解析也放进 try：响应不是对象、data 不是列表时同样收敛成 EmbeddingBackendError。
+            vectors = sorted(data.get("data") or [], key=lambda item: item.get("index", 0))
+            embeddings = [item.get("embedding") for item in vectors]
         except Exception as exc:
-            logger.warning("Embedding API failed; using hash fallback: %s", exc)
-            return _hash_embedding_fn(texts)
+            raise _embedding_failure(f"向量化接口调用失败（{url}）：{exc}") from exc
+
+        if len(embeddings) != len(texts):
+            raise _embedding_failure(
+                f"向量化接口响应结构异常（{url}）：期望 {len(texts)} 条向量，实际得到 {len(embeddings)} 条"
+            )
+        if not all(isinstance(vector, list) and len(vector) == EMBEDDING_DIM for vector in embeddings):
+            # 维度不符的向量写进 Milvus 只会在更深处报错，这里提前给出可读原因。
+            actual = [len(vector) if isinstance(vector, list) else type(vector).__name__ for vector in embeddings]
+            raise _embedding_failure(
+                f"向量化接口响应结构异常（{url}）：期望 {EMBEDDING_DIM} 维向量，实际得到 {actual[:3]}"
+            )
+        _record_embedding_success("openai-compatible")
+        return embeddings
 
 
 _hash_embedding_fn = _HashEmbeddingFunction()
@@ -165,27 +222,41 @@ def _ensure_collection() -> MilvusClient:
 
 
 def embedding_backend_status() -> dict:
-    configured = bool(EMBEDDING_BASE_URL and EMBEDDING_API_KEY)
+    """如实上报向量化后端状态：mode 反映最近一次调用的真实结果，而非配置推断。"""
+    configured = _embedding_configured()
+    source = _embedding_state["source"]
+    if _embedding_state["last_error"]:
+        # last_error 非空 ⇔ 最近一次调用失败（成功路径会清空它）：当前没有可用来源。
+        mode = "unavailable"
+    elif source:
+        mode = source
+    else:
+        mode = "openai-compatible" if configured else "hash-fallback"
     return {
         "configured": configured,
         "model": EMBEDDING_MODEL,
         "dimension": EMBEDDING_DIM,
-        "mode": "openai-compatible" if configured else "hash-fallback",
+        "mode": mode,
         "vector_store": "milvus_lite" if _is_lite_uri(MILVUS_URI) else "milvus",
         "milvus_configured": bool(MILVUS_URI),
         "milvus_uri": MILVUS_URI,
         "collection": COLLECTION_NAME,
+        "last_used_at": _embedding_state["last_used_at"],
+        "last_error": _embedding_state["last_error"],
+        "last_error_at": _embedding_state["last_error_at"],
     }
 
 
 def add_chunks(chunks: list[dict], file_id: int, file_name: str, knowledge_base_id: int):
     client = _ensure_collection()
-    _delete_file_chunks(client, file_id)
     if not chunks:
+        _delete_file_chunks(client, file_id)
         logger.info("Milvus replace completed: file_id=%s chunks_count=0 action=replace_empty", file_id)
         return
     documents = [chunk["text"] for chunk in chunks]
+    # 先取向量再删旧数据：向量化失败时抛错，旧索引保持原样，由调用方回滚。
     embeddings = _embedding_fn(documents)
+    _delete_file_chunks(client, file_id)
     rows = [
         {
             "id": f"{file_id}_{chunk['id']}",

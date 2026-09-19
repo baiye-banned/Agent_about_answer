@@ -2,6 +2,8 @@ import asyncio
 import threading
 import time
 
+import pytest
+
 from rag import retrieval
 
 
@@ -144,6 +146,181 @@ def test_retrieve_knowledge_keeps_event_loop_responsive_and_recalls_concurrently
     assert windows["keyword_start"] < windows["vectors_end"]
     # 8 路各 0.2s：串行需要 1.6s，并发后应明显低于串行耗时。
     assert elapsed < route_count * route_delay * 0.6
+
+
+def test_retrieve_knowledge_skips_vector_routes_when_embedding_backend_fails(monkeypatch):
+    keyword_chunk = {
+        "id": "kw-1",
+        "chunk_id": "1",
+        "content": "迟到30分钟以内罚款50元",
+        "file_name": "考勤制度.txt",
+        "file_id": 1,
+        "route": "keyword",
+    }
+    status_calls = []
+
+    def fake_query_vectors(query, top_k, knowledge_base_id, route):
+        raise retrieval.EmbeddingBackendError("向量化接口调用失败（https://embedding.example/v1/embeddings）：429 Too Many Requests")
+
+    def fake_keyword_recall(db, knowledge_base_id, keywords, top_k):
+        return [keyword_chunk]
+
+    async def fake_rerank_chunks(question, chunks):
+        return chunks, {"status": "done", "items": []}
+
+    def fake_embedding_backend_status():
+        status_calls.append(True)
+        if len(status_calls) == 1:
+            return {"mode": "openai-compatible", "last_error": ""}
+        return {"mode": "unavailable", "last_error": "向量化接口调用失败：429 Too Many Requests"}
+
+    monkeypatch.setattr(retrieval, "query_vectors", fake_query_vectors)
+    monkeypatch.setattr(retrieval, "keyword_recall", fake_keyword_recall)
+    monkeypatch.setattr(retrieval, "rerank_chunks", fake_rerank_chunks)
+    monkeypatch.setattr(retrieval, "embedding_backend_status", fake_embedding_backend_status)
+
+    chunks, trace = asyncio.run(
+        retrieval.retrieve_knowledge(
+            "考勤 迟到 处罚",
+            knowledge_base_id=1,
+            db=object(),
+            query_plan={
+                "original_question": "迟到30分钟以内罚款多少钱",
+                "simplified_question": "迟到罚款标准",
+                "sub_questions": [],
+                "rewrites": [],
+                "keywords": ["考勤", "迟到"],
+                "required_evidence": [],
+            },
+        )
+    )
+
+    assert [chunk["route"] for chunk in chunks] == ["keyword"]
+    assert trace["embedding_error"]
+    assert trace["embedding"]["mode"] == "unavailable"
+    assert [route["count"] for route in trace["routes"]] == [0, 0, 1]
+    assert len(status_calls) == 2
+
+
+def test_retrieve_knowledge_degrades_only_the_failing_vector_route(monkeypatch):
+    """单路向量化失败只降级该路：其余向量路与关键词路照常返回（并发 x 逐路隔离的并集语义）。"""
+    healthy_chunk = {
+        "id": "vec-2",
+        "chunk_id": "2",
+        "content": "迟到30分钟以内罚款50元",
+        "file_name": "考勤制度.txt",
+        "file_id": 1,
+        "route": "simplified",
+    }
+    keyword_chunk = {
+        "id": "kw-1",
+        "chunk_id": "kw-1",
+        "content": "迟到超过30分钟按旷工处理",
+        "file_name": "考勤制度.txt",
+        "file_id": 2,
+        "route": "keyword",
+    }
+    vector_calls = []
+
+    def fake_query_vectors(query, top_k, knowledge_base_id, route):
+        vector_calls.append(route)
+        if route == "planned":
+            raise retrieval.EmbeddingBackendError("向量化接口调用失败：429 Too Many Requests")
+        return [healthy_chunk]
+
+    def fake_keyword_recall(db, knowledge_base_id, keywords, top_k):
+        return [keyword_chunk]
+
+    async def fake_rerank_chunks(question, chunks):
+        return chunks, {"status": "done", "items": []}
+
+    monkeypatch.setattr(retrieval, "query_vectors", fake_query_vectors)
+    monkeypatch.setattr(retrieval, "keyword_recall", fake_keyword_recall)
+    monkeypatch.setattr(retrieval, "rerank_chunks", fake_rerank_chunks)
+
+    chunks, trace = asyncio.run(
+        retrieval.retrieve_knowledge(
+            "考勤 迟到 处罚",
+            knowledge_base_id=1,
+            db=object(),
+            query_plan={
+                "original_question": "迟到30分钟以内罚款多少钱",
+                "simplified_question": "迟到罚款标准",
+                "sub_questions": [],
+                "rewrites": [],
+                "keywords": ["考勤", "迟到"],
+                "required_evidence": [],
+            },
+        )
+    )
+
+    # 失败路仍然被检索过（不是提前退出），只是该路 0 命中；其余路不受影响。
+    assert set(vector_calls) == {"planned", "simplified"}
+    assert [item["route"] for item in trace["routes"]] == ["planned", "simplified", "keyword"]
+    assert [item["count"] for item in trace["routes"]] == [0, 1, 1]
+    assert trace["embedding_error"]
+    # 失败路没有退化成哈希向量召回（否则这里会混入该路的伪命中）。
+    assert {chunk["id"] for chunk in chunks} >= {"vec-2", "kw-1"}
+    assert not any(chunk.get("route") == "planned" for chunk in chunks)
+
+
+def test_retrieve_knowledge_waits_for_all_recalls_before_propagating(monkeypatch):
+    """非降级异常上抛前必须等全部召回结束：否则兄弟线程会在请求级 Session 关闭后继续跑。"""
+    finished = []
+    lock = threading.Lock()
+
+    def fake_query_vectors(query, top_k, knowledge_base_id, route):
+        if route == "planned":
+            raise RuntimeError("boom")
+        try:
+            time.sleep(0.2)
+            return []
+        finally:
+            with lock:
+                finished.append(route)
+
+    def fake_keyword_recall(db, knowledge_base_id, keywords, top_k):
+        try:
+            time.sleep(0.2)
+            return []
+        finally:
+            with lock:
+                finished.append("keyword")
+
+    async def fake_rerank_chunks(question, chunks):
+        return chunks, {"status": "done", "items": []}
+
+    monkeypatch.setattr(retrieval, "query_vectors", fake_query_vectors)
+    monkeypatch.setattr(retrieval, "keyword_recall", fake_keyword_recall)
+    monkeypatch.setattr(retrieval, "rerank_chunks", fake_rerank_chunks)
+
+    # 自建事件循环而不是 asyncio.run：asyncio.run 收尾会 join 线程池，
+    # 把「异常上抛瞬间兄弟线程还在跑」这个差异掩盖掉，用不了作用例的判别力。
+    loop = asyncio.new_event_loop()
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            loop.run_until_complete(
+                retrieval.retrieve_knowledge(
+                    "考勤 迟到 处罚",
+                    knowledge_base_id=1,
+                    db=object(),
+                    query_plan={
+                        "original_question": "迟到30分钟以内罚款多少钱",
+                        "simplified_question": "迟到罚款标准",
+                        "sub_questions": [],
+                        "rewrites": [],
+                        "keywords": ["考勤", "迟到"],
+                        "required_evidence": [],
+                    },
+                )
+            )
+
+        # 非 EmbeddingBackendError 异常原样上抛，但上抛那一刻其余召回必须已全部结束
+        # （否则请求级 Session 已关闭、兄弟线程仍在使用它）。
+        assert set(finished) == {"simplified", "keyword"}
+    finally:
+        loop.run_until_complete(loop.shutdown_default_executor())
+        loop.close()
 
 
 def test_build_route_specs_does_not_reintroduce_empty_question():

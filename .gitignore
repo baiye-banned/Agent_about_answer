@@ -15,6 +15,14 @@ dist/
 .env
 .env.*
 !.env.example
+*.key
+*.pem
+*.pfx
+*.p12
+secrets*.json
+credentials*.json
+deepseek.txt
+.envrc
 
 # Runtime data
 backend/chroma_data/
