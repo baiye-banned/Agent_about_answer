@@ -18,11 +18,12 @@ Current files:
 - `chatApi.test.js`
 - `chatStore.test.js`
 - `clipboard.test.js`
+- `knowledgeFeedback.test.js`
 - `streamEvents.test.js`
 - `url.test.js`
 - `utils.test.js`
 
-These tests cover frontend stream parsing, stream response errors, chat store conversation switching, stale in-flight response handling and fallback reset events, clipboard fallback behavior, URL normalization and link safety, display formatting, status helpers, image validation, and memory trace helpers.
+These tests cover frontend stream parsing, stream response errors, chat store conversation switching, stale in-flight response handling and fallback reset events, clipboard fallback behavior, knowledge batch delete and upload feedback helpers, URL normalization and link safety, display formatting, status helpers, image validation, and memory trace helpers.
 
 ## Python Tests
 
@@ -48,6 +49,7 @@ Current files:
 - `test_json_utils.py`
 - `test_knowledge_ownership.py`
 - `test_knowledge_service.py`
+- `test_knowledge_upload_limits.py`
 - `test_learning_trace.py`
 - `test_llm_urls.py`
 - `test_memory_context.py`
@@ -61,7 +63,7 @@ Current files:
 - `test_upload_validation.py`
 - `conftest.py`
 
-These tests cover retrieval planning and fusion, chat service retrieval wiring, auth token validation, default user seeding without hardcoded passwords, `.env.example`/`config.py` parity, checkpointer helpers, semantic chunking, config parsing, grounding helpers, JSON loading, knowledge ownership filtering, knowledge deletion ordering, learning trace handling, OpenAI-compatible URL helpers, memory context, Milvus client behavior, RAGAS text handling, rerank fallback, SECRET_KEY startup guard, stream fallback reset handling, trace CRUD, and upload validation.
+These tests cover retrieval planning and fusion, chat service retrieval wiring, auth token validation, default user seeding without hardcoded passwords, `.env.example`/`config.py` parity, checkpointer helpers, semantic chunking, config parsing, grounding helpers, JSON loading, knowledge ownership filtering, knowledge deletion ordering, knowledge upload type and size limits, learning trace handling, OpenAI-compatible URL helpers, memory context, Milvus client behavior, RAGAS text handling, rerank fallback, SECRET_KEY startup guard, stream fallback reset handling, trace CRUD, and upload validation.
 
 `conftest.py` only puts `backend/` on `sys.path` so the tests can import application modules; it defines no fixtures.
 
