@@ -22,7 +22,6 @@ READER_FUNCS = {"os.getenv", "_env_bool", "_env_int", "_env_float"}
 # its upper-case form has to be documented.
 LEGACY_ALIASES = {"oss_access_key_id", "oss_access_key_secret", "oss_bucket", "oss_endpoint"}
 
-_UNPARSABLE = object()
 _NO_DEFAULT = object()
 
 
@@ -107,36 +106,50 @@ def test_every_env_var_read_by_config_is_documented():
 
 
 def test_documented_values_match_config_defaults():
+    read = _read_names_with_defaults()
     documented = _parse_env_example()
+
+    # Every setting that is both documented and read with a default has to be compared. The
+    # loop below must not grow a `continue` that quietly drops one: an unparsable default is
+    # a test bug to fix here, not a reason to stop checking.
+    checkable = sorted(
+        name for name, node in read.items() if node is not _NO_DEFAULT and name in documented
+    )
+    checked = []
     mismatched = []
-    for name, default_node in sorted(_read_names_with_defaults().items()):
-        if default_node is _NO_DEFAULT or name not in documented:
-            continue
+
+    for name in checkable:
+        default_node = read[name]
         actual = documented[name]
+        observed = actual
 
         if isinstance(default_node, ast.Name):
             # Default is another documented setting, e.g. MILVUS_URI -> MILVUS_LITE_URI.
-            referenced = documented.get(default_node.id)
-            if referenced is None:
-                continue
-            expected = referenced
+            assert default_node.id in documented, (
+                f"{name} defaults to {default_node.id!r}, which .env.example does not document"
+            )
+            expected = documented[default_node.id]
         elif isinstance(default_node, ast.Constant) and isinstance(default_node.value, bool):
-            if actual.lower() not in {"true", "false"} or actual.lower() != str(
-                default_node.value
-            ).lower():
-                mismatched.append(f"{name}: template={actual!r} config_default={default_node.value!r}")
-            continue
+            expected = str(default_node.value).lower()
+            assert actual.lower() in {"true", "false"}, (
+                f"{name}: template={actual!r} is not a boolean"
+            )
+            observed = actual.lower()
         elif isinstance(default_node, ast.Constant):
             expected = str(default_node.value)
         else:
             evaluated = _eval_int_expr(default_node)
-            if evaluated is None:
-                continue
+            assert evaluated is not None, (
+                f"{name} has a default this test cannot evaluate: {ast.dump(default_node)}; "
+                "extend _eval_int_expr rather than letting the comparison be skipped"
+            )
             expected = str(evaluated)
 
-        if actual != expected:
+        if observed != expected:
             mismatched.append(f"{name}: template={actual!r} config_default={expected!r}")
+        checked.append(name)
 
+    assert checked == checkable, f"these defaults were never compared: {set(checkable) - set(checked)}"
     assert mismatched == [], "defaults drifted from backend/config.py: " + "; ".join(mismatched)
 
 
@@ -153,7 +166,7 @@ def test_secret_key_example_is_the_public_placeholder_everywhere():
     readme_values = [
         line.strip().partition("=")[2].strip()
         for line in README.read_text(encoding="utf-8").splitlines()
-        if line.startswith("SECRET_KEY=")
+        if line.strip().startswith("SECRET_KEY=")
     ]
     assert readme_values, "README.md no longer shows a SECRET_KEY example"
     assert set(readme_values) == {placeholder}, (
