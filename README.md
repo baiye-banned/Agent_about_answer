@@ -285,6 +285,13 @@ CREATE DATABASE IF NOT EXISTS rag_system
 
 `seed_default_users()` 受 `SEED_DEFAULT_USERS` 控制：该开关为 `false` 时不创建任何账号；为 `true` 时仅为尚不存在的 `admin`、`demo` 创建账号，且不会覆盖已有账号的口令。账号口令取自 `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD`，未配置时使用随机生成的口令（不落日志），不再使用任何公开的固定口令。
 
+知识库与知识文件按归属用户隔离，历史数据（`user_id` 为 NULL）对任何用户都不可见，需要一次性回填：
+
+```bash
+python scripts/backfill_knowledge_owner.py --user-id <用户ID>            # 默认只打印回填计划
+python scripts/backfill_knowledge_owner.py --user-id <用户ID> --apply    # 真正写入
+```
+
 ### 4.4 本地启动
 
 启动后端：
@@ -421,7 +428,7 @@ HTTPS 部署后需要检查：
 - `/api/health` 可以正常返回。
 - `/api/chat/stream` 流式输出不会被代理缓冲。
 - `VITE_API_BASE_URL` 与 Nginx 代理路径一致。
-- 生产环境 `SECRET_KEY` 已替换为强随机值。
+- 生产环境 `SECRET_KEY` 已替换为强随机值（未替换时后端会拒绝启动）。
 - CORS、Cookie、安全响应头按真实部署域名收紧。
 
 ## 项目亮点
@@ -508,6 +515,8 @@ npm run build
 - `.env`、本地数据库、上传文件、日志、PID 文件、缓存、`node_modules` 和构建产物都应加入 Git 忽略规则。
 - `.env.example` 只保留占位配置，不应提交真实 API key、OSS 凭证、数据库密码或 JWT secret。
 - 生产环境需要替换默认本地配置，配置 HTTPS / 反向代理，强化 JWT secret 管理，并进行外部模型与对象存储连通性检查。
+- `SECRET_KEY` 缺失或仍是 `.env.example` 里的公开占位值 `change-this-secret-key-in-production` 时，后端会在启动阶段直接报错退出，不会带着这个人人可读的值对外提供服务；该值能让任何人伪造包括 `admin` 在内的任意用户登录态，不可用于任何对外可访问的部署。生成真实值：`python -c "import secrets; print(secrets.token_urlsafe(48))"`。
+- 仅本地开发可用 `ALLOW_INSECURE_DEFAULT_SECRET=true` 放行启动：此时进程使用一次性随机密钥，每次重启已签发 token 全部失效，多进程/多副本之间互不认可对方签发的 token，禁止用于生产。
 - 启动播种的演示账号不再是公开固定口令：账号口令由 `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD` 提供，未配置时随机生成且不写入日志；不需要演示账号时设置 `SEED_DEFAULT_USERS=false`。
 
 ## 文档
