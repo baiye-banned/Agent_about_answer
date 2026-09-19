@@ -2,7 +2,7 @@
 import logging
 
 from fastapi import Depends, File, Form, HTTPException, UploadFile
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from rag.milvus_client import EmbeddingBackendError, add_chunks, delete_file_chunks
@@ -17,20 +17,29 @@ from service.auth_service import get_current_user
 logger = logging.getLogger(__name__)
 
 
-def get_default_knowledge_base(db: Session):
-    knowledge_base = crud_knowledge_base.get_default_knowledge_base(db)
+def get_default_knowledge_base(db: Session, user_id: int):
+    knowledge_base = crud_knowledge_base.get_default_knowledge_base(db, user_id)
     if knowledge_base:
         return knowledge_base
-    return crud_knowledge_base.create_knowledge_base(db, "默认知识库")
+    try:
+        return crud_knowledge_base.create_knowledge_base(db, "默认知识库", user_id)
+    except IntegrityError:
+        # 并发首次访问时可能同时创建默认知识库，唯一约束冲突后回读即可。
+        db.rollback()
+        knowledge_base = crud_knowledge_base.get_default_knowledge_base(db, user_id)
+        if knowledge_base:
+            return knowledge_base
+        raise
 
 
-def resolve_knowledge_base(db: Session, knowledge_base_id: int | None):
-    knowledge_base = crud_knowledge_base.resolve_knowledge_base(db, knowledge_base_id)
+def resolve_knowledge_base(db: Session, knowledge_base_id: int | None, user_id: int):
+    knowledge_base = crud_knowledge_base.resolve_knowledge_base(db, knowledge_base_id, user_id)
     if knowledge_base:
         return knowledge_base
     if knowledge_base_id:
+        # 传了 id 却查不到（不存在或不属于当前用户）统一按 404 处理，不暴露资源存在性。
         raise HTTPException(404, "知识库不存在")
-    return get_default_knowledge_base(db)
+    return get_default_knowledge_base(db, user_id)
 
 
 def rebuild_existing_knowledge_index():
@@ -62,42 +71,42 @@ def _delete_file_vectors_or_500(file_id: int, *, scope: str, detail: str) -> Non
         raise HTTPException(500, detail)
 
 
-def list_knowledge_bases(_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = crud_knowledge_base.list_knowledge_bases(db)
+def list_knowledge_bases(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    rows = crud_knowledge_base.list_knowledge_bases(db, user.id)
     return [crud_knowledge_base.serialize_knowledge_base(item) for item in rows]
 
 
-def create_knowledge_base(body: KnowledgeBaseRequest, _user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def create_knowledge_base(body: KnowledgeBaseRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "知识库名称不能为空")
-    if crud_knowledge_base.knowledge_base_name_exists(db, name):
+    if crud_knowledge_base.knowledge_base_name_exists(db, name, user.id):
         raise HTTPException(400, "知识库名称已存在")
-    entry = crud_knowledge_base.create_knowledge_base(db, name)
+    entry = crud_knowledge_base.create_knowledge_base(db, name, user.id)
     return crud_knowledge_base.serialize_knowledge_base(entry)
 
 
-def rename_knowledge_base(kid: int, body: KnowledgeBaseRequest, _user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    entry = crud_knowledge_base.get_knowledge_base(db, kid)
+def rename_knowledge_base(kid: int, body: KnowledgeBaseRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    entry = crud_knowledge_base.get_knowledge_base(db, kid, user.id)
     if not entry:
         raise HTTPException(404, "知识库不存在")
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "知识库名称不能为空")
-    if crud_knowledge_base.knowledge_base_name_exists(db, name, exclude_id=kid):
+    if crud_knowledge_base.knowledge_base_name_exists(db, name, user.id, exclude_id=kid):
         raise HTTPException(400, "知识库名称已存在")
-    entry = crud_knowledge_base.rename_knowledge_base(db, kid, name)
+    entry = crud_knowledge_base.rename_knowledge_base(db, kid, name, user.id)
     return crud_knowledge_base.serialize_knowledge_base(entry)
 
 
-def delete_knowledge_base(kid: int, _user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    entry = crud_knowledge_base.get_knowledge_base(db, kid)
+def delete_knowledge_base(kid: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    entry = crud_knowledge_base.get_knowledge_base(db, kid, user.id)
     if not entry:
         raise HTTPException(404, "知识库不存在")
-    if crud_knowledge_base.count_knowledge_bases(db) <= 1:
+    if crud_knowledge_base.count_knowledge_bases(db, user.id) <= 1:
         raise HTTPException(400, "至少保留一个知识库")
 
-    target = crud_knowledge_base.get_fallback_knowledge_base(db, kid)
+    target = crud_knowledge_base.get_fallback_knowledge_base(db, kid, user.id)
     file_ids = [file_entry.id for file_entry in crud_knowledge_base.list_files_for_knowledge_base(db, kid)]
     for file_id in file_ids:
         _delete_file_vectors_or_500(
@@ -105,18 +114,18 @@ def delete_knowledge_base(kid: int, _user: User = Depends(get_current_user), db:
             scope="Knowledge base",
             detail="知识库删除失败，向量库清理异常，请稍后重试。",
         )
-    crud_knowledge_base.delete_knowledge_base_with_files(db, kid, target.id)
+    crud_knowledge_base.delete_knowledge_base_with_files(db, kid, target.id, user.id)
     return {"message": "ok", "fallback_knowledge_base_id": target.id}
 
 
-def list_knowledge(knowledge_base_id: int | None = None, _user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    knowledge_base = resolve_knowledge_base(db, knowledge_base_id)
-    files = crud_knowledge_file.list_knowledge_files(db, knowledge_base.id)
+def list_knowledge(knowledge_base_id: int | None = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    knowledge_base = resolve_knowledge_base(db, knowledge_base_id, user.id)
+    files = crud_knowledge_file.list_knowledge_files(db, knowledge_base.id, user.id)
     return [crud_knowledge_file.serialize_knowledge_file(item) for item in files]
 
 
-async def upload_knowledge(file: UploadFile = File(...), knowledge_base_id: int | None = Form(None), _user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    knowledge_base = resolve_knowledge_base(db, knowledge_base_id)
+async def upload_knowledge(file: UploadFile = File(...), knowledge_base_id: int | None = Form(None), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    knowledge_base = resolve_knowledge_base(db, knowledge_base_id, user.id)
     content = await file.read()
     text = crud_knowledge_file.extract_file_text(file.filename or "", content)
 
@@ -127,6 +136,7 @@ async def upload_knowledge(file: UploadFile = File(...), knowledge_base_id: int 
             name=file.filename or "unknown",
             size=len(content),
             content=text,
+            user_id=user.id,
         )
     except SQLAlchemyError as exc:
         db.rollback()
@@ -143,7 +153,7 @@ async def upload_knowledge(file: UploadFile = File(...), knowledge_base_id: int 
         except Exception as cleanup_exc:
             logger.warning("Failed to clean partially indexed chunks: file_id=%s error=%s", entry.id, cleanup_exc, exc_info=True)
         try:
-            crud_knowledge_file.delete_knowledge_file(db, entry.id)
+            crud_knowledge_file.delete_knowledge_file(db, entry.id, user.id)
         except SQLAlchemyError as cleanup_commit_exc:
             db.rollback()
             logger.warning("Failed to rollback partially indexed knowledge file: file_id=%s error=%s", entry.id, cleanup_commit_exc, exc_info=True)
@@ -152,28 +162,29 @@ async def upload_knowledge(file: UploadFile = File(...), knowledge_base_id: int 
     return crud_knowledge_file.serialize_knowledge_file(entry)
 
 
-def delete_knowledge(fid: int, _user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    entry = crud_knowledge_file.get_knowledge_file(db, fid)
+def delete_knowledge(fid: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    entry = crud_knowledge_file.get_knowledge_file(db, fid, user.id)
     if not entry:
+        # 文件不存在或不属于当前用户，统一 404，不暴露资源存在性。
         raise HTTPException(404, "文件不存在")
     _delete_file_vectors_or_500(
         fid,
         scope="Knowledge file",
         detail="知识文件删除失败，向量库清理异常，请稍后重试。",
     )
-    crud_knowledge_file.delete_knowledge_file(db, fid)
+    crud_knowledge_file.delete_knowledge_file(db, fid, user.id)
     return {"message": "ok"}
 
 
-def get_knowledge_detail(fid: int, _user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    entry = crud_knowledge_file.get_knowledge_file(db, fid)
+def get_knowledge_detail(fid: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    entry = crud_knowledge_file.get_knowledge_file(db, fid, user.id)
     if not entry:
         raise HTTPException(404, "文件不存在")
     return crud_knowledge_file.serialize_knowledge_file(entry)
 
 
-def get_knowledge_content(fid: int, _user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    entry = crud_knowledge_file.get_knowledge_file(db, fid)
+def get_knowledge_content(fid: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    entry = crud_knowledge_file.get_knowledge_file(db, fid, user.id)
     if not entry:
         raise HTTPException(404, "文件不存在")
-    return crud_knowledge_file.get_knowledge_content(db, fid)
+    return crud_knowledge_file.get_knowledge_content(db, fid, user.id)
