@@ -11,6 +11,7 @@ from config import (
     EMBEDDING_BASE_URL,
     EMBEDDING_DIM,
     EMBEDDING_MODEL,
+    EMBEDDING_TIMEOUT_SECONDS,
     MILVUS_COLLECTION_NAME,
     MILVUS_DB_NAME,
     MILVUS_PASSWORD,
@@ -91,7 +92,7 @@ class _OpenAICompatibleEmbeddingFunction:
             "dimensions": EMBEDDING_DIM,
         }
         try:
-            with httpx.Client(timeout=60) as client:
+            with httpx.Client(timeout=EMBEDDING_TIMEOUT_SECONDS) as client:
                 response = client.post(url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()

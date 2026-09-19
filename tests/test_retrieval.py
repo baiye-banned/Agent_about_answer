@@ -1,4 +1,6 @@
 import asyncio
+import threading
+import time
 
 from rag import retrieval
 
@@ -45,10 +47,94 @@ def test_retrieve_knowledge_uses_sub_questions_and_rewrites(monkeypatch):
         )
     )
 
-    routes = [route for route, _ in vector_calls]
-    assert routes == ["planned", "sub_question_1", "rewrite_1"]
+    # 多路召回并发执行后调用发生的先后不再有保证，trace 中的顺序才是对外语义
+    # （它按 route_specs 的生成顺序固定），这里同样能验证“采纳子问题/改写 + 同义 query 去重”。
+    assert {route for route, _ in vector_calls} == {"planned", "sub_question_1", "rewrite_1"}
+    vector_routes_in_trace = [item["route"] for item in trace["routes"] if item["route"] != "keyword"]
+    assert vector_routes_in_trace == ["planned", "sub_question_1", "rewrite_1"]
     assert chunks
     assert trace["query_plan"]["original_question"] == "迟到三个小时扣多少钱"
+
+
+def test_retrieve_knowledge_keeps_event_loop_responsive_and_recalls_concurrently(monkeypatch):
+    """一轮多路检索期间事件循环必须仍在被调度，且各路召回是并发而不是串行等待。"""
+    route_count = 8
+    route_delay = 0.2
+    lock = threading.Lock()
+    inflight = {"now": 0, "max": 0}
+    calls = []
+
+    def fake_query_vectors(query, top_k, knowledge_base_id, route):
+        with lock:
+            calls.append(route)
+            inflight["now"] += 1
+            inflight["max"] = max(inflight["max"], inflight["now"])
+        try:
+            time.sleep(route_delay)
+            return []
+        finally:
+            with lock:
+                inflight["now"] -= 1
+
+    def fake_keyword_recall(db, knowledge_base_id, keywords, top_k):
+        return []
+
+    async def fake_rerank_chunks(question, chunks):
+        return chunks, {"status": "done", "items": []}
+
+    monkeypatch.setattr(retrieval, "query_vectors", fake_query_vectors)
+    monkeypatch.setattr(retrieval, "keyword_recall", fake_keyword_recall)
+    monkeypatch.setattr(retrieval, "rerank_chunks", fake_rerank_chunks)
+
+    async def scenario():
+        heartbeats = []
+
+        async def ticker():
+            while True:
+                await asyncio.sleep(0.02)
+                heartbeats.append(time.perf_counter())
+
+        ticker_task = asyncio.create_task(ticker())
+        await asyncio.sleep(0.05)  # 先让心跳协程真正跑起来
+        started_at = time.perf_counter()
+        _, trace = await retrieval.retrieve_knowledge(
+            "迟到怎么处理",
+            knowledge_base_id=1,
+            db=object(),
+            query_plan={
+                "original_question": "迟到怎么处理",
+                "simplified_question": "考勤 迟到 处理",
+                "sub_questions": ["迟到多久算旷工", "迟到罚款多少"],
+                "hyde_document": "员工迟到30分钟以内罚款50元。",
+                "rewrites": ["迟到怎么罚", "上班迟到扣多少钱", "迟到处罚规定"],
+                "keywords": ["迟到"],
+            },
+        )
+        finished_at = time.perf_counter()
+        ticker_task.cancel()
+        during = [beat for beat in heartbeats if started_at < beat < finished_at]
+        return during, finished_at - started_at, trace
+
+    heartbeats_during_retrieval, elapsed, trace = asyncio.run(scenario())
+
+    assert [item["route"] for item in trace["routes"]] == [
+        "planned",
+        "simplified",
+        "sub_question_1",
+        "sub_question_2",
+        "hyde",
+        "rewrite_1",
+        "rewrite_2",
+        "rewrite_3",
+        "keyword",
+    ]
+    assert len(calls) == route_count
+    # 检索期间事件循环仍在调度心跳协程：修复前这里是 0（同步调用独占事件循环）。
+    assert heartbeats_during_retrieval
+    # 多路召回并发：任一时刻都有多路在途，而不是一路接一路。
+    assert inflight["max"] >= 2
+    # 8 路各 0.2s：串行需要 1.6s，并发后应明显低于串行耗时。
+    assert elapsed < route_count * route_delay * 0.6
 
 
 def test_build_route_specs_does_not_reintroduce_empty_question():
