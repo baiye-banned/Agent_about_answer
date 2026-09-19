@@ -1,0 +1,55 @@
+name: 后端测试
+
+# 触发：PR → develop / main；push → develop（合入后回归）。
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop]
+
+# CI 只需要读取仓库内容。
+permissions:
+  contents: read
+
+# 同一分支连续 push 时，取消上一次仍在跑的运行（按 workflow + ref 分组）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (Python 3.10)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # Python 版本来源：仓库根目录 runtime.txt（内容 python-3.10.11，与线上 Render 对齐）。
+      # 这里写 "3.10" 表示 3.10.x 小版本线，避免钉死补丁号后在 runner 上取不到该构建；
+      # 下一步会把两份 runtime.txt 原文与解释器实际版本打进日志，便于核对。
+      - name: 安装 Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          # pip 缓存命中会在日志里显示 "Cache restored from key: ..."。
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: 确认版本来源（runtime.txt）
+        run: |
+          echo "runtime.txt: $(cat runtime.txt)"
+          echo "backend/runtime.txt: $(cat backend/runtime.txt)"
+          python -V
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          # pytest 不在 backend/requirements.txt 里（该文件只列线上运行时依赖），测试工具单独安装。
+          # ragas 等可选评估依赖不装：backend/rag/ragas_eval.py 对 ragas/datasets 是函数内延迟导入，
+          # 现有用例只覆盖该模块的纯函数，不触达这些可选包。
+          pip install pytest
+
+      - name: 运行后端测试
+        run: python -m pytest -q tests

@@ -1,0 +1,54 @@
+name: 前端构建
+
+# 触发：PR → develop / main；push → develop（合入后回归）。
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop]
+
+# CI 只需要读取仓库内容。
+permissions:
+  contents: read
+
+# 同一分支连续 push 时，取消上一次仍在跑的运行（按 workflow + ref 分组）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: vite build (Node 22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      # 说明：构建日志里可能出现 "(!) Some chunks are larger than 500 kB"（Chat chunk 体积提示），
+      # 这是 Vite 的 bundle size 提醒，退出码仍为 0，不代表构建失败，不要据此把 CI 判红。
+      - name: 构建
+        run: npm run build
+
+      # 构建成功但没产出文件也是一种失败（例如入口被改坏），显式确认产物存在。
+      - name: 校验构建产物
+        run: test -f dist/index.html
+
+      # 产物保留 7 天，便于排查构建期问题。
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7

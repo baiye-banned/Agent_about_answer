@@ -214,8 +214,11 @@ MYSQL_SSL_CA=
 DEEPSEEK_API_KEY=your_deepseek_api_key
 DASHSCOPE_API_KEY=your_dashscope_api_key
 
-SECRET_KEY=replace-with-a-long-random-secret
+SECRET_KEY=change-this-secret-key-in-production
 ```
+
+上面 `SECRET_KEY` 写的是与 `.env.example` 一致的公开占位值，**必须替换**成随机值再启动：
+保持占位值（或留空）时后端会拒绝启动。生成方式见文末安全说明。
 
 Render 后端 Web Service 建议额外设置 Python 版本，避免平台默认使用过新的 Python 版本：
 
@@ -566,12 +569,37 @@ npm run build
 
 当前 Vite 构建可能出现 `Chat` chunk 体积较大的提示，这是 bundle size 提醒，不代表构建失败。
 
+### CI（GitHub Actions）
+
+向 `develop`、`main` 提 PR，以及 push 到 `develop` 时会自动跑下面四个独立检查。同一分支连续 push 时，上一次还在跑的运行会被自动取消（各 workflow 内的 `concurrency`）。
+
+| Workflow | 检查项 | 内容 |
+| --- | --- | --- |
+| `.github/workflows/python-tests.yml` | 后端测试 pytest (Python 3.10) | 版本对齐 `runtime.txt`（`python-3.10.11`），`pip install -r backend/requirements.txt` + `pytest`，跑 `python -m pytest -q tests` |
+| `.github/workflows/frontend-tests.yml` | 前端测试 node --test (Node 22) | `npm ci` 后跑 `npm test` |
+| `.github/workflows/build.yml` | 前端构建 vite build (Node 22) | `npm run build`，产物 `dist/` 上传为 artifact |
+| `.github/workflows/static-checks.yml` | 静态检查 (最低档) | 后端 `python -m compileall` + `ruff check --select E9,F63,F7,F82`；前端 `node --check src/**/*.js` |
+
+说明：
+
+- 静态检查目前只拦语法错误、未定义名等确定性错误，**不是**完整规范；为什么不直接开 `ruff --select E,F` 以及后续怎么加严，写在 `static-checks.yml` 顶部注释里。
+- 四个 workflow 都是 `permissions: contents: read`，不配置任何密钥，也不使用 `continue-on-error`：失败就是失败。
+- 后端测试只需 `backend/requirements.txt` + `pytest`；RAGAS 等可选评估依赖是延迟导入，CI 不安装。
+
 ## 协作与提交规范
 
 - 提交信息与 PR 标题遵循 [Conventional Commits](https://www.conventionalcommits.org/)，type 与 scope 取值、合并方式见 [COMMIT_CONVENTION.md](COMMIT_CONVENTION.md)。
 - 新建 issue 必须选择模板；PR 描述按 [.github/pull_request_template.md](.github/pull_request_template.md) 逐节填写，必填节为空时 CI 会变红。
 - CI 校验 PR 标题、PR 描述必填节与 issue 结构，脚本在 `scripts/` 下，可用 `node scripts/check_pr_body.mjs <文件>` 本地复现同一套规则。
 - 日常 PR squash 合并进 `develop`，发布 PR（`develop` → `main`）用 merge commit。
+
+## 分支与发布
+
+- `main` 是发布分支，只接受来自 `develop` 的发布 PR 和紧急热修复；`develop` 是集成分支，日常改动都提到这里。
+- 短分支从 `develop` 切出，命名为 `<type>/<topic>-<issue号>`，合入后删除；一律通过 PR 合入，不直接 push 公共分支。
+- 合并方式：日常 PR 用 squash；发布 PR 和 `main → develop` 回同步 PR 用 merge commit（否则回同步会反复重现）。
+- 发布：手动运行 `Release` 工作流（输入版本号）→ 评审并合并发布 PR 到 `main` → 手动打 tag；合并到 `main` 后 `Sync main into develop` 会自动开回同步 PR。
+- 完整约定（分支命名、发布步骤、门禁、已知限制）见 [BRANCHING.md](BRANCHING.md)。
 
 ## 安全说明
 
