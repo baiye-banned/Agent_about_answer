@@ -449,3 +449,74 @@ test('流式期间点了「新对话」，迟到的会话事件不得登记待�
   assert.equal(store.pendingRouteConversationId, null)
   assert.deepEqual(contents(store), [])
 })
+
+test('后备模型接管时，reset 事件清空已渲染内容，只保留重置后的回答', async () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+
+  store.sendMessage('迟到30分钟以内怎么罚款？')
+  const stream = streams.at(-1)
+
+  // 首个模型（DeepSeek）中途断开，这两段增量已经渲染出来了。
+  stream.onMessage('根据《员工手册》考勤管理')
+  stream.onMessage('，迟到30分钟以内')
+  const placeholderMessages = store.messages.length
+
+  // 后端在切到后备模型之前下发 reset：作废已渲染内容，但消息占位（流式气泡）必须保留。
+  stream.onMessage('', { type: 'reset', reason: 'text_fallback', message: '已切换到后备模型重新生成' })
+
+  assert.equal(store.streamContent, '')
+  assert.equal(store.streaming, true)
+  assert.equal(store.messages.length, placeholderMessages)
+  assert.deepEqual(contents(store), ['迟到30分钟以内怎么罚款？'])
+
+  // 后备模型从头输出的内容按正常增量追加。
+  stream.onMessage('根据《员工手册》考勤管理章节，')
+  stream.onMessage('迟到30分钟以内罚款50元。')
+  assert.equal(store.streamContent, '根据《员工手册》考勤管理章节，迟到30分钟以内罚款50元。')
+
+  // 本地消息由 streamContent 构建（handleStreamDone 同步部分），必须只含后备模型的回答。
+  stream.onDone()
+  assert.deepEqual(contents(store), [
+    '迟到30分钟以内怎么罚款？',
+    '根据《员工手册》考勤管理章节，迟到30分钟以内罚款50元。',
+  ])
+
+  await settleTail(['a'])
+})
+
+test('后备模型也失败时，reset 已作废的半截回答不得混进错误消息', async () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+
+  store.sendMessage('问题')
+  const stream = streams.at(-1)
+  stream.onMessage('半截回答')
+  stream.onMessage('', { type: 'reset', reason: 'text_fallback' })
+  stream.onError(new Error('回答生成失败：模型不可用'))
+
+  assert.equal(store.errorMessage, '回答生成失败：模型不可用')
+  assert.deepEqual(contents(store), ['问题', '回答生成失败：模型不可用'])
+})
+
+test('被新流取代的旧流投递的 reset 不得清空当前流的内容', async () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+
+  store.sendMessage('第一个问题')
+  const firstStream = streams.at(-1)
+  firstStream.onDone()
+  await flush()
+
+  store.sendMessage('第二个问题')
+  const secondStream = streams.at(-1)
+  secondStream.onMessage('第二个回答')
+
+  // 旧流此刻才投递 reset（#25 的世代守卫必须先拦住它）。
+  firstStream.onMessage('', { type: 'reset', reason: 'text_fallback' })
+
+  assert.equal(store.streamContent, '第二个回答')
+
+  secondStream.onDone()
+  await settleTail(['a'])
+})
