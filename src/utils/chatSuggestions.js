@@ -4,5 +4,3 @@ export const CHAT_SUGGESTIONS = [
   '根据已有资料生成一份培训提纲',
   '帮我提炼文档里的常见问题',
 ]
-
-export const BROKEN_SYNTAX = ( ;
