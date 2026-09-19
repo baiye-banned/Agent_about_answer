@@ -524,7 +524,7 @@ npm run build
 | `.github/workflows/frontend-tests.yml` | 前端测试 node --test (Node 22) | `npm ci` 后跑 `npm test` |
 | `.github/workflows/build.yml` | 前端构建 vite build (Node 22) | `npm run build`，产物 `dist/` 上传为 artifact |
 | `.github/workflows/static-checks.yml` | 静态检查 (最低档) | 后端 `python -m compileall` + `ruff check --select E9,F63,F7,F82`；前端 `node --check src/**/*.js` |
-| `.github/workflows/e2e.yml` | 端到端验收 Playwright e2e (chromium) | 起 MySQL 8.0 服务容器 + 本地模型桩（`tests/e2e/stub_llm_server.py`，替掉全部模型上游）→ 构建前端并以 `vite preview` 托管 → 真实浏览器跑 `tests/e2e/chat.spec.mjs` → 截图与各服务日志上传为 artifact |
+| `.github/workflows/e2e.yml` | 端到端验收 Playwright e2e (chromium) | 起 MySQL 8.0 服务容器 + 本地模型桩（`tests/e2e/stub_llm_server.py`，替掉全部模型上游）→ 构建前端并以 `vite preview` 托管 → 真实浏览器跑 `tests/e2e/chat.spec.mjs` → 用桩的请求日志确认检索链路真被走到（`tests/e2e/check_stub_calls.py`）→ 截图与各服务日志上传为 artifact |
 
 说明：
 
@@ -545,9 +545,12 @@ npm run build
 # 0) 只装 chromium：CI 里也只装这一个浏览器，本地与 CI 的结论才对得上
 npx playwright install chromium
 
-# 1) 模型桩服务
+# 1) 模型桩服务（日志目录先建好：桩启动时会校验日志文件可写，不可写直接以退出码 2 失败）
+#    分片间隔与 CI 保持一致，见 .github/workflows/e2e.yml
+mkdir -p tests/e2e/artifacts/logs
 python tests/e2e/stub_llm_server.py --port 8899 --dim 1024 \
-  --chunk-delay-ms 700 --chunk-size 8
+  --chunk-delay-ms 1200 --chunk-size 8 \
+  --log-file tests/e2e/artifacts/logs/stub-requests.jsonl
 ```
 
 ```bash
@@ -577,9 +580,14 @@ npm run preview -- --port 4173 --strictPort --host 127.0.0.1
 # 4) 跑用例
 E2E_BASE_URL=http://127.0.0.1:4173 E2E_USERNAME=demo \
   E2E_PASSWORD=<与 SEED_DEMO_PASSWORD 一致> npm run test:e2e
+
+# 5) 确认检索链路真被走到（CI 里也跑这一步，见 e2e.yml）
+#    用例全绿不等于链路完整：后端路由 / 检索规划 / 重排都有兜底分支，
+#    退化到兜底时用例照样绿。这一步读桩的请求日志，判定各角色是否都被调过。
+python tests/e2e/check_stub_calls.py tests/e2e/artifacts/logs/stub-requests.jsonl
 ```
 
-产物落在 `tests/e2e/artifacts/`（截图、trace、HTML 报告，已 gitignore）：`npx playwright show-report tests/e2e/artifacts/report` 可回看，截图也挂在测试报告的每一步上。
+产物落在 `tests/e2e/artifacts/`（已 gitignore）：7 张截图与 HTML 报告在 `artifacts/report/`，用 `npx playwright show-report tests/e2e/artifacts/report` 回看，截图挂在测试报告的每一步上；用例失败时还会额外留下 `trace.zip`（配置为 `trace: 'retain-on-failure'`，**绿跑没有 trace**，这是 Playwright 的预期行为而不是产物缺失）。
 
 CI 与本地唯一的环境差异是各服务的地址由 `.github/workflows/e2e.yml` 注入；用例本身不感知环境，也不做 `if (CI)` 分支。
 
