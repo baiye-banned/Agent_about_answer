@@ -2,12 +2,13 @@
 
 打桩方式：替换 `rag.llm._stream_model_chunks`，第一次调用（DeepSeek）先吐两段内容再断开，
 第二次调用（文本后备模型）从头输出完整回答。
+会话侧只打桩真正的边界（鉴权/库/知识库解析/检索），SSE 组帧、证据校验与消息落库跑真实实现。
 """
 
 import asyncio
-import json
 
 import rag.llm as llm
+from conftest import FakeKnowledgeBase, collect_stream, frames_of_type, parse_sse_frames
 from schema.schemas import ChatRequest
 from service import chat_service
 
@@ -15,6 +16,7 @@ from service import chat_service
 DEEPSEEK_CHUNKS = ["根据《员工手册》考勤管理", "，迟到30分钟以内"]
 FALLBACK_CHUNKS = ["根据《员工手册》考勤管理章节，", "迟到30分钟以内罚款50元。", "（以上为完整回答）"]
 FALLBACK_TEXT = "".join(FALLBACK_CHUNKS)
+CHUNK = {"file_name": "制度.txt", "content": "迟到规则", "file_id": 1, "chunk_id": "a"}
 
 
 def _stub_fallback_stream(monkeypatch, *, deepseek_chunks, fallback_chunks, failure=None):
@@ -129,78 +131,11 @@ def test_fallback_disabled_still_reports_error_without_reset(monkeypatch):
     assert not [event for event in events if isinstance(event, dict) and event.get("type") == "reset"]
 
 
-class _FakeQuery:
-    def __init__(self, rows):
-        self.rows = rows
-
-    def filter_by(self, **_kwargs):
-        return self
-
-    def first(self):
-        return self.rows[0] if self.rows else None
-
-
-class _FakeDb:
-    def __init__(self, user):
-        self.user = user
-        self.added = []
-
-    def query(self, model):
-        if model is chat_service.User:
-            return _FakeQuery([self.user])
-        return _FakeQuery([])
-
-    def add(self, item):
-        self.added.append(item)
-
-    def commit(self):
-        pass
-
-    def refresh(self, item):
-        if getattr(item, "id", None) is None:
-            item.id = 1
-
-    def rollback(self):
-        pass
-
-    def close(self):
-        pass
-
-
-class _FakeUser:
-    id = 7
-    username = "alice"
-
-
-class _FakeKnowledgeBase:
-    id = 3
-    name = "制度库"
-
-
-class _FakeTrace:
-    def __init__(self, user_id=None):
-        self.user_id = user_id
-        self.trace_id = "trace-test"
-        self.events = []
-
-    def add(self, event, owner, **payload):
-        self.events.append({"event": event, "owner": owner, **payload})
-
-    def attach(self, **payload):
-        self.attached = payload
-
-    def finish(self, status):
-        self.status = status
-
-    def snapshot(self):
-        return {"trace_id": self.trace_id, "events": self.events}
-
-
-def _patch_chat_service_dependencies(monkeypatch, fake_db):
+def _patch_chat_service_boundaries(monkeypatch, fake_db, trace_cls):
     monkeypatch.setattr(chat_service, "decode_token", lambda authorization: "alice")
     monkeypatch.setattr(chat_service, "SessionLocal", lambda: fake_db)
-    monkeypatch.setattr(chat_service, "TraceRecorder", _FakeTrace)
-    monkeypatch.setattr(chat_service, "resolve_knowledge_base", lambda db, kid, user_id: _FakeKnowledgeBase())
+    monkeypatch.setattr(chat_service, "TraceRecorder", trace_cls)
+    monkeypatch.setattr(chat_service, "resolve_knowledge_base", lambda db, kid, user_id: FakeKnowledgeBase())
 
     async def fake_build_effective_question(question, attachments):
         return question, {"status": "skipped"}
@@ -213,39 +148,20 @@ def _patch_chat_service_dependencies(monkeypatch, fake_db):
 
     async def fake_retrieve_knowledge(question, knowledge_base_id, db, trace_recorder=None):
         return (
-            [{"file_name": "制度.txt", "content": "迟到规则", "file_id": 1, "chunk_id": "a"}],
+            [dict(CHUNK)],
             {"query_plan": {}, "routes": [], "rrf": [], "rerank": {"status": "done", "items": []}},
         )
 
     monkeypatch.setattr(chat_service, "_build_effective_question", fake_build_effective_question)
     monkeypatch.setattr(chat_service, "_build_recent_memory_text", fake_recent_memory_text)
-    monkeypatch.setattr(chat_service, "_build_memory_context", lambda *args, **kwargs: "")
-    monkeypatch.setattr(
-        chat_service,
-        "_build_memory_aware_retrieval_question",
-        lambda question, memory_context: question,
-    )
     monkeypatch.setattr(chat_service, "decide_need_rag", fake_decide_need_rag)
     monkeypatch.setattr(chat_service, "retrieve_knowledge", fake_retrieve_knowledge)
-    monkeypatch.setattr(chat_service, "_trace_sse_payloads", lambda trace: [])
-    monkeypatch.setattr(chat_service, "_build_sources", lambda chunks: [{"file": chunks[0]["file_name"]}])
-    monkeypatch.setattr(chat_service, "_attach_grounding_trace", lambda *args, **kwargs: None)
-    monkeypatch.setattr(chat_service, "_safe_trace_attach", lambda *args, **kwargs: None)
-    monkeypatch.setattr(chat_service, "_safe_trace_finish", lambda *args, **kwargs: None)
     monkeypatch.setattr(chat_service, "_schedule_memory_summary_update", lambda *args, **kwargs: None)
     monkeypatch.setattr(chat_service, "schedule_ragas_evaluation", lambda *args, **kwargs: None)
 
 
-async def _collect_stream(iterator):
-    chunks = []
-    async for chunk in iterator:
-        chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
-    return "".join(chunks)
-
-
-def test_chat_service_persists_only_content_after_reset(monkeypatch):
-    fake_db = _FakeDb(_FakeUser())
-    _patch_chat_service_dependencies(monkeypatch, fake_db)
+def test_chat_service_persists_only_content_after_reset(monkeypatch, fake_db, trace_recorder_cls):
+    _patch_chat_service_boundaries(monkeypatch, fake_db, trace_recorder_cls)
     _stub_fallback_stream(
         monkeypatch,
         deepseek_chunks=DEEPSEEK_CHUNKS,
@@ -262,31 +178,32 @@ def test_chat_service_persists_only_content_after_reset(monkeypatch):
     response = asyncio.run(
         chat_service.stream_chat(ChatRequest(question="迟到30分钟以内怎么罚款？"), authorization="Bearer token")
     )
-    body = asyncio.run(_collect_stream(response.body_iterator))
+    body = collect_stream(response.body_iterator)
 
-    resets = [line for line in body.split("\n\n") if '"type": "reset"' in line]
+    frames = parse_sse_frames(body)
+    resets = frames_of_type(frames, "reset")
     assert len(resets) == 1
+    assert resets[0]["reason"] == "text_fallback"
+    assert frames_of_type(frames, "error") == []
 
-    saved = [item for item in fake_db.added if getattr(item, "role", "") == "assistant"]
+    saved = fake_db.added_by_role("assistant")
     assert len(saved) == 1
     assert saved[0].content == FALLBACK_TEXT
     assert "根据《员工手册》考勤管理，迟到30分钟以内根据《员工手册》考勤管理章节，" not in saved[0].content
+    assert fake_db.closed is True
 
     # 前端按同一份事件流渲染出的最终文本必须与落库内容一致
-    rendered, frontend_resets = _render_like_frontend(_events_from_sse(body))
+    rendered, frontend_resets = _render_like_frontend(_events_from_sse(frames))
     assert frontend_resets == 1
     assert rendered == saved[0].content
 
 
-def _events_from_sse(body):
+def _events_from_sse(frames):
+    """把已解析的 SSE 帧还原成流式事件（前端消费的形态）。"""
     events = []
-    for line in body.split("\n\n"):
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[len("data:") :].strip()
-        if payload == "[DONE]":
-            continue
-        parsed = json.loads(payload)
-        events.append(parsed if "type" in parsed else parsed.get("content", ""))
+    for frame in frames:
+        if "type" in frame:
+            events.append(frame)
+        else:
+            events.append(frame.get("content", ""))
     return events

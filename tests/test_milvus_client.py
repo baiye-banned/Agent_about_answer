@@ -64,9 +64,36 @@ def test_restore_milvus_uri_env_round_trip(monkeypatch):
 
     hidden = milvus_client._hide_lite_uri_from_pymilvus_import()
     assert hidden == "./milvus.db"
+    # hide 期间变量必须真的从环境里消失，否则 pymilvus 导入时仍会把它当成 server uri
+    assert "MILVUS_URI" not in milvus_client.os.environ
 
     milvus_client._restore_milvus_uri_env(hidden)
     assert milvus_client.os.environ["MILVUS_URI"] == "./milvus.db"
+
+
+def test_hide_keeps_server_uri_in_env_for_pymilvus(monkeypatch):
+    monkeypatch.setattr(milvus_client, "MILVUS_URI", "http://127.0.0.1:19530")
+    monkeypatch.setenv("MILVUS_URI", "http://127.0.0.1:19530")
+
+    assert milvus_client._hide_lite_uri_from_pymilvus_import() is None
+    assert milvus_client.os.environ["MILVUS_URI"] == "http://127.0.0.1:19530"
+
+
+def test_hide_lite_uri_without_env_var_leaves_env_untouched(monkeypatch):
+    monkeypatch.setattr(milvus_client, "MILVUS_URI", "./milvus.db")
+    monkeypatch.delenv("MILVUS_URI", raising=False)
+
+    assert milvus_client._hide_lite_uri_from_pymilvus_import() is None
+    assert "MILVUS_URI" not in milvus_client.os.environ
+
+
+def test_restore_with_nothing_hidden_does_not_write_placeholder(monkeypatch):
+    monkeypatch.delenv("MILVUS_URI", raising=False)
+
+    milvus_client._restore_milvus_uri_env(None)
+
+    # 不能把字符串 "None" 写回环境变量（server uri 场景下 hide 返回 None）
+    assert "MILVUS_URI" not in milvus_client.os.environ
 
 
 def test_add_chunks_replaces_existing_file_chunks(monkeypatch):
