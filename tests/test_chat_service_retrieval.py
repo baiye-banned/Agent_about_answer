@@ -83,7 +83,7 @@ def test_stream_chat_uses_direct_advanced_rag_retriever(monkeypatch):
     monkeypatch.setattr(chat_service, "decode_token", lambda authorization: "alice")
     monkeypatch.setattr(chat_service, "SessionLocal", lambda: fake_db)
     monkeypatch.setattr(chat_service, "TraceRecorder", _FakeTrace)
-    monkeypatch.setattr(chat_service, "resolve_knowledge_base", lambda db, kid: _FakeKnowledgeBase())
+    monkeypatch.setattr(chat_service, "resolve_knowledge_base", lambda db, kid, user_id: _FakeKnowledgeBase())
     async def fake_build_effective_question(question, attachments):
         return question, {"status": "skipped"}
 

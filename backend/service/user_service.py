@@ -1,9 +1,13 @@
 
+import logging
+import os
+import secrets
 from datetime import datetime
 
 from fastapi import Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
+from config import SEED_DEFAULT_USERS
 from crud import user as crud_user
 from database.session import SessionLocal, get_db
 from model.models import User
@@ -13,23 +17,51 @@ from service.auth_service import get_current_user, pwd_context
 from service.utils_service import AVATAR_MAX_BYTES, resolve_image_upload_type
 
 
-DEFAULT_USERS = (
-    ("admin", "admin123"),
-    ("demo", "demo123"),
-)
+logger = logging.getLogger(__name__)
+
+# Bootstrap accounts created on startup when SEED_DEFAULT_USERS is enabled.
+# No password is hardcoded: each one comes from SEED_<USERNAME>_PASSWORD, and an
+# unguessable random value is generated when that variable is unset.
+DEFAULT_USERNAMES = ("admin", "demo")
 
 
-def seed_default_users() -> None:
+def seed_password_env_var(username: str) -> str:
+    return f"SEED_{username.upper()}_PASSWORD"
+
+
+def seed_default_users() -> list[str]:
+    """Create the bootstrap accounts, unless seeding is disabled by config."""
+    if not SEED_DEFAULT_USERS:
+        return []
+
+    created = []
     db = SessionLocal()
     try:
-        for username, password in DEFAULT_USERS:
+        for username in DEFAULT_USERNAMES:
             existing_user = db.query(User).filter_by(username=username).first()
-            if not existing_user:
+            if existing_user:
+                continue
+
+            env_var = seed_password_env_var(username)
+            password = os.getenv(env_var, "").strip()
+            if password:
                 db.add(User(username=username, password_hash=pwd_context.hash(password)))
+                created.append(username)
+                continue
+
+            db.add(User(username=username, password_hash=pwd_context.hash(secrets.token_urlsafe(32))))
+            created.append(username)
+            logger.warning(
+                "%s is not set: seeded account '%s' with a random password that is never logged. "
+                "See README for the reset procedure before exposing this service.",
+                env_var,
+                username,
+            )
         if db.new:
             db.commit()
     finally:
         db.close()
+    return created
 
 
 def get_profile(user: User = Depends(get_current_user)):
