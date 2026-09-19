@@ -66,7 +66,7 @@ Commands run from `D:\code\AIcoding\RAG`:
 - Milvus migration is the largest backend risk. Existing Chroma data is not automatically migrated, and the upload/query/delete loop still deserves a focused runtime acceptance pass.
 - Several external providers are mocked in tests. DeepSeek, DashScope embedding, DashScope rerank, OSS, and RAGAS runtime behavior still need real-environment smoke checks.
 - Some terminal output showed mojibake for Chinese strings. Prior tests passed, but the final UI text should be checked in a browser or by reading files with confirmed UTF-8 handling.
-- `Knowledge.vue` batch delete and `chat store` RAGAS polling are partly covered through utilities, but not yet by narrow behavior-level frontend tests.
+- `Knowledge.vue` batch delete/upload feedback and `chat store` RAGAS polling/message merge are now covered by narrow behavior-level Node tests (`tests/knowledgeFeedback.test.js`, `tests/chatStore.test.js`). The view-side logic was extracted into `src/utils/knowledgeFeedback.js` to make it testable in plain Node, so the Vue SFC glue itself (which helper it calls, the toast level, `uploading`/`uploadPercent` reset) is still only verified by reading, not executed by tests.
 - Documentation and older project context disagree on some ports. Final operational docs should be checked against the actual running backend/frontend commands.
 
 ## Follow-Up Small Goals
@@ -83,7 +83,7 @@ Next batch:
    - Acceptance tests: `tests/test_retrieval_acceptance.py` (see [Acceptance Test Index](#acceptance-test-index)).
 4. Rerank and provider goal: smoke-test DashScope rerank, LLM fallback, embedding, and DeepSeek connectivity in the target environment.
    - Acceptance tests: `tests/test_provider_smoke.py` plus the offline smoke entry point `scripts/smoke_providers.py` (`--live` for the real endpoints); see [Acceptance Test Index](#acceptance-test-index).
-5. Frontend behavior goal: add narrow tests for knowledge batch delete feedback and chat RAGAS polling/message merge behavior.
+5. Frontend behavior goal: partially done. Narrow tests for knowledge batch delete/upload feedback and chat RAGAS polling/message merge behavior were added (`tests/knowledgeFeedback.test.js`, `tests/chatStore.test.js`). Still open: no test covers the Vue view glue, and the delete paths take no error branch when the user cancels the confirm dialog or `knowledgeAPI.delete` rejects.
 6. Documentation alignment goal: reconcile ports, startup commands, and environment variables across README, docs, and project instructions.
 
 ## Acceptance Test Index

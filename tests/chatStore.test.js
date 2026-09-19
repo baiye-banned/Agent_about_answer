@@ -63,12 +63,15 @@ registerHooks({
   },
 })
 
-// 评测轮询依赖 window.setInterval；这里只记录调用，不真正起定时器。
+// 评测轮询依赖 window.setInterval；这里只记录调用（回调与间隔），不真正起定时器。
+// 轮询用例因此可以直接手动触发某一次 tick：pollingStarts.at(-1)()。
 const pollingStarts = []
+const pollingDelays = []
 const pollingStops = []
 globalThis.window = {
-  setInterval: (fn) => {
+  setInterval: (fn, delay) => {
     pollingStarts.push(fn)
+    pollingDelays.push(delay)
     return pollingStarts.length
   },
   clearInterval: (timer) => {
@@ -112,6 +115,7 @@ function createStore(conversations) {
   streams.length = 0
   getMessagesCalls.length = 0
   pollingStarts.length = 0
+  pollingDelays.length = 0
   pollingStops.length = 0
   const store = useChatStore()
   store.conversations = conversations
@@ -519,4 +523,285 @@ test('被新流取代的旧流投递的 reset 不得清空当前流的内容', a
 
   secondStream.onDone()
   await settleTail(['a'])
+})
+
+// ---------------------------------------------------------------------------
+// 评测轮询（startEvaluationPolling / stopEvaluationPolling / markLocalEvaluationTimeout）
+// 与 refreshMessages 的消息合并。
+//
+// 这些函数没有从 store 导出，用例只断言可观测行为：window.setInterval / clearInterval
+// 的调用（记录型桩，全程零真实定时器）、chatAPI.getMessages 的调用次数与目标会话、
+// 以及 store.messages 的内容与评测状态。
+// ---------------------------------------------------------------------------
+
+const backendMessage = (id, role, content, ragasStatus = '') => ({
+  id,
+  role,
+  content,
+  ragas_status: ragasStatus,
+})
+
+// 手动驱动一次轮询 tick：定时器桩只登记回调，这里显式调用它。
+// getMessages 的订阅在回调同步段内完成，因此先触发 tick 再投递响应即可。
+async function tick(conversationId, snapshot) {
+  const pending = pollingStarts.at(-1)()
+  if (snapshot) respond(conversationId, snapshot)
+  return pending
+}
+
+// 走真实链路进入轮询状态：提问 → 流式回答（带检索轨迹，才会标记待评测）→ 收尾刷新。
+// tailSnapshot 是收尾那次 GET /messages 的后端快照。
+async function enterPolling(conversationId, tailSnapshot) {
+  const store = createStore([conversation(conversationId)])
+  store.setCurrentId(conversationId)
+  store.sendMessage('问题')
+  const stream = streams.at(-1)
+  stream.onMessage('', {
+    type: 'trace',
+    trace_id: 't1',
+    event: { index: 0, stage: 'retrieval_completed' },
+  })
+  stream.onMessage('回答')
+  stream.onDone()
+  respondConversations([])
+  await flush()
+  respond(conversationId, tailSnapshot)
+  await flush()
+  return store
+}
+
+test('评测轮询：后端状态收敛为已完成时停止轮询', async () => {
+  const store = await enterPolling('a', [
+    backendMessage(1, 'user', '问题'),
+    backendMessage(2, 'assistant', '回答', 'pending'),
+  ])
+
+  assert.equal(pollingStarts.length, 1)
+  assert.equal(pollingDelays.at(-1), 3000) // 固定 3 秒一次
+  assert.equal(pollingStops.length, 0)
+
+  await tick('a', [
+    backendMessage(1, 'user', '问题'),
+    backendMessage(2, 'assistant', '回答', 'done'),
+  ])
+
+  assert.deepEqual(getMessagesCalls, ['a', 'a']) // 收尾一次 + 每个 tick 一次
+  assert.equal(pollingStops.length, 1)
+  assert.equal(pollingStops.at(-1), 1) // 停的是自己那块表
+  assert.deepEqual(contents(store), ['问题', '回答'])
+  assert.equal(store.messages.at(-1).ragas_status, 'done')
+  assert.equal(store.messages.at(-1).isLocal, false) // 以服务端快照为准
+})
+
+test('评测轮询：后端状态收敛为失败时同样停止轮询', async () => {
+  const store = await enterPolling('a', [
+    backendMessage(1, 'user', '问题'),
+    backendMessage(2, 'assistant', '回答', 'pending'),
+  ])
+
+  await tick('a', [
+    backendMessage(1, 'user', '问题'),
+    backendMessage(2, 'assistant', '回答', 'failed'),
+  ])
+
+  assert.equal(pollingStops.length, 1)
+  assert.equal(store.messages.at(-1).ragas_status, 'failed')
+  assert.deepEqual(contents(store), ['问题', '回答'])
+})
+
+test('评测轮询：仍为等待中/评测中时按间隔继续轮询，且不重复起表', async () => {
+  const store = await enterPolling('a', [
+    backendMessage(1, 'user', '问题'),
+    backendMessage(2, 'assistant', '回答', 'pending'),
+  ])
+
+  await tick('a', [
+    backendMessage(1, 'user', '问题'),
+    backendMessage(2, 'assistant', '回答', 'running'),
+  ])
+  await tick('a', [
+    backendMessage(1, 'user', '问题'),
+    backendMessage(2, 'assistant', '回答', 'pending'),
+  ])
+
+  assert.equal(pollingStops.length, 0)
+  assert.equal(pollingStarts.length, 1) // 复用同一块表，不叠加定时器
+  assert.deepEqual(getMessagesCalls, ['a', 'a', 'a'])
+})
+
+test('评测轮询：某次刷新失败不中断轮询', async () => {
+  const store = await enterPolling('a', [backendMessage(1, 'user', '问题')])
+
+  const pending = pollingStarts.at(-1)()
+  respondError('a', new Error('消息接口失败'))
+  await pending
+
+  assert.equal(pollingStops.length, 0)
+  assert.equal(store.messages.at(-1).ragas_status, 'pending') // 本地待评测消息仍在，靠下次 tick 收敛
+})
+
+test('评测轮询：会话切走后下一次 tick 自行停止，且不再请求旧会话', async () => {
+  const store = await enterPolling('a', [backendMessage(1, 'user', '问题')])
+  const callsBefore = getMessagesCalls.length
+  const contentsBefore = contents(store)
+
+  // 用户切到别的会话（不等轮询回调），旧表留到下一次 tick 才被回调自行停掉。
+  store.setCurrentId('b')
+  await pollingStarts.at(-1)()
+
+  assert.equal(getMessagesCalls.length, callsBefore) // 不为已切走的会话发请求
+  assert.equal(pollingStops.at(-1), 1)
+  assert.deepEqual(contents(store), contentsBefore) // 也不写旧会话的消息
+})
+
+test('评测轮询：超过时限后把本地待评测消息标记为失败并停止轮询', async () => {
+  // 后端快照里还没有助手回答：本地乐观消息必须保留，并一直轮询到超时。
+  const store = await enterPolling('a', [backendMessage(1, 'user', '问题')])
+
+  assert.equal(pollingStarts.length, 1)
+  assert.equal(pollingDelays.at(-1), 3000)
+  assert.equal(store.messages.at(-1).isLocal, true)
+  assert.equal(store.messages.at(-1).ragas_status, 'pending')
+
+  const snapshot = [backendMessage(1, 'user', '问题')]
+  // 时限 190000ms、每次 tick 记 3000ms：第 63 次仍是 189000ms，尚未超时。
+  for (let i = 0; i < 63; i += 1) {
+    await tick('a', snapshot)
+  }
+  assert.equal(store.messages.at(-1).ragas_status, 'pending')
+  assert.equal(pollingStops.length, 0)
+
+  // 第 64 次 tick（192000ms）越界：标记本地消息并停表。
+  await tick('a', snapshot)
+
+  assert.equal(pollingStops.length, 1)
+  assert.equal(pollingStarts.length, 1)
+  assert.equal(getMessagesCalls.length, 65) // 收尾一次 + 64 次 tick
+  const timedOut = store.messages.at(-1)
+  assert.equal(timedOut.isLocal, true)
+  assert.equal(timedOut.ragas_status, 'failed')
+  assert.equal(timedOut.ragas_error, '评测未及时返回，稍后刷新会话可查看最终状态')
+  assert.deepEqual(contents(store), ['问题', '回答'])
+})
+
+test('评测轮询：只有待评测的助手消息才启动轮询', async () => {
+  const store = createStore([
+    conversation('a'),
+    conversation('b'),
+    conversation('c'),
+    conversation('d'),
+  ])
+
+  // 评测中（running）也算待评测。
+  const requestA = store.selectConversation('a')
+  respond('a', [backendMessage(2, 'assistant', '回答', 'running')])
+  await requestA
+  assert.equal(pollingStarts.length, 1)
+
+  // 切到已完成的会话：不新起轮询，并且停掉上一个会话的表。
+  const requestB = store.selectConversation('b')
+  respond('b', [backendMessage(3, 'assistant', '回答', 'done')])
+  await requestB
+  assert.equal(pollingStarts.length, 1)
+  assert.deepEqual(pollingStops, [1])
+
+  // 助手消息未带评测状态（历史消息）：不启动。
+  const requestC = store.selectConversation('c')
+  respond('c', [backendMessage(4, 'assistant', '历史回答', '')])
+  await requestC
+  assert.equal(pollingStarts.length, 1)
+  assert.deepEqual(pollingStops, [1])
+
+  // 只有用户提问、还没有回答：不启动。
+  const requestD = store.selectConversation('d')
+  respond('d', [backendMessage(5, 'user', '只有提问')])
+  await requestD
+  assert.equal(pollingStarts.length, 1)
+  assert.deepEqual(pollingStops, [1])
+})
+
+test('消息合并：后端已有同内容的助手回答时，不重复插入本地待评测消息', async () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+  store.addMessage({ role: 'user', content: '问题' })
+  store.addMessage({ role: 'assistant', content: '回答', ragas_status: 'pending', isLocal: true })
+
+  const request = store.refreshMessages('a')
+  respond('a', [
+    backendMessage(1, 'user', '问题'),
+    backendMessage(2, 'assistant', '回答', 'done'),
+  ])
+  const merged = await request
+
+  assert.equal(merged.length, 2) // 不出现第三条重复回答
+  assert.deepEqual(contents(store), ['问题', '回答'])
+  assert.equal(store.messages.at(-1).isLocal, false)
+  assert.equal(store.messages.at(-1).ragas_status, 'done')
+})
+
+test('消息合并：后端快照还没有该回答时保留本地待评测消息', async () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+  store.addMessage({ role: 'user', content: '问题' })
+  store.addMessage({ role: 'assistant', content: '回答', ragas_status: 'pending', isLocal: true })
+
+  const request = store.refreshMessages('a')
+  respond('a', [backendMessage(1, 'user', '问题')])
+  const merged = await request
+
+  assert.equal(merged.length, 2)
+  assert.equal(store.messages.at(-1).isLocal, true)
+  assert.equal(store.messages.at(-1).ragas_status, 'pending')
+})
+
+test('消息合并：后端已有助手回答时，本地待评测消息不再插入', async () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+  store.addMessage({ role: 'user', content: '问题' })
+  store.addMessage({ role: 'assistant', content: '回答', ragas_status: 'pending', isLocal: true })
+
+  const request = store.refreshMessages('a')
+  respond('a', [
+    backendMessage(1, 'user', '问题'),
+    backendMessage(2, 'assistant', '另一个答案', 'pending'),
+  ])
+  await request
+
+  // 后端已落库（助手消息存在），本地这条 pending 交给后端快照接管，避免出现两条回答。
+  assert.deepEqual(contents(store), ['问题', '另一个答案'])
+  assert.equal(store.messages.at(-1).isLocal, false)
+})
+
+test('消息合并：本地已中止的助手消息（非待评测）不与后端快照去重', async () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+  store.addMessage({ role: 'user', content: '问题' })
+  // 例如用户中断生成留下的本地消息：后端不会落库，只按「内容是否重复」去重。
+  store.addMessage({ role: 'assistant', content: '回答\n\n*(已停止生成)*', isLocal: true })
+
+  const request = store.refreshMessages('a')
+  respond('a', [
+    backendMessage(1, 'user', '问题'),
+    backendMessage(2, 'assistant', '另一个答案', 'done'),
+  ])
+  await request
+
+  assert.deepEqual(contents(store), ['问题', '另一个答案', '回答\n\n*(已停止生成)*'])
+})
+
+test('消息合并：会话已切走时只返回合并结果，不写当前视图', async () => {
+  const store = createStore([conversation('a'), conversation('b')])
+  store.setCurrentId('a')
+  store.addMessage({ role: 'user', content: 'A 的问题' })
+
+  const request = store.refreshMessages('a')
+  respond('a', [
+    backendMessage(1, 'user', 'A 的问题'),
+    backendMessage(2, 'assistant', 'A 的回答'),
+  ])
+  store.setCurrentId('b')
+  const merged = await request
+
+  assert.equal(merged.length, 2) // 合并结果照常返回
+  assert.deepEqual(contents(store), ['A 的问题']) // 但不改写已切走会话的视图
 })
