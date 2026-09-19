@@ -1,0 +1,39 @@
+name: PR 描述校验
+
+# PR 描述里缺必填节时变红，并指出缺了哪一节。
+# 校验脚本取 base 分支上的版本，避免 PR 通过改脚本来放松自己的门禁。
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-template-check:
+    name: PR 描述必填节校验
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出 base 分支（校验脚本来源）
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: 校验 PR 描述
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { execFileSync } = require('child_process');
+            const bodyPath = `${process.env.RUNNER_TEMP}/pr_body.md`;
+            fs.writeFileSync(bodyPath, context.payload.pull_request.body || '', 'utf8');
+            try {
+              core.info(
+                execFileSync(process.execPath, ['scripts/check_pr_body.mjs', bodyPath], {
+                  encoding: 'utf8',
+                })
+              );
+            } catch (error) {
+              const detail = `${error.stdout || ''}${error.stderr || ''}`.trim();
+              core.setFailed(detail || error.message);
+            }

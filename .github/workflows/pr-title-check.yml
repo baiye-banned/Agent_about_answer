@@ -1,0 +1,39 @@
+name: PR 标题校验
+
+# PR 标题必须符合 Conventional Commits，否则变红。
+# 校验脚本取 base 分支上的版本，避免 PR 通过改脚本来放松自己的门禁。
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-title-check:
+    name: PR 标题规范校验
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出 base 分支（校验脚本来源）
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: 校验 PR 标题
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { execFileSync } = require('child_process');
+            const titlePath = `${process.env.RUNNER_TEMP}/pr_title.txt`;
+            fs.writeFileSync(titlePath, context.payload.pull_request.title || '', 'utf8');
+            try {
+              core.info(
+                execFileSync(process.execPath, ['scripts/check_title.mjs', titlePath], {
+                  encoding: 'utf8',
+                })
+              );
+            } catch (error) {
+              const detail = `${error.stdout || ''}${error.stderr || ''}`.trim();
+              core.setFailed(detail || error.message);
+            }
