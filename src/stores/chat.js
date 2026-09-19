@@ -31,6 +31,9 @@ export const useChatStore = defineStore('chat', () => {
   // 避免陈旧响应覆盖当前会话。
   let loadSeq = 0
   let streamSeq = 0
+  // 视图世代：用户显式清空会话视图（新建对话 / 删除会话）时递增。在途流据此放弃「认领新建会话」，
+  // 否则用户已经开了新对话，旧流收尾还会把他拽回原会话。
+  let viewEpoch = 0
 
   const currentConversation = computed(() =>
     conversations.value.find((conversation) => conversation.id === currentId.value)
@@ -154,6 +157,7 @@ export const useChatStore = defineStore('chat', () => {
     streamingHasAttachments.value = attachments.length > 0
     abortController.value = new AbortController()
     const requestSeq = ++streamSeq
+    const viewEpochAtSend = viewEpoch
 
     addMessage({ role: 'user', content: displayText, attachments })
 
@@ -170,11 +174,12 @@ export const useChatStore = defineStore('chat', () => {
           // 归属必须在改动状态之前判定：流式过程中用户可能已经切到别的会话，
           // 此时迟到的 conversation 事件只能更新会话列表，不得改写当前会话的知识库选择。
           const belongsToCurrent =
-            !currentId.value || currentId.value === streamingConversationId.value
+            viewEpochAtSend === viewEpoch &&
+            (!currentId.value || currentId.value === streamingConversationId.value)
           upsertConversation(conversation)
           streamingConversationId.value = conversation.id || streamingConversationId.value
           pendingRouteConversationId.value = conversation.id || null
-          if (!currentId.value && conversation.id) {
+          if (!currentId.value && conversation.id && viewEpochAtSend === viewEpoch) {
             currentId.value = conversation.id
           }
           if (conversation.knowledge_base_id && belongsToCurrent) {
@@ -196,7 +201,7 @@ export const useChatStore = defineStore('chat', () => {
         }
         streamContent.value += content
       },
-      onDone: () => handleStreamDone(requestSeq),
+      onDone: () => handleStreamDone(requestSeq, viewEpochAtSend),
       onError: (error) => handleStreamError(error, requestSeq),
     })
   }
@@ -206,7 +211,7 @@ export const useChatStore = defineStore('chat', () => {
     return seq === streamSeq
   }
 
-  async function handleStreamDone(requestSeq) {
+  async function handleStreamDone(requestSeq, viewEpochAtSend) {
     if (!isLatestStream(requestSeq)) return
     const targetConversationId = streamingConversationId.value
     const shouldTrackEvaluation = shouldTrackEvaluationFromTrace()
@@ -225,8 +230,9 @@ export const useChatStore = defineStore('chat', () => {
 
     finishStreaming()
     const nextConversations = await fetchConversations().catch(() => [])
-    // 改写「当前会话」属于归属写入：收尾期间可能已经又发起了新的提问，只有仍是当前请求才允许改写。
-    if (!currentId.value && isLatestStream(requestSeq)) {
+    // 改写「当前会话」属于归属写入：收尾期间可能已经又发起了新的提问、或用户已经开了新对话，
+    // 只有仍是当前请求、且视图没有被显式清空过，才允许改写。
+    if (!currentId.value && isLatestStream(requestSeq) && viewEpochAtSend === viewEpoch) {
       if (nextConversations?.[0]?.id) {
         setCurrentId(nextConversations[0].id)
       } else if (targetConversationId) {
@@ -240,7 +246,7 @@ export const useChatStore = defineStore('chat', () => {
       // 被新请求取代时只返回合并结果、不改动消息列表，避免抹掉刚发出的提问。
       const nextMessages = await refreshMessages(targetConversationId, {
         shouldWrite: () => isLatestStream(requestSeq),
-      })
+      }).catch(() => messages.value)
       // 刷新期间用户可能已经切走，回来后不得再改动（启停评测轮询）不属于自己的会话。
       if (currentId.value !== targetConversationId) return
       if (hasPendingEvaluation(nextMessages)) {
@@ -466,6 +472,8 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   function clearMessages() {
+    // 用户显式离开当前视图：在途流的「认领会话」「改写知识库」写入随之失效。
+    viewEpoch += 1
     currentId.value = null
     messages.value = []
     stopEvaluationPolling()

@@ -10,10 +10,10 @@ const stubSource = [
   'export const getMessagesCalls = []',
   'export const chatAPI = {',
   '  getConversations: () => new Promise((resolve) => conversationResolvers.push(resolve)),',
-  '  getMessages: (id) => new Promise((resolve) => {',
+  '  getMessages: (id) => new Promise((resolve, reject) => {',
   '    getMessagesCalls.push(id)',
   '    const queue = pending.get(id) || []',
-  '    queue.push(resolve)',
+  '    queue.push({ resolve, reject })',
   '    pending.set(id, queue)',
   '  }),',
   '  deleteConversation: async () => {},',
@@ -24,9 +24,15 @@ const stubSource = [
   '}',
   'export function respond(id, messages) {',
   '  const queue = pending.get(id) || []',
-  '  const resolve = queue.shift()',
+  '  const entry = queue.shift()',
   '  pending.set(id, queue)',
-  '  if (resolve) resolve(messages)',
+  '  if (entry) entry.resolve(messages)',
+  '}',
+  'export function respondError(id, error) {',
+  '  const queue = pending.get(id) || []',
+  '  const entry = queue.shift()',
+  '  pending.set(id, queue)',
+  '  if (entry) entry.reject(error)',
   '}',
   // 每条用例开始前清空桩状态：某条用例提前断言失败时可能留下没人消费的 resolver，
   // 若不清理，下一条用例的 respond() 会把它消费掉，导致该用例永远等不到自己的响应。
@@ -72,7 +78,8 @@ globalThis.window = {
 
 const { createPinia, setActivePinia } = await import('pinia')
 const { useChatStore } = await import('../src/stores/chat.js')
-const { respond, respondConversations, resetStub, streams, getMessagesCalls } = await import(chatApiStub)
+const { respond, respondError, respondConversations, resetStub, streams, getMessagesCalls } =
+  await import(chatApiStub)
 
 const conversation = (id, knowledgeBaseId = null) => ({
   id,
@@ -369,4 +376,50 @@ test('切走后，旧流的会话事件不得再改写当前会话的知识库�
 
   assert.equal(store.currentId, 'b')
   assert.equal(store.selectedKnowledgeBaseId, 'kb-b')
+})
+
+test('流式期间点了「新对话」，旧流不得把会话认领回来', async () => {
+  const store = createStore([conversation('a', 'kb-a')])
+  store.setCurrentId('a')
+
+  store.sendMessage('问题')
+  const stream = streams.at(-1)
+  stream.onMessage('回答')
+  stream.onDone() // 收尾挂在 fetchConversations 上
+
+  // 回答还在收尾时用户点了「新对话」：视图被显式清空。
+  store.clearMessages()
+  assert.equal(store.currentId, null)
+
+  // 旧流此刻才投递 conversation 事件与收尾结果，都不得把已清空的视图认领回会话 a。
+  stream.onMessage('', { type: 'conversation', conversation: conversation('a', 'kb-a') })
+  respondConversations([conversation('a', 'kb-a')])
+  await flush()
+
+  assert.equal(store.currentId, null)
+  assert.equal(store.selectedKnowledgeBaseId, null)
+  assert.deepEqual(contents(store), [])
+})
+
+test('收尾刷新失败时，仍要启动评测轮询而不是中断收尾', async () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+
+  store.sendMessage('问题')
+  const stream = streams.at(-1)
+  stream.onMessage('', { type: 'trace', trace_id: 't1', event: { index: 0, stage: 'retrieval_completed' } })
+  stream.onMessage('回答')
+  stream.onDone()
+
+  respondConversations([])
+  await flush()
+  assert.deepEqual(getMessagesCalls, ['a']) // 收尾已进入 refreshMessages('a')
+
+  // 收尾的 GET /messages 失败（500 / 超时）：不得把异常抛进 onDone（streamChat 丢弃该 Promise，
+  // 会变成未处理的 rejection），待评测的本地消息仍要进入轮询，靠轮询重试收敛。
+  respondError('a', new Error('消息接口失败'))
+  await flush()
+
+  assert.equal(pollingStarts.length, 1)
+  assert.deepEqual(contents(store), ['问题', '回答'])
 })
