@@ -51,9 +51,9 @@ Commands run from the repository root:
 
 | Command | Result |
 | --- | --- |
-| `npm test` | Passed: `58` Node tests; script discovers `tests/**/*.test.js` |
+| `npm test` | Passed: `78` Node tests; script discovers `tests/**/*.test.js` |
 | `npm run build` | Passed: Vite build completed; retained existing `Chat` chunk > 500 kB warning |
-| `python -m pytest -q tests` | Passed: `155` Python tests; discovery fixed by `pytest.ini` |
+| `python -m pytest -q tests` | `181` passed, `1` failed of `182` collected; discovery fixed by `pytest.ini`. The failure (`test_env_example_parity.py::test_every_env_var_read_by_config_is_documented`) comes from upstream commit `483a070`: `backend/config.py` reads `EMBEDDING_TIMEOUT_SECONDS`, but `.env.example` does not document it |
 | `git status --short` | Dirty tree remains; see current worktree shape above |
 | `git diff --stat` | `45 files changed`, `1296 insertions`, `2874 deletions` |
 | `git diff --check -- src backend package.json tests` | No whitespace errors reported; Git printed LF-to-CRLF working-copy warnings |
@@ -65,7 +65,7 @@ Commands run from the repository root:
 - Milvus migration is the largest backend risk. Existing Chroma data is not automatically migrated, and the upload/query/delete loop still deserves a focused runtime acceptance pass.
 - Several external providers are mocked in tests. DeepSeek, DashScope embedding, DashScope rerank, OSS, and RAGAS runtime behavior still need real-environment smoke checks.
 - Some terminal output showed mojibake for Chinese strings. Prior tests passed, but the final UI text should be checked in a browser or by reading files with confirmed UTF-8 handling.
-- `Knowledge.vue` batch delete and `chat store` RAGAS polling are partly covered through utilities, but not yet by narrow behavior-level frontend tests.
+- `Knowledge.vue` batch delete/upload feedback and `chat store` RAGAS polling/message merge are now covered by narrow behavior-level Node tests (`tests/knowledgeFeedback.test.js`, `tests/chatStore.test.js`). The view-side logic was extracted into `src/utils/knowledgeFeedback.js` to make it testable in plain Node, so the Vue SFC glue itself (which helper it calls, the toast level, `uploading`/`uploadPercent` reset) is still only verified by reading, not executed by tests.
 
 ## Follow-Up Small Goals
 
@@ -78,7 +78,7 @@ Next batch:
 2. Milvus acceptance goal: verify index rebuild, upload, query, knowledge-base isolation, and deletion cleanup end to end.
 3. Retrieval acceptance goal: verify query planning, vector recall, keyword recall, RRF fusion, and rerank with focused behavior tests.
 4. Rerank and provider goal: smoke-test DashScope rerank, LLM fallback, embedding, and DeepSeek connectivity in the target environment.
-5. Frontend behavior goal: add narrow tests for knowledge batch delete feedback and chat RAGAS polling/message merge behavior.
+5. Frontend behavior goal: partially done. Narrow tests for knowledge batch delete/upload feedback and chat RAGAS polling/message merge behavior were added (`tests/knowledgeFeedback.test.js`, `tests/chatStore.test.js`). Still open: no test covers the Vue view glue, and the delete paths take no error branch when the user cancels the confirm dialog or `knowledgeAPI.delete` rejects.
 6. Documentation alignment goal: keep startup commands and environment variables consistent across README, docs, and project instructions.
 
 ## Closure Decision
