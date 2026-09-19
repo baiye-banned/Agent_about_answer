@@ -683,14 +683,14 @@ flowchart LR
 
 ### `backend/rag`
 
-> LangChain RAG ????????? `agentic_rag.py`?`tool.py`?`retrieval.py`?`rag_gate.py` ??????
+> LangChain RAG 层按职责拆分文件：召回与重排见下表；生成入口是 `chains.py`，模型调用、JSON 解析与文本兜底在 `llm.py`。RAG gate 不是独立文件，而是 `retrieval.py` 的 `decide_need_rag()`。
 
-| ?? | ?? |
+| 文件 | 作用 |
 |---|---|
 | `retrieval.py` | RAG gate、查询规划、多路召回、关键词召回和 RRF 融合 |
 | `rerank.py` | DashScope rerank 与 LLM fallback 重排 |
-| `chains.py` | ?????????? `stream_rag_answer()` |
-| `llm.py` | `ChatOpenAI`?DeepSeek????????JSON ????????? |
+| `chains.py` | 生成入口，`stream_rag_answer()` 转发 `llm.py` 的 `stream_answer_events()` 事件流 |
+| `llm.py` | `ChatOpenAI` 接 DeepSeek；URL 归一化、`parse_json_object()` 与文本兜底链路 |
 
 ### `backend/rag/learning_trace.py`
 
