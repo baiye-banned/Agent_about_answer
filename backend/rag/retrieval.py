@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import re
 from typing import Any
@@ -9,7 +10,7 @@ from sqlalchemy.orm import Session
 from config import RETRIEVAL_ROUTE_TOP_K
 from model.models import KnowledgeFile
 from rag.llm import call_chat_json, call_router_json
-from rag.milvus_client import embedding_backend_status, query_vectors
+from rag.milvus_client import EmbeddingBackendError, embedding_backend_status, query_vectors
 from rag.rerank import (
     chunk_key,
     rerank_chunks,
@@ -19,6 +20,8 @@ from rag.rerank import (
 
 
 ROUTE_CONFIDENCE_THRESHOLD = 0.55
+
+logger = logging.getLogger(__name__)
 
 
 async def decide_need_rag(
@@ -97,12 +100,19 @@ async def retrieve_knowledge(
     route_specs = _build_route_specs(question, query_plan)
 
     for route, query in route_specs:
-        chunks = query_vectors(
-            query,
-            top_k=RETRIEVAL_ROUTE_TOP_K,
-            knowledge_base_id=knowledge_base_id,
-            route=route,
-        )
+        try:
+            chunks = query_vectors(
+                query,
+                top_k=RETRIEVAL_ROUTE_TOP_K,
+                knowledge_base_id=knowledge_base_id,
+                route=route,
+            )
+        except EmbeddingBackendError as exc:
+            # 查询向量化失败时绝不退化为哈希向量（会造成跨空间检索），
+            # 显式跳过向量路由并记录原因，后续仍可用关键词路由召回。
+            logger.warning("Vector route skipped, embedding backend unavailable: route=%s error=%s", route, exc)
+            trace["embedding_error"] = str(exc)
+            chunks = []
         route_results.append((route, chunks))
         trace["routes"].append(
             {
@@ -132,6 +142,9 @@ async def retrieve_knowledge(
                 "items": [trace_chunk(item) for item in keyword_chunks[:5]],
             }
         )
+
+    if trace.get("embedding_error"):
+        trace["embedding"] = embedding_backend_status()
 
     fused = rrf_fuse(route_results)
     trace["rrf"] = [trace_chunk(item) for item in fused[:10]]

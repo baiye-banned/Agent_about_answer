@@ -1,0 +1,99 @@
+name: Bug 报告
+description: 报告一个可复现的缺陷（检索异常、上传失败、登录问题等）
+title: "[BUG] "
+labels: [bug, "Triage Needed"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。表单里标记为必填的每一项都要填清楚。
+        提交后 CI 会再校验「复现步骤」与「日志」两节：小节缺失、空白，或只写「无」这类占位文本都会变红。
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 描述
+      description: 一句话说清楚出了什么问题
+      placeholder: 例如：上传 PDF 后知识库检索不到该文件的内容
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境
+      description: 操作系统、浏览器、Node / Python 版本、部署方式（本地 / Docker / Render）与所在分支或提交
+      placeholder: |
+        操作系统：Windows 11 / macOS 14
+        浏览器：Chrome 126
+        运行方式：本地开发（npm run dev + uvicorn）
+        版本：develop @ c2916e7
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 从零开始的精确步骤，让别人能照着复现
+      placeholder: |
+        1. 登录后进入「知识库」页面
+        2. 上传 xxx.pdf
+        3. 提问「文档里写了什么」
+    validations:
+      required: true
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: 复现频率
+      description: 这个问题多久出现一次
+      options:
+        - 必现
+        - 偶现
+        - 条件必现（特定文件 / 特定知识库 / 特定模型）
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      description: 正确的表现应该是什么
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: 实际发生了什么，包括报错文案
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: 必填，不接受空白。粘贴终端输出、浏览器控制台报错或服务端日志
+      render: shell
+      placeholder: |
+        把相关日志粘贴在这里，不要只写「报错了」
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: 截图
+      description: 选填。界面相关的问题建议附截图或录屏
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充
+      description: 选填。已经排查过哪些方向、相关的 commit 或 PR
+    validations:
+      required: false

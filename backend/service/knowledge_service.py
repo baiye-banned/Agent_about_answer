@@ -5,7 +5,7 @@ from fastapi import Depends, File, Form, HTTPException, Request, UploadFile
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from rag.milvus_client import add_chunks, delete_file_chunks
+from rag.milvus_client import EmbeddingBackendError, add_chunks, delete_file_chunks
 from crud import knowledge_base as crud_knowledge_base
 from crud import knowledge_file as crud_knowledge_file
 from database.session import SessionLocal, get_db
@@ -81,9 +81,20 @@ def rebuild_existing_knowledge_index():
     try:
         for entry in db.query(KnowledgeFile).filter(KnowledgeFile.knowledge_base_id.isnot(None)).all():
             chunks = crud_knowledge_file.chunk_text(entry.content or "", entry.id)
-            add_chunks(chunks, entry.id, entry.name, entry.knowledge_base_id)
+            try:
+                add_chunks(chunks, entry.id, entry.name, entry.knowledge_base_id)
+            except Exception as exc:
+                # 单个文件失败不阻塞启动：旧索引保持原样，可修复向量化服务后再次重建。
+                logger.warning("Knowledge index rebuild failed: file_id=%s error=%s", entry.id, exc, exc_info=True)
     finally:
         db.close()
+
+
+def _index_failure_detail(exc: Exception) -> str:
+    """向量化失败时把可读原因透出给前端，其余写入异常保持原有提示。"""
+    if isinstance(exc, EmbeddingBackendError):
+        return f"知识文件上传失败：{exc}"
+    return "知识文件上传失败，向量库写入异常。"
 
 
 def _delete_file_vectors_or_500(file_id: int, *, scope: str, detail: str) -> None:
@@ -188,7 +199,7 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
         except SQLAlchemyError as cleanup_commit_exc:
             db.rollback()
             logger.warning("Failed to rollback partially indexed knowledge file: file_id=%s error=%s", entry.id, cleanup_commit_exc, exc_info=True)
-        raise HTTPException(500, "知识文件上传失败，向量库写入异常。")
+        raise HTTPException(500, _index_failure_detail(exc))
 
     return crud_knowledge_file.serialize_knowledge_file(entry)
 
