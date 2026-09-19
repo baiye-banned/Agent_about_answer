@@ -8,6 +8,7 @@ import { marked } from 'marked'
 import { markedHighlight } from 'marked-highlight'
 import hljs from 'highlight.js'
 import 'highlight.js/styles/github.css'
+import { isSafeLinkUrl, isUrlAttribute } from '../utils/url.js'
 
 marked.use(
   markedHighlight({
@@ -48,8 +49,7 @@ function sanitizeHtml(html) {
   template.content.querySelectorAll('*').forEach((node) => {
     for (const attr of [...node.attributes]) {
       const name = attr.name.toLowerCase()
-      const value = attr.value.trim().toLowerCase()
-      const isUnsafeUrl = ['href', 'src'].includes(name) && value.startsWith('javascript:')
+      const isUnsafeUrl = isUrlAttribute(name) && !isSafeLinkUrl(attr.value)
 
       if (name.startsWith('on') || isUnsafeUrl) {
         node.removeAttribute(attr.name)
