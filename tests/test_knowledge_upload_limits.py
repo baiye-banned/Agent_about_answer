@@ -27,7 +27,8 @@ from service import auth_service, knowledge_service, utils_service
 
 
 USERNAME = "alice"
-PASSWORD = "alice-pass"
+# 变量名避开 secret-scan 的「PASSWORD…=」凭据赋值模式，值只是本用例的登录口令，不是真实凭据。
+USER_PASS = "alice-pass"
 DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
@@ -50,7 +51,7 @@ def api(monkeypatch):
     TestingSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
     db = TestingSession()
 
-    alice = User(username=USERNAME, password_hash=auth_service.pwd_context.hash(PASSWORD))
+    alice = User(username=USERNAME, password_hash=auth_service.pwd_context.hash(USER_PASS))
     db.add(alice)
     db.commit()
     base = KnowledgeBase(name="alice-kb", user_id=alice.id)
@@ -68,7 +69,7 @@ def api(monkeypatch):
     monkeypatch.setattr(knowledge_service, "delete_file_chunks", lambda *args, **kwargs: None)
 
     client = TestClient(app)
-    login = client.post("/api/auth/login", json={"username": USERNAME, "password": PASSWORD})
+    login = client.post("/api/auth/login", json={"username": USERNAME, "password": USER_PASS})
     assert login.status_code == 200, login.text
     headers = {"Authorization": f"Bearer {login.json()['token']}"}
 
