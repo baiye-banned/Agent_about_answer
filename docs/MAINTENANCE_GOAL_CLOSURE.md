@@ -51,9 +51,9 @@ Commands run from the repository root:
 
 | Command | Result |
 | --- | --- |
-| `npm test` | Passed: `78` Node tests; script discovers `tests/**/*.test.js` |
+| `npm test` | Passed: `80` Node tests; script discovers `tests/**/*.test.js` |
 | `npm run build` | Passed: Vite build completed; retained existing `Chat` chunk > 500 kB warning |
-| `python -m pytest -q tests` | `181` passed, `1` failed of `182` collected; discovery fixed by `pytest.ini`. The failure (`test_env_example_parity.py::test_every_env_var_read_by_config_is_documented`) comes from upstream commit `483a070`: `backend/config.py` reads `EMBEDDING_TIMEOUT_SECONDS`, but `.env.example` does not document it |
+| `python -m pytest -q tests` | `206` passed, `1` failed of `207` collected; discovery fixed by `pytest.ini`. The failure (`test_env_example_parity.py::test_every_env_var_read_by_config_is_documented`) comes from upstream commit `483a070`: `backend/config.py` reads `EMBEDDING_TIMEOUT_SECONDS`, but `.env.example` does not document it |
 | `git status --short` | Dirty tree remains; see current worktree shape above |
 | `git diff --stat` | `45 files changed`, `1296 insertions`, `2874 deletions` |
 | `git diff --check -- src backend package.json tests` | No whitespace errors reported; Git printed LF-to-CRLF working-copy warnings |
