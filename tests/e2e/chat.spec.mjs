@@ -27,6 +27,10 @@ const CITATION = `引用来源：${FIXTURE_NAME}`
 // 夹具里出现过、桩的回答里没有的措辞：用来证明答案不是检索原文的回显。
 const FIXTURE_ONLY_PHRASE = '合规发票'
 
+// 夹具正文第二段（报销时限）里的措辞，桩的固定回答里没有：参考资料抽屉里出现它，
+// 说明检回的 chunk 带回了正文，而不只是一个文件名。
+const FIXTURE_BODY_PHRASE = '30 个工作日'
+
 // 答案开头（标记串的前缀）：采样流式帧时用它确认「已经收到作答内容」。
 const ANSWER_PREFIX = 'E2E-STUB'
 
@@ -138,7 +142,8 @@ test('登录 → 建库 → 上传 → 提问 → 流式作答 → 引用可溯�
     streamingPartial = await streamingBubble.innerText()
 
     // 已经收到开头、却还没收到完整标记串 —— 证明前端是边收边渲染，
-    // 而不是收到整包再一次性显示（桩按 700ms/片 下发，这个窗口足够稳定观察到）。
+    // 而不是收到整包再一次性显示（桩按 1200ms/片 下发，这个窗口足够稳定观察到；
+    // 间隔必须与 CI 一致，见 .github/workflows/e2e.yml 里启动桩的那一步）。
     expect(streamingPartial).not.toContain(ANSWER_MARKER)
     await testInfo.attach('streaming-partial.txt', {
       body: Buffer.from(streamingPartial, 'utf8'),
@@ -160,7 +165,9 @@ test('登录 → 建库 → 上传 → 提问 → 流式作答 → 引用可溯�
     await expect(answerBubble).toContainText(CITATION)
 
     // 用户看到的是答案本身：既不能把带 [来源: …] 的原始上下文吐出来，
-    // 也不能只是把检索到的原文回显一遍。
+    // 也不能只是把检索到的原文回显一遍。这两条在当前实现下近乎恒真（气泡正文只来自
+    // SSE 的 delta），留着的意义是钉住「上下文不得混进正文」这个契约；检索是否真的
+    // 发生，由下面的参考资料断言与 CI 里的桩日志校验来证明，不由这两条证明。
     await expect(answerBubble).not.toContainText('[来源:')
     await expect(answerBubble).not.toContainText(FIXTURE_ONLY_PHRASE)
     await shot(page, testInfo, '6-answer')
@@ -175,6 +182,17 @@ test('登录 → 建库 → 上传 → 提问 → 流式作答 → 引用可溯�
     const drawer = page.locator('.el-drawer').filter({ hasText: '参考资料' })
     await expect(drawer).toBeVisible()
     await expect(drawer).toContainText(FIXTURE_NAME)
+
+    // 只认文件名不够：正文取空时接口照样会返回 file_name，模型拿到的却是空上下文，
+    // 用例却仍会绿。夹具正文里独有的措辞出现在抽屉里，才说明检回的 chunk 带回了正文。
+    await expect(drawer).toContainText(FIXTURE_BODY_PHRASE)
+
+    // 路名与名次来自后端 RRF 融合的真实来源（planned / hyde / rewrite_* / keyword）。
+    // 关键词一路也能召回夹具并渲染出分数，所以必须单独确认向量路真的召回过：
+    // 向量路被跳过（retrieval.py 里吞掉 EmbeddingBackendError 的那条分支）时不会有
+    // 「planned #…」这一片。
+    await expect(drawer.getByText(/planned\s*#\d/).first()).toBeVisible()
+
     // 有重排分和融合分，说明这条引用确实经过了 向量/关键词召回 + RRF 融合 + 重排，
     // 而不是把库里所有东西一股脑列出来。
     await expect(drawer.getByText(/rerank\s+[\d.]/).first()).toBeVisible()
