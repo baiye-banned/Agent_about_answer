@@ -95,6 +95,24 @@ test('selectConversation 丢弃先发出但后返回的陈旧响应', async () =
   assert.deepEqual(contents(store), ['B 的回答'])
 })
 
+test('连续快速切换多个会话，乱序返回后仍只保留最后一个会话的消息', async () => {
+  const ids = ['a', 'b', 'c', 'd']
+  const store = createStore(ids.map((id) => conversation(id)))
+
+  // 依次点击 a→b→c→d，四个请求同时在空中。
+  const pending = ids.map((id) => store.selectConversation(id))
+
+  // 返回顺序与点击顺序完全相反，最后返回的是最早发出的那次。
+  for (const index of [3, 1, 0, 2]) {
+    respond(ids[index], [message(index, `${ids[index]} 的回答`)])
+    await pending[index]
+  }
+
+  assert.equal(store.currentId, 'd')
+  assert.deepEqual(contents(store), ['d 的回答'])
+  assert.equal(store.loading, false)
+})
+
 test('loading 只由最新一次加载复位', async () => {
   const store = createStore([conversation('a'), conversation('b')])
 
