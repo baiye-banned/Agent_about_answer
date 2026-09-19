@@ -5,8 +5,12 @@ file drives the whole chain of ``retrieve_knowledge`` -- multi-route recall, RRF
 rerank and final context selection -- with the real fusion/truncation code and only the
 provider boundary stubbed:
 
-* marginal recall (``query_vectors`` / ``keyword_recall``) is replaced, because it is
-  asserted separately against a real Milvus Lite store in test_milvus_acceptance.py;
+* vector recall (``query_vectors``) is replaced, because it is asserted separately against
+  a real Milvus Lite store in test_milvus_acceptance.py;
+* keyword recall (``keyword_recall``) is replaced only where a case isolates a different
+  route. It reads the relational store, not Milvus, so its real behavior is covered at the
+  end of this file by driving the unpatched implementation against a real SQLAlchemy
+  database holding real ``KnowledgeFile`` rows;
 * the rerank HTTP call is replaced by an in-process transport, while the real
   ``rerank_chunks`` / ``select_final_chunks`` logic under test stays untouched.
 
@@ -17,9 +21,22 @@ import asyncio
 
 import httpx
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.dialects.mysql import LONGTEXT
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from config import RETRIEVAL_RERANK_TOP_N, RETRIEVAL_ROUTE_TOP_K
+from database.session import Base
+from model.models import KnowledgeFile
 from rag import rerank, retrieval
+
+
+@compiles(LONGTEXT, "sqlite")
+def _compile_longtext_as_text(_type, _compiler, **_kwargs):
+    """The model declares MySQL LONGTEXT; SQLite needs it spelled as TEXT."""
+    return "TEXT"
 
 ROUTE_LABELS = [
     "planned",
@@ -168,12 +185,12 @@ def _install_recall(monkeypatch, route_results, keyword_chunks=()):
     return calls
 
 
-def _retrieve(knowledge_base_id=7, trace_recorder=None, question="迟到三个小时怎么处理", plan=None):
+def _retrieve(knowledge_base_id=7, trace_recorder=None, question="迟到三个小时怎么处理", plan=None, db=None):
     return asyncio.run(
         retrieval.retrieve_knowledge(
             question,
             knowledge_base_id=knowledge_base_id,
-            db=object(),
+            db=object() if db is None else db,
             trace_recorder=trace_recorder,
             query_plan=dict(QUERY_PLAN if plan is None else plan),
         )
@@ -396,3 +413,130 @@ def test_acceptance_rerank_candidate_window_is_capped(monkeypatch):
     assert captured[0]["json"]["top_n"] == RETRIEVAL_RERANK_TOP_N
     assert [item["chunk_id"] for item in trace["rrf"]] == [f"m{index}" for index in range(10)]
     assert [item["chunk_id"] for item in final] == [f"m{index}" for index in range(RETRIEVAL_RERANK_TOP_N)]
+
+
+# ---------------------------------------------------------------------------
+# Real keyword recall (unpatched implementation, real relational store)
+#
+# ``keyword_recall`` reads the relational store, not Milvus, so a Milvus Lite fixture
+# cannot cover it. These cases build the real ``KnowledgeFile`` table in a real SQLite
+# database, insert real rows, and call the implementation itself -- no stub session and
+# no patched ``keyword_recall``. Only the round trip through the model/session layer is
+# shared with the other database-backed tests in this suite.
+# ---------------------------------------------------------------------------
+
+KB = 7
+OTHER_KB = 8
+
+ATTENDANCE = "员工迟到30分钟以内罚款50元；迟到超过30分钟按旷工处理。"
+ASSESSMENT = "考勤制度：上下班迟到早退均计入月度考核。"
+EXPENSE = "报销流程：发票需要在30天内提交。"
+# Longer than the 900-character window, so the splitter must emit a second chunk. The
+# filler has no keyword, and the tail starts exactly at the 720-character step (900 - 180).
+LONG_CHUNK_STEP = 900 - 180
+LONG_HEAD = "迟到超过30分钟按旷工处理。"
+LONG_TAIL = "迟到罚款50元。"
+LONG_FILE = LONG_HEAD + "附" * (LONG_CHUNK_STEP - len(LONG_HEAD)) + LONG_TAIL
+
+
+def _real_knowledge_db(tmp_path):
+    """Real SQLite database holding real ``KnowledgeFile`` rows."""
+    engine = create_engine(
+        f"sqlite:///{(tmp_path / 'keyword-recall.db').as_posix()}",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine, tables=[KnowledgeFile.__table__])
+    db = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)()
+    db.add_all(
+        [
+            KnowledgeFile(knowledge_base_id=KB, name="考勤制度.txt", size=len(ATTENDANCE), content=ATTENDANCE),
+            KnowledgeFile(knowledge_base_id=KB, name="考勤考核.txt", size=len(ASSESSMENT), content=ASSESSMENT),
+            KnowledgeFile(knowledge_base_id=KB, name="报销制度.txt", size=len(EXPENSE), content=EXPENSE),
+            # Same text as 考勤制度.txt, stored under another knowledge base: it must never leak.
+            KnowledgeFile(knowledge_base_id=OTHER_KB, name="他库考勤.txt", size=len(ATTENDANCE), content=ATTENDANCE),
+        ]
+    )
+    db.commit()
+    return db
+
+
+def test_acceptance_real_keyword_recall_reads_the_relational_store(tmp_path):
+    db = _real_knowledge_db(tmp_path)
+
+    chunks = retrieval.keyword_recall(db, KB, ["迟到", "旷工"], RETRIEVAL_ROUTE_TOP_K)
+
+    # Only rows of the requested knowledge base, and only rows whose text matches a keyword.
+    assert [chunk["file_name"] for chunk in chunks] == ["考勤制度.txt", "考勤考核.txt"]
+    assert all(chunk["route"] == "keyword" for chunk in chunks)
+    assert all("他库考勤.txt" != chunk["file_name"] for chunk in chunks)
+
+    # The chunk carries the stored row's identity and its real offset in the stored text.
+    assert chunks[0]["file_id"] > 0
+    assert chunks[0]["chunk_id"] == "0"
+    assert chunks[0]["id"] == f"{chunks[0]['file_id']}_0"
+    assert chunks[0]["content"] == ATTENDANCE
+
+    # Scoring and ordering are the implementation's own: the stronger match comes first.
+    assert chunks[0]["keyword_score"] > chunks[1]["keyword_score"]
+    # ... and it is strong enough to clear the final-selection boost threshold.
+    assert chunks[0]["keyword_score"] >= 10
+
+
+def test_acceptance_real_keyword_recall_chunks_long_text_and_caps_results(tmp_path):
+    db = _real_knowledge_db(tmp_path)
+    db.add(KnowledgeFile(knowledge_base_id=KB, name="长文件.txt", size=len(LONG_FILE), content=LONG_FILE))
+    db.commit()
+
+    chunks = retrieval.keyword_recall(db, KB, ["迟到", "旷工"], RETRIEVAL_ROUTE_TOP_K)
+
+    long_chunks = [chunk for chunk in chunks if chunk["file_name"] == "长文件.txt"]
+    # Chunk ids are the real character offsets produced by the splitter, and the second
+    # chunk really starts at that offset in the stored text.
+    assert [chunk["chunk_id"] for chunk in long_chunks] == ["0", str(LONG_CHUNK_STEP)]
+    assert LONG_FILE[LONG_CHUNK_STEP:] == LONG_TAIL
+    assert long_chunks[1]["content"] == LONG_TAIL
+    # Chunks with no keyword hit are dropped, not returned with a zero score.
+    assert all(chunk["keyword_score"] > 0 for chunk in chunks)
+
+    # ``top_k`` caps the real result list, and blank keywords never reach the store.
+    assert len(retrieval.keyword_recall(db, KB, ["迟到", "旷工"], 1)) == 1
+    assert retrieval.keyword_recall(db, KB, [], RETRIEVAL_ROUTE_TOP_K) == []
+    assert retrieval.keyword_recall(db, KB, ["   "], RETRIEVAL_ROUTE_TOP_K) == []
+    assert retrieval.keyword_recall(db, OTHER_KB, ["旷工"], RETRIEVAL_ROUTE_TOP_K) != []
+
+
+def test_acceptance_retrieve_knowledge_uses_the_real_keyword_recall(tmp_path, monkeypatch):
+    """One path from plan to final context with the unpatched keyword recall.
+
+    Only the vector routes and the rerank transport are stubbed; the keyword route runs
+    the real implementation against the real database, and its strongest chunk has to
+    survive fusion and rerank to reach the final context.
+    """
+    db = _real_knowledge_db(tmp_path)
+    monkeypatch.setattr(retrieval, "query_vectors", lambda *args, **kwargs: [])
+
+    def only_assessment(request):
+        documents = request["json"]["documents"]
+        assert documents == [ATTENDANCE, ASSESSMENT]
+        return {"output": {"results": [{"index": 1, "relevance_score": 0.8}]}}
+
+    captured = _install_rerank_transport(monkeypatch, only_assessment)
+
+    final, trace = _retrieve(db=db)
+
+    keyword_route = next(item for item in trace["routes"] if item["route"] == "keyword")
+    assert keyword_route["count"] == 2
+    assert [item["file_name"] for item in keyword_route["items"]] == ["考勤制度.txt", "考勤考核.txt"]
+
+    # The real database content is what the reranker receives, already in the order the
+    # real keyword scores gave the fused list.
+    assert captured[0]["json"]["documents"] == [ATTENDANCE, ASSESSMENT]
+    assert [item["chunk_id"] for item in trace["rrf"]] == ["0", "0"]
+
+    # The reranker only kept the second document, so the prepended first element is the
+    # real keyword chunk that the keyword route produced from the database.
+    assert [item["file_name"] for item in final] == ["考勤制度.txt", "考勤考核.txt"]
+    assert final[0]["content"] == ATTENDANCE
+    assert final[0]["keyword_score"] >= 10
+    assert final[1]["rerank_score"] == pytest.approx(0.8)

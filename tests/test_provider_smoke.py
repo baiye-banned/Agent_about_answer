@@ -119,6 +119,11 @@ def _embedding_payload(count):
 
 
 def test_embedding_request_contract_and_vectors(monkeypatch, caplog):
+    # The embedding timeout is configuration (config.EMBEDDING_TIMEOUT_SECONDS), read at call time
+    # through the milvus_client module global. Pinning a value that matches neither the config
+    # default nor any hard-coded literal keeps the assertion below falsifiable: a client built
+    # from a stale constant goes red here instead of passing by coincidence.
+    monkeypatch.setattr(milvus_client, "EMBEDDING_TIMEOUT_SECONDS", 12)
     calls = _install_embedding_client(monkeypatch, lambda count: _Response(_embedding_payload(count)))
 
     with caplog.at_level(logging.WARNING, logger=milvus_client.__name__):
@@ -137,7 +142,10 @@ def test_embedding_request_contract_and_vectors(monkeypatch, caplog):
         "dimensions": milvus_client.EMBEDDING_DIM,
     }
     assert call["headers"]["Authorization"] == "Bearer test-embedding-key"
-    assert call["timeout"] == 60
+    # Follow the configured timeout instead of a literal: the client must use whatever
+    # EMBEDDING_TIMEOUT_SECONDS currently holds, so the deployed value can be tuned without
+    # this contract test going stale (and a hard-coded value elsewhere still fails here).
+    assert call["timeout"] == milvus_client.EMBEDDING_TIMEOUT_SECONDS
     assert caplog.text == ""
 
 
