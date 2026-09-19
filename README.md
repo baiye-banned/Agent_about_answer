@@ -479,6 +479,7 @@ HTTPS 部署后需要检查：
 │   └── service/                 # 业务服务
 ├── docs/                        # 架构和流程文档
 ├── tests/                       # Node 和 pytest 回归测试
+│   └── e2e/                     # Playwright 浏览器验收（用例 / 夹具 / 模型桩服务）
 ├── package.json
 ├── pytest.ini
 └── backend/requirements.txt
@@ -515,7 +516,7 @@ npm run build
 
 ### CI（GitHub Actions）
 
-向 `develop`、`main` 提 PR，以及 push 到 `develop` 时会自动跑下面四个独立检查。同一分支连续 push 时，上一次还在跑的运行会被自动取消（各 workflow 内的 `concurrency`）。
+向 `develop`、`main` 提 PR，以及 push 到 `develop` 时会自动跑下面五个独立检查。同一分支连续 push 时，上一次还在跑的运行会被自动取消（各 workflow 内的 `concurrency`）。
 
 | Workflow | 检查项 | 内容 |
 | --- | --- | --- |
@@ -523,12 +524,64 @@ npm run build
 | `.github/workflows/frontend-tests.yml` | 前端测试 node --test (Node 22) | `npm ci` 后跑 `npm test` |
 | `.github/workflows/build.yml` | 前端构建 vite build (Node 22) | `npm run build`，产物 `dist/` 上传为 artifact |
 | `.github/workflows/static-checks.yml` | 静态检查 (最低档) | 后端 `python -m compileall` + `ruff check --select E9,F63,F7,F82`；前端 `node --check src/**/*.js` |
+| `.github/workflows/e2e.yml` | 端到端验收 Playwright e2e (chromium) | 起 MySQL 8.0 服务容器 + 本地模型桩（`tests/e2e/stub_llm_server.py`，替掉全部模型上游）→ 构建前端并以 `vite preview` 托管 → 真实浏览器跑 `tests/e2e/chat.spec.mjs` → 截图与各服务日志上传为 artifact |
 
 说明：
 
 - 静态检查目前只拦语法错误、未定义名等确定性错误，**不是**完整规范；为什么不直接开 `ruff --select E,F` 以及后续怎么加严，写在 `static-checks.yml` 顶部注释里。
-- 四个 workflow 都是 `permissions: contents: read`，不配置任何密钥，也不使用 `continue-on-error`：失败就是失败。
+- 五个 workflow 都是 `permissions: contents: read`，不配置任何密钥，也不使用 `continue-on-error`：失败就是失败。
 - 后端测试只需 `backend/requirements.txt` + `pytest`；RAGAS 等可选评估依赖是延迟导入，CI 不安装。
+- e2e 不需要任何真实密钥：模型上游由仓库内的桩服务顶替，元数据库是一次性容器，`SECRET_KEY` 每次运行现场生成（写进仓库等于提交一个可用密钥）。审批用的占位口令只对本次运行的临时容器有效。
+
+### 端到端验收（e2e）
+
+`tests/e2e/chat.spec.mjs` 用真实浏览器走一遍主干：登录 → 新建知识库 → 上传资料 → 提问 → 观察流式作答 → 展开参考资料核对引用。它打的是**构建产物**（`vite build` + `vite preview`）而不是 dev server，后端连的也是真实 MySQL 与向量库，所以前端渲染、HTTP 接口、检索与 SSE 都在验收范围内。
+
+唯一的替身是模型上游：`tests/e2e/stub_llm_server.py` 是只依赖标准库的 OpenAI 兼容服务，返回固定文本与确定性向量。它不替后端检索，也不替前端渲染——链路里任何一环断掉，用例都会失败，而不是被桩兜住。
+
+本地跑一遍（下列命令分四个终端）：
+
+```bash
+# 0) 只装 chromium：CI 里也只装这一个浏览器，本地与 CI 的结论才对得上
+npx playwright install chromium
+
+# 1) 模型桩服务
+python tests/e2e/stub_llm_server.py --port 8899 --dim 1024 \
+  --chunk-delay-ms 700 --chunk-size 8
+```
+
+```bash
+# 2) 后端：上游全部指向桩，MySQL / 向量库用本地实例
+cd backend
+export MYSQL_HOST=127.0.0.1 MYSQL_PORT=<端口> MYSQL_USER=<用户> \
+  MYSQL_PASSWORD=<口令> MYSQL_DATABASE=<库名>
+export SECRET_KEY="$(openssl rand -hex 32)"
+export DEEPSEEK_BASE_URL=http://127.0.0.1:8899/v1 DEEPSEEK_API_KEY=<任意非空占位值>
+export TEXT_FALLBACK_BASE_URL=http://127.0.0.1:8899/v1 TEXT_FALLBACK_API_KEY=<同上>
+export EMBEDDING_BASE_URL=http://127.0.0.1:8899/v1 EMBEDDING_API_KEY=<同上>
+export EMBEDDING_DIM=1024
+export RERANK_BASE_URL=http://127.0.0.1:8899/v1/reranks RERANK_API_KEY=<同上>
+export VISION_BASE_URL=http://127.0.0.1:8899/v1 VISION_API_KEY=<同上>
+export SEED_DEFAULT_USERS=true SEED_DEMO_PASSWORD=<与下面的 E2E_PASSWORD 一致>
+python -m uvicorn main:app --host 127.0.0.1 --port 8002
+```
+
+```bash
+# 3) 前端：构建期固化后端绝对地址（preview 不复用 vite.config.js 的 dev 代理），再托管产物
+#    末尾的 /api 与 dev 代理的目标一致：后端路由本身挂在 /api 下，前端请求 `${base}/chat/...`
+VITE_API_BASE_URL=http://127.0.0.1:8002/api npm run build
+npm run preview -- --port 4173 --strictPort --host 127.0.0.1
+```
+
+```bash
+# 4) 跑用例
+E2E_BASE_URL=http://127.0.0.1:4173 E2E_USERNAME=demo \
+  E2E_PASSWORD=<与 SEED_DEMO_PASSWORD 一致> npm run test:e2e
+```
+
+产物落在 `tests/e2e/artifacts/`（截图、trace、HTML 报告，已 gitignore）：`npx playwright show-report tests/e2e/artifacts/report` 可回看，截图也挂在测试报告的每一步上。
+
+CI 与本地唯一的环境差异是各服务的地址由 `.github/workflows/e2e.yml` 注入；用例本身不感知环境，也不做 `if (CI)` 分支。
 
 ## 协作与提交规范
 
