@@ -546,7 +546,7 @@ flowchart LR
 | `openSources()` | 方法 | 打开来源 drawer |
 | `hasTrace()` / `openTrace()` | 方法 | 打开 Trace 弹层 |
 | `normalizeTrace()` | 方法 | 规范化 trace |
-| `formatJson()` / `stringifyBrief()` / `formatScore()` | 方法 | Trace / 分数展示 |
+| `formatJson()` / `formatScore()` | 方法 | Trace / 分数展示（`formatJson()` 与 `formatScore()` 从 `@/utils` 引入；`stringifyBrief()` 定义在 `src/components/TraceVariableFlow.vue:442`，不在本文件） |
 | `ragasStatusText()` / `ragasStatusClass()` | 方法 | RAGAS 状态展示 |
 | `shouldShowImageAnalysisWarning()` / `imageAnalysisWarningText()` | 方法 | 图片分析提示 |
 | `refreshKnowledgeBases()` / `syncSelectedKnowledgeBase()` / `changeKnowledgeBase()` | 方法 | 知识库同步 |
@@ -726,7 +726,7 @@ flowchart LR
 | `_mark_message()` | 方法 | 写回 message 的评估状态 |
 | `_format_metric_errors()` | 方法 | 格式化部分失败信息 |
 | `_friendly_error()` | 方法 | 异常转中文错误 |
-| `openai_base_url()` | 方法 | OpenAI 兼容 base_url |
+| `openai_base_url()` | 方法 | OpenAI 兼容 base_url（定义在 `backend/rag/llm.py:30`，本文件 `:25` 引入后用于 embedding 与 DeepSeek 客户端） |
 | `_prepare_contexts()` | 方法 | 上下文裁剪 |
 | `_truncate_text()` | 方法 | 文本裁剪 |
 
