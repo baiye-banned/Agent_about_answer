@@ -102,6 +102,7 @@ embedding function is replaced, with a deterministic offline implementation).
 - `test_acceptance_delete_removes_only_target_file` - deleting one file leaves the other files of the same knowledge base searchable.
 - `test_acceptance_index_rebuild_restores_recall_without_duplicates` - `rebuild_existing_knowledge_index()` rebuilds a deleted index with the same chunk count and the same recall result.
 - `test_acceptance_query_window_and_missing_collection` - `top_k` window behavior, blank query, missing collection, and a knowledge base with no data.
+- `test_acceptance_round_trip_survives_a_dead_proxy_environment` - the round trip stays green in a child process whose proxy variables point at a dead port, so a proxy setting cannot masquerade as a Milvus failure.
 
 ### Goal 3 - Retrieval acceptance (`tests/test_retrieval_acceptance.py`)
 
