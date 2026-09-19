@@ -57,8 +57,9 @@ def get_fallback_knowledge_base(db: Session, deleted_id: int, user_id: int) -> K
 def list_files_for_knowledge_base(db: Session, kid: int) -> list[KnowledgeFile]:
     """知识库下的全部文件。
 
-    知识库自身没有 user_id 维度，调用方必须先用 get_knowledge_base(db, kid, user_id)
-    校验归属；删除知识库时需要清空其下所有文件，否则外键会悬挂。
+    按知识库 id 取，不再叠加 user_id 过滤：文件既可能带 user_id，也可能是回填前的历史行。
+    调用方必须先用 get_knowledge_base(db, kid, user_id) 校验归属；删除知识库时需要清空
+    其下所有文件，否则外键会悬挂。
     """
     return db.query(KnowledgeFile).filter_by(knowledge_base_id=kid).all()
 
@@ -111,10 +112,14 @@ def delete_knowledge_base_with_files(
     if not entry:
         return None
     owner_id = entry.user_id
-    for conversation in db.query(Conversation).filter_by(knowledge_base_id=kid).all():
-        conversation.knowledge_base_id = fallback_id if conversation.user_id == owner_id else None
+    conversations = db.query(Conversation).filter_by(knowledge_base_id=kid).all()
     for file_entry in list_files_for_knowledge_base(db, kid):
         db.delete(file_entry)
     db.delete(entry)
+    # 必须先 flush 掉删除：SQLAlchemy 删除知识库时会把已加载会话的 knowledge_base_id 置空，
+    # 若在删除前改绑，赋值会被这次置空覆盖（生产 SessionLocal 的 autoflush=False 下尤为明显）。
+    db.flush()
+    for conversation in conversations:
+        conversation.knowledge_base_id = fallback_id if conversation.user_id == owner_id else None
     db.commit()
     return entry

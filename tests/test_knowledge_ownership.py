@@ -3,6 +3,7 @@
 每个用例都让 bob 去访问 alice 的资源，期望得到 404（而不是 403），
 以免通过状态码差异判断资源是否存在。
 """
+import asyncio
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,9 +19,10 @@ from sqlalchemy.pool import StaticPool
 
 from database import session as db_session
 from database.session import Base
-from model.models import Conversation, KnowledgeBase, KnowledgeFile, User
+from model.models import Conversation, KnowledgeBase, KnowledgeFile, Message, User
 from router import auth as auth_router
 from router import knowledge as knowledge_router
+from schema.schemas import ChatRequest
 from service import auth_service, knowledge_service
 
 
@@ -51,8 +53,10 @@ def api(monkeypatch):
             KnowledgeBase.__table__,
             KnowledgeFile.__table__,
             Conversation.__table__,
+            Message.__table__,
         ],
     )
+    # autoflush=False 与生产 SessionLocal 保持一致：聊天/删除链路的行为不能只在 autoflush 打开时成立。
     TestingSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
     db = TestingSession()
 
@@ -365,3 +369,120 @@ def test_backfill_script_reports_conflicts_and_can_rename(api):
     renamed = api.db.query(KnowledgeBase).filter_by(id=legacy_base.id).first()
     assert renamed.user_id == api.alice.id
     assert renamed.name == f"legacy-kb-{legacy_base.id}"
+
+
+def test_deleting_knowledge_base_rebinds_only_owner_conversations(api):
+    """删除知识库：本人会话改绑到兜底库，他人会话只解除绑定（生产 autoflush=False 下也必须成立）。"""
+    from crud import knowledge_base as crud_knowledge_base
+
+    fallback = KnowledgeBase(name="alice-fallback")
+    fallback.user_id = api.alice.id
+    api.db.add(fallback)
+    api.db.commit()
+
+    own = Conversation(user_id=api.alice.id, title="alice-own", knowledge_base_id=api.alice_base.id)
+    foreign = Conversation(user_id=api.bob.id, title="bob-stolen", knowledge_base_id=api.alice_base.id)
+    api.db.add_all([own, foreign])
+    api.db.commit()
+
+    deleted, target = crud_knowledge_base.delete_knowledge_base(api.db, api.alice_base.id, api.alice.id)
+    api.db.expire_all()
+
+    assert deleted.id == api.alice_base.id
+    assert target.id == fallback.id
+    assert api.db.query(Conversation).filter_by(id=own.id).first().knowledge_base_id == fallback.id
+    assert api.db.query(Conversation).filter_by(id=foreign.id).first().knowledge_base_id is None
+    assert api.db.query(KnowledgeFile).filter_by(id=api.alice_file.id).first() is None
+    assert api.db.query(KnowledgeBase).filter_by(id=api.alice_base.id).first() is None
+
+
+class _FakeChatTrace:
+    """聊天链路只用到 trace 的这几个方法，测试里不落库。"""
+
+    def __init__(self, user_id=None):
+        self.user_id = user_id
+        self.trace_id = "trace-test"
+
+    def add(self, *_args, **_kwargs):
+        pass
+
+    def attach(self, **_kwargs):
+        pass
+
+    def finish(self, *_args, **_kwargs):
+        pass
+
+    def snapshot(self):
+        return {"trace_id": self.trace_id, "events": []}
+
+
+async def _collect_stream(iterator):
+    chunks = []
+    async for chunk in iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+    return "".join(chunks)
+
+
+def _run_stream_chat(api, monkeypatch, username, conversation_id):
+    """跑一次真实会话的聊天流（模型与检索短路），返回本次实际使用的知识库 id。"""
+    from service import chat_service
+
+    used_knowledge_bases = []
+
+    async def fake_build_effective_question(question, attachments):
+        return question, {"status": "skipped"}
+
+    async def fake_recent_memory_text(*_args, **_kwargs):
+        return ""
+
+    async def fake_decide_need_rag(*_args, **_kwargs):
+        return {"need_rag": True, "route": "rag", "confidence": 1.0, "reason": "test"}
+
+    async def fake_retrieve_knowledge(question, knowledge_base_id, db, trace_recorder=None):
+        used_knowledge_bases.append(knowledge_base_id)
+        return [], {}
+
+    async def fake_stream_rag_answer(*_args, **_kwargs):
+        yield "回答"
+
+    monkeypatch.setattr(chat_service, "SessionLocal", lambda: api.db)
+    monkeypatch.setattr(chat_service, "decode_token", lambda authorization: username)
+    monkeypatch.setattr(chat_service, "TraceRecorder", _FakeChatTrace)
+    monkeypatch.setattr(chat_service, "_build_effective_question", fake_build_effective_question)
+    monkeypatch.setattr(chat_service, "_build_recent_memory_text", fake_recent_memory_text)
+    monkeypatch.setattr(chat_service, "_build_memory_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        chat_service, "_build_memory_aware_retrieval_question", lambda question, memory_context: question
+    )
+    monkeypatch.setattr(chat_service, "decide_need_rag", fake_decide_need_rag)
+    monkeypatch.setattr(chat_service, "retrieve_knowledge", fake_retrieve_knowledge)
+    monkeypatch.setattr(chat_service, "stream_rag_answer", fake_stream_rag_answer)
+    monkeypatch.setattr(chat_service, "_trace_sse_payloads", lambda trace: [])
+    monkeypatch.setattr(chat_service, "_build_sources", lambda chunks: [])
+    monkeypatch.setattr(chat_service, "_attach_grounding_trace", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat_service, "_safe_trace_attach", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat_service, "_safe_trace_finish", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat_service, "_schedule_memory_summary_update", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat_service, "schedule_ragas_evaluation", lambda *args, **kwargs: None)
+
+    response = asyncio.run(
+        chat_service.stream_chat(
+            ChatRequest(question="迟到怎么处理", conversation_id=conversation_id, authorization="Bearer token")
+        )
+    )
+    asyncio.run(_collect_stream(response.body_iterator))
+    return used_knowledge_bases
+
+
+def test_chat_reuses_only_own_knowledge_base_binding(api, monkeypatch):
+    stolen = Conversation(user_id=api.bob.id, title="bob-stolen", knowledge_base_id=api.alice_base.id)
+    own = Conversation(user_id=api.alice.id, title="alice-own", knowledge_base_id=api.alice_base.id)
+    api.db.add_all([stolen, own])
+    api.db.commit()
+
+    used = _run_stream_chat(api, monkeypatch, "bob", stolen.id)
+    api.db.expire_all()
+    bob_default = api.db.query(KnowledgeBase).filter_by(user_id=api.bob.id).one()
+    assert used == [bob_default.id]
+
+    assert _run_stream_chat(api, monkeypatch, "alice", own.id) == [api.alice_base.id]

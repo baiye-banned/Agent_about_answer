@@ -1,8 +1,12 @@
+import logging
+
 from sqlalchemy import create_engine
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
 from config import DATABASE_URL, MYSQL_CONNECT_ARGS
+
+logger = logging.getLogger(__name__)
 
 engine = create_engine(DATABASE_URL, connect_args=MYSQL_CONNECT_ARGS, pool_pre_ping=True, pool_recycle=3600)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -243,7 +247,7 @@ def _ensure_knowledge_base_owner_unique_index():
                 )
     except Exception:
         # 迁移失败不阻塞启动；即使仍是旧的全局唯一索引，归属过滤依然生效。
-        pass
+        logger.warning("Failed to switch knowledge_bases to a per-owner unique index", exc_info=True)
 
 
 def _get_mysql_column_info(table_name: str, column_name: str):
@@ -281,6 +285,17 @@ def _ensure_default_knowledge_base():
             db.add(default_base)
             db.commit()
             db.refresh(default_base)
+
+        # 只把悬挂引用挂到「无归属」的历史全局默认库上：knowledge_bases 里的库一旦有归属，
+        # 把别人的会话/文件改绑过去就是跨用户写入，宁可留空（聊天会按用户重新解析默认库，
+        # 无归属文件继续不可见并由 scripts/backfill_knowledge_owner.py 回填）。
+        if default_base.user_id is not None:
+            logger.warning(
+                "Skip rebinding orphan rows: knowledge base %s already belongs to user %s",
+                default_base.id,
+                default_base.user_id,
+            )
+            return
 
         default_id = default_base.id
         with engine.begin() as conn:
