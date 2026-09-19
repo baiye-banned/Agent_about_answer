@@ -52,12 +52,32 @@ bash scripts/scan_secrets.sh
 
 - 优先改成不触发规则的形式，例如把示例值写成明显的占位串（`your-api-key-here`、
   `example-token`）或从代码里挪进 `.env.example`；
-- 确需保留某个看起来像密钥的样例值时，在仓库根目录的 `.gitleaks.toml` 里做
-  **精确豁免**（只豁免该路径或该条规则，例如把样例文件放进 `paths` allowlist），
-  并在提交信息里说明原因；
+- 占位词表（内建扫描「像配置不像凭据」的判定依据）含 `none`、`change-me*`、`your-*`、
+  `replace-*`、`placeholder*`、`example*`、`sample*`、`dummy*`、`fake*`、`testkey*`、
+  `test-only*`、`not-set*`、`xxxx*` 等。扩大词表等于放宽判定，必须说明为什么不会漏掉
+  真实密钥（例如 `test-only` 前缀的长随机值只在测试里出现，且真实密钥不会这样命名）；
+- 只有**变量名或取值语义**像密钥、实际是测试夹具/标签常量的行，才在行尾加内联标记：
+
+  ```python
+  MODE_LABEL = "env"  # scan-secrets:allow source label, not a credential
+  ```
+
+  标记必须带非空理由（`# scan-secrets:allow <理由>`），且**只**豁免该行的
+  `[credential assignment]`（赋值启发式）命中：`sk-` 长串、`AKIA`+16 位大写、
+  `ghp_` 长串、`-----BEGIN ... PRIVATE KEY-----` 头都是按**形态**匹配的，任何标记都
+  豁免不了，所以标记无法用来藏起这些形态的凭据。扫描每次都会打印被豁免的行清单
+  （`N line(s) exempted ...` 后面跟着 `文件:行号`），豁免在 CI 日志里可见而非静默，
+  评审时与它豁免的代码在同一份 diff 里一起审。**禁止**用标记掩盖真密钥或提交无关代码；
+- 内建扫描把 `KEY == 其它值` 当比较而不是赋值（`==` 的第一个 `=` 属于比较运算符），
+  因此这类行不再产生赋值命中；它的字面量仍由下面 gitleaks 的熵规则覆盖；
+- 形态类命中（`sk-` 之类标记豁免不了的）确需保留样例时，在仓库根目录的
+  `.gitleaks.toml` 里做**精确豁免**（只豁免该路径或该条规则，例如把样例文件放进
+  `paths` allowlist），并在提交信息里说明原因；
 - **禁止**整体关闭某条规则、禁止 `--no-git`/`--patterns-only` 之类跳过扫描的做法
   进入 CI（`--patterns-only` 只用于本地快速自查）；
-- 当前仓库无误报，因此暂未提供 `.gitleaks.toml`；一旦需要豁免，按上面三条添加。
+- 当前仓库没有 `.gitleaks.toml`，有 6 行使用上面的内联标记：
+  `backend/config.py` 的 3 个来源标签常量、`tests/test_knowledge_ownership.py` 的
+  3 行内存测试夹具（见 issue #36）；再有新增时按本节约定处理。
 
 ## 提交信息
 
