@@ -21,6 +21,32 @@ const EMPTY_VALUES = [
   'ok',
   '_no response_',
 ];
+// 占位文本可以带标点、写成多行或列表项（`暂无。`、`- 无`、`TODO（待补充）`），
+// 比对前统一去掉标点与空白，否则多加一个句号就能绕过去。长词优先，避免被短词先切走。
+const PUNCTUATION = /[\s　。．.!！?？~～、,，;；:：\-—_*`#（）()【】\[\]「」『』“”‘’"'…·|｜/\\]+/g;
+const stripPunctuation = (text) => text.replace(PUNCTUATION, '').toLowerCase();
+const PLACEHOLDER_WORDS = EMPTY_VALUES.map(stripPunctuation)
+  .filter((word) => word.length > 0)
+  .sort((a, b) => b.length - a.length);
+// 实质字符：汉字、字母、数字。emoji 与纯符号不算，避免「🐛✨📝」凑够长度。
+const SUBSTANTIVE = /[\p{L}\p{N}]/u;
+
+// 整段内容由占位词拼成（`- 无`、`无 待补充`、`TODO（待补充）`）就算空：
+// 逐个抠掉占位词后什么都不剩才算占位，因此「无 UI 变更」这类真实内容不会被误杀。
+function isOnlyPlaceholders(normalized) {
+  let rest = normalized;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const word of PLACEHOLDER_WORDS) {
+      if (rest.includes(word)) {
+        rest = rest.split(word).join('');
+        changed = true;
+      }
+    }
+  }
+  return rest.length === 0;
+}
 
 const RULES = {
   BUG: {
@@ -95,16 +121,28 @@ function parseSections(markdown) {
   });
 }
 
+// 清掉空勾选项、残留标题与围栏标记后，判断正文是否算「有实际内容」。
+// 围栏内的行原样保留：日志块即使整段以 # 开头也是真实内容。
 function cleanContent(content) {
-  return content
-    .replace(/^\s*#{1,6}\s+.*$/gm, '')
-    .replace(/^\s*```.*$/gm, '')
-    .replace(/^\s*[-*]\s*\[[ xX]\]\s*$/gm, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const kept = [];
+  let fence = null;
+  for (const line of content.split(/\r?\n/)) {
+    const fenceMark = line.match(/^\s*(```|~~~)/);
+    if (fenceMark) {
+      if (fence === null) fence = fenceMark[1];
+      else if (fence === fenceMark[1]) fence = null;
+      continue;
+    }
+    if (fence === null) {
+      if (/^\s*#{1,6}\s+.*$/.test(line)) continue;
+      if (/^\s*[-*]\s*\[[ xX]\]\s*$/.test(line)) continue;
+    }
+    kept.push(line);
+  }
+  return kept.join(' ').replace(/\s+/g, ' ').trim();
 }
 
-// 占位内容即使写成列表项（`- 无`、`1. 无`）也算空；
+// 占位内容即使写成列表项（`- 无`、`1. 无`）、多行（`- 无` + `- 待补充`）或带标点（`暂无。`）也算空；
 // 长度按码点算，避免两个字符的 emoji 凑够 UTF-16 长度蒙混过关。
 function isFilled(content) {
   const cleaned = cleanContent(content)
@@ -112,7 +150,10 @@ function isFilled(content) {
     .replace(/\s+/g, ' ')
     .trim();
   if ([...cleaned].length < MIN_LENGTH) return false;
-  return !EMPTY_VALUES.includes(cleaned.toLowerCase());
+  if (!SUBSTANTIVE.test(cleaned)) return false;
+  const normalized = stripPunctuation(cleaned);
+  if (normalized.length === 0) return false;
+  return !isOnlyPlaceholders(normalized);
 }
 
 const file = process.argv[2];

@@ -20,11 +20,37 @@ const EMPTY_VALUES = [
   'ok',
   '_no response_',
 ];
+// 占位文本可以带标点、写成多行或列表项（`暂无。`、`- 无`、`TODO（待补充）`），
+// 比对前统一去掉标点与空白，否则多加一个句号就能绕过去。长词优先，避免被短词先切走。
+const PUNCTUATION = /[\s　。．.!！?？~～、,，;；:：\-—_*`#（）()【】\[\]「」『』“”‘’"'…·|｜/\\]+/g;
+const stripPunctuation = (text) => text.replace(PUNCTUATION, '').toLowerCase();
+const PLACEHOLDER_WORDS = EMPTY_VALUES.map(stripPunctuation)
+  .filter((word) => word.length > 0)
+  .sort((a, b) => b.length - a.length);
+// 实质字符：汉字、字母、数字。emoji 与纯符号不算，避免「🐛✨📝」凑够长度。
+const SUBSTANTIVE = /[\p{L}\p{N}]/u;
+
+// 整段内容由占位词拼成（`- 无`、`无 待补充`、`TODO（待补充）`）就算空：
+// 逐个抠掉占位词后什么都不剩才算占位，因此「无 UI 变更」这类真实内容不会被误杀。
+function isOnlyPlaceholders(normalized) {
+  let rest = normalized;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const word of PLACEHOLDER_WORDS) {
+      if (rest.includes(word)) {
+        rest = rest.split(word).join('');
+        changed = true;
+      }
+    }
+  }
+  return rest.length === 0;
+}
 
 const REQUIRED_SECTIONS = [
   { key: '类型', label: '类型', kind: 'checkbox' },
   { key: '变更概述', label: '变更概述', kind: 'text' },
-  { key: '背景问题', label: '背景·问题', kind: 'text' },
+  { key: '背景问题', label: '背景·问题', kind: 'text', aliases: ['背景与问题'] },
   { key: '关联issue', label: '关联 issue', kind: 'issueLink' },
   { key: '变更内容', label: '变更内容', kind: 'text' },
   { key: '日志验证证据', label: '日志·验证证据', kind: 'text' },
@@ -41,6 +67,20 @@ const IMAGE_PATTERNS = [
   /https?:\/\/github\.com\/user-attachments\/assets\/\S+/i, // GitHub 附件
   /https?:\/\/\S*(user-images|private-user-images)\S*/i, // GitHub 图床
 ];
+
+// COMMIT_CONVENTION.md「关联 issue 节须含 #编号 或写明「无关联 issue」及原因」：
+// 只写短语本身不算，短语之外还要剩下至少 REASON_MIN_LENGTH 个非占位实质字符（即原因）。
+// 容忍「无关联的 issue」这类自然写法。
+const NO_ISSUE_PHRASE = /(?:无|没有|不涉及|无需|未有|不存在)\s*关联\s*(?:的)?\s*issue/gi;
+const REASON_MIN_LENGTH = 3;
+
+function declaresNoIssueWithReason(content) {
+  const stripped = content.replace(NO_ISSUE_PHRASE, ' ');
+  if (stripped === content) return false;
+  const reason = stripPunctuation(stripped);
+  if (!SUBSTANTIVE.test(reason)) return false;
+  return [...reason].length >= REASON_MIN_LENGTH && !isOnlyPlaceholders(reason);
+}
 
 function fail(problems) {
   console.error('[FAIL] PR 描述校验未通过');
@@ -103,25 +143,43 @@ function parseSections(markdown) {
   });
 }
 
-function findSection(sections, key) {
-  return (
-    sections.find((section) => section.normalized === key) ||
-    sections.find((section) => section.normalized.includes(key)) ||
-    null
-  );
+// 小节标题匹配：先按 key 与别名精确匹配，再退化为包含匹配（容忍「背景与问题」这类写法）。
+function findSection(sections, required) {
+  const keys =
+    typeof required === 'string' ? [required] : [required.key, ...(required.aliases ?? [])];
+  for (const key of keys) {
+    const exact = sections.find((section) => section.normalized === key);
+    if (exact) return exact;
+  }
+  for (const key of keys) {
+    const partial = sections.find((section) => section.normalized.includes(key));
+    if (partial) return partial;
+  }
+  return null;
 }
 
-// 清掉空勾选项、代码围栏、残留标题后，判断正文是否算「有实际内容」。
+// 清掉空勾选项、残留标题与围栏标记后，判断正文是否算「有实际内容」。
+// 围栏内的行原样保留：日志块即使整段以 # 开头也是真实内容。
 function cleanContent(content) {
-  return content
-    .replace(/^\s*#{1,6}\s+.*$/gm, '')
-    .replace(/^\s*```.*$/gm, '')
-    .replace(/^\s*[-*]\s*\[[ xX]\]\s*$/gm, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const kept = [];
+  let fence = null;
+  for (const line of content.split(/\r?\n/)) {
+    const fenceMark = line.match(/^\s*(```|~~~)/);
+    if (fenceMark) {
+      if (fence === null) fence = fenceMark[1];
+      else if (fence === fenceMark[1]) fence = null;
+      continue;
+    }
+    if (fence === null) {
+      if (/^\s*#{1,6}\s+.*$/.test(line)) continue;
+      if (/^\s*[-*]\s*\[[ xX]\]\s*$/.test(line)) continue;
+    }
+    kept.push(line);
+  }
+  return kept.join(' ').replace(/\s+/g, ' ').trim();
 }
 
-// 占位内容即使写成列表项（`- 无`、`1. 无`）也算空；
+// 占位内容即使写成列表项（`- 无`、`1. 无`）、多行（`- 无` + `- 待补充`）或带标点（`暂无。`）也算空；
 // 长度按码点算，避免两个字符的 emoji 凑够 UTF-16 长度蒙混过关。
 function isFilled(content) {
   const cleaned = cleanContent(content)
@@ -129,7 +187,10 @@ function isFilled(content) {
     .replace(/\s+/g, ' ')
     .trim();
   if ([...cleaned].length < MIN_LENGTH) return false;
-  return !EMPTY_VALUES.includes(cleaned.toLowerCase());
+  if (!SUBSTANTIVE.test(cleaned)) return false;
+  const normalized = stripPunctuation(cleaned);
+  if (normalized.length === 0) return false;
+  return !isOnlyPlaceholders(normalized);
 }
 
 const file = process.argv[2];
@@ -152,7 +213,7 @@ const sections = parseSections(body);
 const problems = [];
 
 for (const required of REQUIRED_SECTIONS) {
-  const section = findSection(sections, required.key);
+  const section = findSection(sections, required);
   if (!section) {
     problems.push(`缺少「${required.label}」节。`);
     continue;
@@ -166,11 +227,9 @@ for (const required of REQUIRED_SECTIONS) {
   if (required.kind === 'issueLink') {
     // 模板预填的裸 "Closes #" 不算关联：必须有 issue 编号，或写明无关联及原因。
     const hasIssueRef = /#\d+/.test(section.content);
-    const declaresNone =
-      isFilled(section.content) && /(无|没有|不涉及|无需)\s*关联\s*issue/i.test(section.content);
-    if (!hasIssueRef && !declaresNone) {
+    if (!hasIssueRef && !declaresNoIssueWithReason(section.content)) {
       problems.push(
-        `「${required.label}」节既没有「#编号」形式的 issue 引用，也没有写明「无关联 issue」及原因。`
+        `「${required.label}」节既没有「#编号」形式的 issue 引用，也没有写明「无关联 issue」及原因（原因至少 ${REASON_MIN_LENGTH} 个字符）。`
       );
     }
     continue;
