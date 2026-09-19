@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from config import REBUILD_KNOWLEDGE_INDEX_ON_STARTUP
+from config import REBUILD_KNOWLEDGE_INDEX_ON_STARTUP, ensure_secret_key_configured
 from database.session import init_db
 from paths import UPLOAD_DIR, AVATAR_DIR
 from router.auth import router as auth_router
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    ensure_secret_key_configured()
     init_db()
     seed_default_users()
     if REBUILD_KNOWLEDGE_INDEX_ON_STARTUP:
