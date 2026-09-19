@@ -481,6 +481,14 @@ npm run build
 
 当前 Vite 构建可能出现 `Chat` chunk 体积较大的提示，这是 bundle size 提醒，不代表构建失败。
 
+## 分支与发布
+
+- `main` 是发布分支，只接受来自 `develop` 的发布 PR 和紧急热修复；`develop` 是集成分支，日常改动都提到这里。
+- 短分支从 `develop` 切出，命名为 `<type>/<topic>-<issue号>`，合入后删除；一律通过 PR 合入，不直接 push 公共分支。
+- 合并方式：日常 PR 用 squash；发布 PR 和 `main → develop` 回同步 PR 用 merge commit（否则回同步会反复重现）。
+- 发布：手动运行 `Release` 工作流（输入版本号）→ 评审并合并发布 PR 到 `main` → 手动打 tag；合并到 `main` 后 `Sync main into develop` 会自动开回同步 PR。
+- 完整约定（分支命名、发布步骤、门禁、已知限制）见 [BRANCHING.md](BRANCHING.md)。
+
 ## 安全说明
 
 - `.env`、本地数据库、上传文件、日志、PID 文件、缓存、`node_modules` 和构建产物都应加入 Git 忽略规则。
