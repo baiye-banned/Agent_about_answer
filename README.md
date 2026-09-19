@@ -263,6 +263,13 @@ CREATE DATABASE IF NOT EXISTS rag_system
 
 启动 FastAPI 时，`backend/main.py` 会调用 `init_db()` 创建表结构，并调用 `seed_default_users()` 初始化默认用户数据。
 
+知识库与知识文件按归属用户隔离，历史数据（`user_id` 为 NULL）对任何用户都不可见，需要一次性回填：
+
+```bash
+python scripts/backfill_knowledge_owner.py --user-id <用户ID>            # 默认只打印回填计划
+python scripts/backfill_knowledge_owner.py --user-id <用户ID> --apply    # 真正写入
+```
+
 ### 4.4 本地启动
 
 启动后端：
