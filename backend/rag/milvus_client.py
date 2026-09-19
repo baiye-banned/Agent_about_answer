@@ -142,14 +142,21 @@ class _OpenAICompatibleEmbeddingFunction:
                 response = client.post(url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
+            # 解析也放进 try：响应不是对象、data 不是列表时同样收敛成 EmbeddingBackendError。
+            vectors = sorted(data.get("data") or [], key=lambda item: item.get("index", 0))
+            embeddings = [item.get("embedding") for item in vectors]
         except Exception as exc:
             raise _embedding_failure(f"向量化接口调用失败（{url}）：{exc}") from exc
 
-        vectors = sorted(data.get("data") or [], key=lambda item: item.get("index", 0))
-        embeddings = [item.get("embedding") or [] for item in vectors]
-        if len(embeddings) != len(texts) or not all(embeddings):
+        if len(embeddings) != len(texts):
             raise _embedding_failure(
                 f"向量化接口响应结构异常（{url}）：期望 {len(texts)} 条向量，实际得到 {len(embeddings)} 条"
+            )
+        if not all(isinstance(vector, list) and len(vector) == EMBEDDING_DIM for vector in embeddings):
+            # 维度不符的向量写进 Milvus 只会在更深处报错，这里提前给出可读原因。
+            actual = [len(vector) if isinstance(vector, list) else type(vector).__name__ for vector in embeddings]
+            raise _embedding_failure(
+                f"向量化接口响应结构异常（{url}）：期望 {EMBEDDING_DIM} 维向量，实际得到 {actual[:3]}"
             )
         _record_embedding_success("openai-compatible")
         return embeddings
@@ -214,14 +221,14 @@ def _ensure_collection() -> MilvusClient:
 
 
 def embedding_backend_status() -> dict:
-    """如实上报向量化后端状态：mode 是最近一次实际生效的来源，而非配置推断。"""
+    """如实上报向量化后端状态：mode 反映最近一次调用的真实结果，而非配置推断。"""
     configured = _embedding_configured()
     source = _embedding_state["source"]
-    if source:
-        mode = source
-    elif _embedding_state["last_error"]:
-        # 配置了接口但最近一次调用失败，且从未成功过：当前没有任何可用向量来源。
+    if _embedding_state["last_error"]:
+        # last_error 非空 ⇔ 最近一次调用失败（成功路径会清空它）：当前没有可用来源。
         mode = "unavailable"
+    elif source:
+        mode = source
     else:
         mode = "openai-compatible" if configured else "hash-fallback"
     return {

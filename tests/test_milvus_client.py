@@ -234,6 +234,10 @@ def test_configured_embedding_invalid_response_shape_raises(monkeypatch):
     assert "响应结构异常" in str(exc_info.value)
 
 
+def _vector(value: float = 0.1) -> list[float]:
+    return [value] * milvus_client.EMBEDDING_DIM
+
+
 def test_configured_embedding_success_reports_openai_mode(monkeypatch):
     urls = []
     monkeypatch.setattr(milvus_client, "EMBEDDING_BASE_URL", "https://embedding.example/v1")
@@ -242,18 +246,65 @@ def test_configured_embedding_success_reports_openai_mode(monkeypatch):
         milvus_client.httpx,
         "Client",
         lambda *args, **kwargs: _FakeHttpClient(
-            payload={"data": [{"index": 0, "embedding": [0.1, 0.2]}]},
+            payload={"data": [{"index": 0, "embedding": _vector()}]},
             url_sink=urls,
         ),
     )
 
     vectors = milvus_client._OpenAICompatibleEmbeddingFunction()(["hello"])
 
-    assert vectors == [[0.1, 0.2]]
+    assert vectors == [_vector()]
     assert urls == ["https://embedding.example/v1/embeddings"]
     status = milvus_client.embedding_backend_status()
     assert status["mode"] == "openai-compatible"
     assert status["last_error"] == ""
+    assert status["last_used_at"]
+
+
+def test_configured_embedding_non_object_payload_raises(monkeypatch):
+    _patch_configured_embedding(monkeypatch, payload=[1, 2, 3])
+
+    with pytest.raises(milvus_client.EmbeddingBackendError) as exc_info:
+        milvus_client._OpenAICompatibleEmbeddingFunction()(["hello"])
+
+    assert "向量化接口调用失败" in str(exc_info.value)
+    assert milvus_client.embedding_backend_status()["mode"] == "unavailable"
+
+
+def test_configured_embedding_wrong_dimension_raises(monkeypatch):
+    _patch_configured_embedding(monkeypatch, payload={"data": [{"index": 0, "embedding": [0.1, 0.2]}]})
+
+    with pytest.raises(milvus_client.EmbeddingBackendError) as exc_info:
+        milvus_client._OpenAICompatibleEmbeddingFunction()(["hello"])
+
+    message = str(exc_info.value)
+    assert "响应结构异常" in message
+    assert str(milvus_client.EMBEDDING_DIM) in message
+
+
+def test_configured_embedding_scalar_embedding_raises(monkeypatch):
+    _patch_configured_embedding(monkeypatch, payload={"data": [{"index": 0, "embedding": "not-a-vector"}]})
+
+    with pytest.raises(milvus_client.EmbeddingBackendError) as exc_info:
+        milvus_client._OpenAICompatibleEmbeddingFunction()(["hello"])
+
+    assert "响应结构异常" in str(exc_info.value)
+
+
+def test_status_reports_unavailable_after_failure_following_success(monkeypatch):
+    """先成功再失败：mode 必须翻转为 unavailable，而不是停留在上一次的成功来源。"""
+    _patch_configured_embedding(monkeypatch, payload={"data": [{"index": 0, "embedding": _vector()}]})
+    function = milvus_client._OpenAICompatibleEmbeddingFunction()
+    function(["hello"])
+    assert milvus_client.embedding_backend_status()["mode"] == "openai-compatible"
+
+    _patch_configured_embedding(monkeypatch, status_code=429, payload={"error": {"message": "rate limited"}})
+    with pytest.raises(milvus_client.EmbeddingBackendError):
+        function(["hello"])
+
+    status = milvus_client.embedding_backend_status()
+    assert status["mode"] == "unavailable"
+    assert "429" in status["last_error"]
     assert status["last_used_at"]
 
 
