@@ -27,7 +27,8 @@ export const useChatStore = defineStore('chat', () => {
   const streamImageAnalysis = ref(null)
   const evaluationPollTimer = ref(null)
 
-  // 请求序号：切换会话会让在途的消息请求与流式响应失效，避免陈旧响应覆盖当前会话。
+  // 请求序号：切换会话会让在途的「会话消息加载」失效；新的提问会让上一次「流式请求」的回调失效，
+  // 避免陈旧响应覆盖当前会话。
   let loadSeq = 0
   let streamSeq = 0
 
@@ -166,13 +167,17 @@ export const useChatStore = defineStore('chat', () => {
         if (!isLatestStream(requestSeq)) return
         if (event?.type === 'conversation') {
           const conversation = event.conversation || {}
+          // 归属必须在改动状态之前判定：流式过程中用户可能已经切到别的会话，
+          // 此时迟到的 conversation 事件只能更新会话列表，不得改写当前会话的知识库选择。
+          const belongsToCurrent =
+            !currentId.value || currentId.value === streamingConversationId.value
           upsertConversation(conversation)
           streamingConversationId.value = conversation.id || streamingConversationId.value
           pendingRouteConversationId.value = conversation.id || null
           if (!currentId.value && conversation.id) {
             currentId.value = conversation.id
           }
-          if (conversation.knowledge_base_id) {
+          if (conversation.knowledge_base_id && belongsToCurrent) {
             selectedKnowledgeBaseId.value = conversation.knowledge_base_id
           }
           return
@@ -220,14 +225,24 @@ export const useChatStore = defineStore('chat', () => {
 
     finishStreaming()
     const nextConversations = await fetchConversations().catch(() => [])
-    if (!isLatestStream(requestSeq)) return
-    if (!currentId.value && nextConversations?.[0]?.id) {
-      setCurrentId(nextConversations[0].id)
-    } else if (targetConversationId && !currentId.value) {
-      setCurrentId(targetConversationId)
+    // 改写「当前会话」属于归属写入：收尾期间可能已经又发起了新的提问，只有仍是当前请求才允许改写。
+    if (!currentId.value && isLatestStream(requestSeq)) {
+      if (nextConversations?.[0]?.id) {
+        setCurrentId(nextConversations[0].id)
+      } else if (targetConversationId) {
+        setCurrentId(targetConversationId)
+      }
     }
+    // 消息刷新与评测轮询按「会话归属」判定：只要用户仍停留在该会话就要刷新。若这里改按请求序号判定，
+    // 「回答刚结束又立刻追问」时收尾会被新请求作废，刚生成的回答会一直停在「评测中」且没有轮询。
     if (targetConversationId && currentId.value === targetConversationId) {
-      const nextMessages = await refreshMessages(targetConversationId)
+      // 收尾期间用户可能又提了新问题：刷新照做（轮询要能启动），但写入快照属于请求归属写入，
+      // 被新请求取代时只返回合并结果、不改动消息列表，避免抹掉刚发出的提问。
+      const nextMessages = await refreshMessages(targetConversationId, {
+        shouldWrite: () => isLatestStream(requestSeq),
+      })
+      // 刷新期间用户可能已经切走，回来后不得再改动（启停评测轮询）不属于自己的会话。
+      if (currentId.value !== targetConversationId) return
       if (hasPendingEvaluation(nextMessages)) {
         startEvaluationPolling(targetConversationId)
       } else {
@@ -354,7 +369,10 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  async function refreshMessages(id = currentId.value) {
+  // options.shouldWrite：可选的额外写入条件，用于「收尾刷新」这类需要按请求归属判定的调用方；
+  // 默认只按会话归属判定（用户还在该会话就写入），保持既有调用行为不变。
+  async function refreshMessages(id = currentId.value, options = {}) {
+    const { shouldWrite = null } = options
     if (!id) return []
     const response = await chatAPI.getMessages(id)
     const nextMessages = Array.isArray(response) ? response : []
@@ -382,7 +400,7 @@ export const useChatStore = defineStore('chat', () => {
         mergedMessages.push(localMessage)
       }
     }
-    if (currentId.value === id) {
+    if (currentId.value === id && (!shouldWrite || shouldWrite())) {
       messages.value = mergedMessages
     }
     return mergedMessages
