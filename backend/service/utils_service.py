@@ -1,6 +1,9 @@
 
 import mimetypes
 import re
+from pathlib import Path
+
+from config import KNOWLEDGE_UPLOAD_MAX_MB
 
 IMAGE_UPLOAD_TYPES = {
     "image/png": ".png",
@@ -9,6 +12,20 @@ IMAGE_UPLOAD_TYPES = {
 }
 CHAT_ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024
 AVATAR_MAX_BYTES = 2 * 1024 * 1024
+
+# 知识库上传白名单：扩展名必须与 crud.knowledge_file.extract_file_text 的抽取链一致。
+KNOWLEDGE_UPLOAD_TYPES = {
+    ".txt": frozenset({"text/plain"}),
+    ".md": frozenset({"text/markdown", "text/plain"}),
+    ".docx": frozenset({"application/vnd.openxmlformats-officedocument.wordprocessingml.document"}),
+    ".pdf": frozenset({"application/pdf"}),
+}
+# 浏览器和命令行工具常把任意文件标成这些通用类型，无法据此判断真实格式，按扩展名放行。
+GENERIC_UPLOAD_CONTENT_TYPES = frozenset({"", "application/octet-stream", "binary/octet-stream"})
+KNOWLEDGE_UPLOAD_MAX_BYTES = KNOWLEDGE_UPLOAD_MAX_MB * 1024 * 1024
+KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE = (
+    "仅支持 " + "、".join(ext.lstrip(".") for ext in KNOWLEDGE_UPLOAD_TYPES) + " 格式的文件"
+)
 
 
 def _build_sources(chunks: list[dict]) -> list[dict]:
@@ -41,6 +58,22 @@ def resolve_image_upload_type(content_type: str | None, filename: str | None = N
     if not ext:
         return None
     return resolved_type, ext
+
+
+def resolve_knowledge_upload_type(content_type: str | None, filename: str | None) -> str | None:
+    """返回白名单内的归一化扩展名；扩展名或声明的 MIME 不符时返回 None。"""
+    ext = Path(filename or "").suffix.lower()
+    allowed_types = KNOWLEDGE_UPLOAD_TYPES.get(ext)
+    if not allowed_types:
+        return None
+    normalized_type = _normalize_content_type(content_type)
+    if normalized_type in GENERIC_UPLOAD_CONTENT_TYPES or normalized_type in allowed_types:
+        return ext
+    return None
+
+
+def knowledge_upload_too_large_message() -> str:
+    return f"文件不能超过 {KNOWLEDGE_UPLOAD_MAX_MB}MB"
 
 
 def _normalize_content_type(content_type: str | None) -> str:

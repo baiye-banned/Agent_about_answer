@@ -6,6 +6,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from model.models import KnowledgeFile
+from service.utils_service import KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE
 
 
 def serialize_knowledge_file(file_entry: KnowledgeFile) -> dict:
@@ -77,12 +78,15 @@ def get_knowledge_content(db: Session, fid: int, user_id: int) -> dict | None:
 
 
 def extract_file_text(filename: str, content: bytes) -> str:
-    lower_name = filename.lower()
+    """按扩展名抽取文本；白名单外的类型直接拒绝，不再兜底当纯文本解码。"""
+    lower_name = (filename or "").lower()
     if lower_name.endswith(".docx"):
         return extract_docx_text(content)
     if lower_name.endswith(".pdf"):
         return extract_pdf_text(content)
-    return content.decode("utf-8", errors="replace")
+    if lower_name.endswith(".txt") or lower_name.endswith(".md"):
+        return content.decode("utf-8", errors="replace")
+    raise HTTPException(400, KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE)
 
 
 def extract_docx_text(content: bytes) -> str:

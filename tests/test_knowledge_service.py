@@ -13,12 +13,24 @@ class _FileEntry:
 
 
 class _UploadFile:
-    def __init__(self, filename, content):
+    def __init__(self, filename, content, content_type="text/plain"):
         self.filename = filename
+        self.content_type = content_type
         self._content = content
 
-    async def read(self):
-        return self._content
+    async def read(self, size=-1):
+        # 与 UploadFile 一致：按 size 切分，读完返回空串，否则调用方会一直读到内容。
+        if size is None or size < 0:
+            chunk, self._content = self._content, b""
+            return chunk
+        chunk, self._content = self._content[:size], self._content[size:]
+        return chunk
+
+
+class _Request:
+    """上传端点只用到 headers，这里给一个空 headers 让 content-length 预检直接跳过。"""
+
+    headers: dict = {}
 
 
 def _patch_upload(monkeypatch, calls, failure):
@@ -55,6 +67,7 @@ def _patch_upload(monkeypatch, calls, failure):
 def _upload():
     return asyncio.run(
         knowledge_service.upload_knowledge(
+            request=_Request(),
             file=_UploadFile("考勤制度.txt", b"text"),
             knowledge_base_id=2,
             user=_User(),
