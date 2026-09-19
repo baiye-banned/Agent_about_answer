@@ -396,29 +396,34 @@ server {
 ```nginx
     # Swagger UI 页面本身是 /docs，它还会请求 /docs/oauth2-redirect，
     # 因此精确匹配 /docs 之外还要放行 /docs/ 子路径。
-    # proxy_set_header 不能跨 location 继承，每个块都要各写一次。
+    # proxy_set_header 在 location 之间互不继承（写在 server 级才会被各 location 继承），
+    # 这里逐块书写，方便单独复制其中一段。
     location = /docs {
         proxy_pass http://127.0.0.1:8002/docs;
         proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 
     location /docs/ {
         proxy_pass http://127.0.0.1:8002/docs/;
         proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 
     location = /redoc {
         proxy_pass http://127.0.0.1:8002/redoc;
         proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 
     location = /openapi.json {
         proxy_pass http://127.0.0.1:8002/openapi.json;
         proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 ```
 
-这里统一用 `=` 精确匹配，避免 `/docsXYZ` 这类并不存在的路径也被转发到后端。`proxy_set_header Host $host;` 同样是必须的：不写的话 Nginx 默认把 `Host` 设成上游地址（`127.0.0.1:8002`），而 Starlette 对 `/docs/` 会回一个 `307` 跳转到 `/docs`，跳转目标里就会带上 `http://127.0.0.1:8002` 这个只在服务器内部可达的地址，浏览器拿到后会跳不过去。开启前建议配合 IP 白名单（`allow` / `deny`）或额外的鉴权，不要直接暴露在公网。
+这里统一用 `=` 精确匹配，避免 `/docsXYZ` 这类并不存在的路径也被转发到后端。`proxy_set_header Host $host;` 同样是必须的：不写的话 Nginx 默认把 `Host` 设成上游地址（`127.0.0.1:8002`），而 Starlette 对 `/docs/` 会回一个 `307` 跳转到 `/docs`，跳转目标里就会带上 `http://127.0.0.1:8002` 这个只在服务器内部可达的地址，浏览器拿到后会跳不过去。四个块里还一并设置了 `X-Forwarded-Proto`（与上面 `/api/` 块保持一致），这样从 HTTPS 入口访问时 `307` 直接跳到 `https://`；少了它，跳转目标会是 `http://`，还要经 80 端口再 `301` 回 443，白多一次往返。开启前建议配合 IP 白名单（`allow` / `deny`）或额外的鉴权，不要直接暴露在公网。
 
 ### 4.7 DNS 配置
 
