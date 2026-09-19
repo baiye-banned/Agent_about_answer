@@ -28,14 +28,21 @@
 #   inside a repository: one pass over the commit history and one over the
 #   working tree (the working-tree pass is what sees an untracked .env, which
 #   a history-only scan cannot see); outside a repository: a working-tree pass.
-#   In a git worktree (.git is a file) the history pass cannot run - gitleaks
-#   cannot open such a checkout - so it is skipped with a loud note; use a
-#   normal clone, or CI, for history scanning.
+#   --tracked-only drops the working-tree pass, so untracked files are then
+#   covered by neither layer - that is what the flag asks for, and it is
+#   announced on stderr. If dropping it leaves gitleaks with no pass at all
+#   (a worktree, where the history pass is skipped as well), the run fails
+#   with exit 2 instead of reporting a clean scan.
+#   In a git worktree (.git is a file, not a directory) the history pass is
+#   skipped with a loud note: gitleaks cannot walk the history of such a
+#   checkout - depending on the environment it fails outright or reports
+#   "0 commits scanned", a clean-looking scan of nothing. Use a normal clone,
+#   or CI, for history scanning.
 #
 # Exit codes:
 #   0  clean
 #   1  findings (built-in scan and/or gitleaks)
-#   2  bad usage or gitleaks not installed
+#   2  bad usage, gitleaks not installed, or no gitleaks pass could run
 #
 # A scan that quietly skips gitleaks reads as proof that the repository is
 # clean when nothing of the sort was checked, so a missing gitleaks is an
@@ -56,13 +63,15 @@ Usage: bash scripts/scan_secrets.sh [PATH] [--tracked-only] [--patterns-only]
                                    [--require-gitleaks]
 
   PATH                directory to scan (default: the repository containing this script)
-  --tracked-only      scan only files already tracked by git (skips untracked and
-                      git-ignored files, e.g. a local .env that will never be committed)
+  --tracked-only      check only what git tracks: the built-in scan skips untracked
+                      and git-ignored files (e.g. a local .env that will never be
+                      committed) and the gitleaks working-tree pass is dropped.
+                      Uncommitted edits to tracked files are still covered.
   --patterns-only     run the built-in pattern scan only; gitleaks is skipped, so no
                       history and no entropy scan happens (explicit opt-out)
   --require-gitleaks  accepted for compatibility; gitleaks is required by default
 
-Exit codes: 0 clean, 1 findings, 2 bad usage or gitleaks not installed.
+Exit codes: 0 clean, 1 findings, 2 bad usage / gitleaks not installed / no pass ran.
 USAGE
 }
 
@@ -185,11 +194,18 @@ line_value() {
 }
 
 scan_builtin() {
-  local hits hit content file lineno value
+  local hits hit content file lineno value rc=0
   # -I skips binary files, -H always prefixes the file name (without it grep
   # omits the name when a single file is scanned, which would shift the
   # "file:line" parsing below).
-  hits=$(grep -HInE -e "$RE_SK" -e "$RE_PEM" -e "$RE_PREFIX" -- "$@" 2>/dev/null || true)
+  hits=$(grep -HInE -e "$RE_SK" -e "$RE_PEM" -e "$RE_PREFIX" -- "$@" 2>/dev/null) || rc=$?
+  # grep exits 0 for matches and 1 for none; 2+ means the scan itself failed
+  # (unreadable file, broken grep). Swallowing that would print "clean" for a
+  # scan that never ran, which is the one outcome this script must not have.
+  if [ "$rc" -ge 2 ]; then
+    echo "scan_secrets: ERROR - the built-in pattern scan failed (grep exit $rc); refusing to report a clean scan" >&2
+    exit 2
+  fi
   [ -n "$hits" ] || return 0
   while IFS= read -r hit; do
     [ -n "$hit" ] || continue
@@ -245,10 +261,12 @@ else
 fi
 
 # Appends one gitleaks run to the shared log; the exit status is gitleaks'.
+GITLEAKS_PASSES=0
 gitleaks_pass() {
   local label=$1 src=$2
   shift 2
   echo "scan_secrets: gitleaks - scanning $label"
+  GITLEAKS_PASSES=$((GITLEAKS_PASSES + 1))
   gitleaks detect --source "$src" --redact --no-banner "$@" >> "$GITLEAKS_LOG" 2>&1
 }
 
@@ -260,19 +278,35 @@ elif command -v gitleaks >/dev/null 2>&1; then
     if [ -f "$GIT_ROOT/.git" ]; then
       {
         echo "scan_secrets: NOTE - this checkout is a linked git worktree (.git is a file),"
-        echo "  which gitleaks cannot open; the history pass is skipped and only the"
-        echo "  working tree is scanned. Run in a normal clone, or rely on CI, for history."
+        echo "  whose history gitleaks cannot walk (it fails or reports 0 commits scanned);"
+        echo "  the history pass is skipped. Run in a normal clone, or rely on CI, for history."
       } >&2
     else
       gitleaks_pass "commit history" "$GIT_ROOT" || GITLEAKS_RC=1
     fi
-    gitleaks_pass "working tree" "$PWD" --no-git || GITLEAKS_RC=1
+    if [ "$TRACKED_ONLY" -eq 1 ]; then
+      {
+        echo "scan_secrets: NOTE - --tracked-only: the gitleaks working-tree pass is"
+        echo "  skipped, so untracked files (e.g. a local .env) are covered by neither"
+        echo "  layer. Drop the flag to scan the whole working tree."
+      } >&2
+    else
+      gitleaks_pass "working tree" "$PWD" --no-git || GITLEAKS_RC=1
+    fi
   else
     gitleaks_pass "working tree" "$PWD" --no-git || GITLEAKS_RC=1
   fi
   sed -n '1,120p' "$GITLEAKS_LOG"
   if [ "$GITLEAKS_RC" -ne 0 ]; then
     echo "scan_secrets: FAIL - gitleaks reported findings (secrets are redacted above)" >&2
+  elif [ "$GITLEAKS_PASSES" -eq 0 ]; then
+    {
+      echo "scan_secrets: ERROR - gitleaks ran no pass in this invocation (see the notes"
+      echo "  above), so nothing was scanned for history or entropy; refusing to report a"
+      echo "  clean scan. Drop --tracked-only to scan the working tree, or run in a normal"
+      echo "  clone / in CI to scan the history."
+    } >&2
+    GITLEAKS_RC=2
   else
     echo "scan_secrets: gitleaks scan clean"
   fi
