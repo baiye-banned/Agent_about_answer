@@ -315,7 +315,7 @@ sequenceDiagram
   participant K as Knowledge.vue
   participant API as knowledgeAPI
   participant B as FastAPI main.py
-  participant DB as database.py / models.py
+  participant DB as database/session.py / model/models.py
   participant C as milvus_client.py
   participant M as MySQL
 
@@ -515,7 +515,7 @@ flowchart LR
 | `removeConversation()` | 方法 | 删除会话 |
 | `toggleHistoryManageMode()` | 方法 | 切换管理模式 |
 | `removeSelectedConversations()` | 方法 | 批量删除会话 |
-| `normalizeAvatarUrl()` | 方法 | 头像路径归一化 |
+| `normalizeApiAssetUrl()` | 工具函数 | 头像路径归一化（`src/utils/url.js`） |
 | `handleUserCommand()` | 方法 | 跳个人设置 / 退出 |
 
 ### `src/views/Chat.vue`
@@ -532,8 +532,8 @@ flowchart LR
 | `knowledgeBases` / `selectedKnowledgeBaseId` | computed/ref | 当前知识库选择 |
 | `isCurrentConversationStreaming` | computed | 是否正在生成 |
 | `currentKnowledgeBaseName` | computed | 当前知识库名称 |
-| `suggestions` / `ragasMetrics` | 常量 | 页面快捷问句 / RAGAS 指标 |
-| `traceEvents` / `traceVariableRows` / `retrievalRoutes` / `memoryEvents` / `ragasEvents` / `prettyTrace` | computed | Trace 相关可视化数据 |
+| `CHAT_SUGGESTIONS` / `RAGAS_METRICS` | 常量 | 页面快捷问句（`src/utils/chatSuggestions.js`）/ RAGAS 指标（`src/utils/ragasStatus.js`） |
+| `traceEvents` / `retrievalRoutes` / `memoryEvents` / `ragasEvents` / `prettyTrace` | computed | Trace 相关可视化数据 |
 | `askSuggestion()` | 方法 | 点击快捷问句 |
 | `createNewConversation()` | 方法 | 新建对话 |
 | `sendMessage()` | 方法 | 读取输入框和附件并调用 store |
@@ -591,7 +591,7 @@ flowchart LR
 | `rules` | 常量 | 表单校验 |
 | `handleSubmit()` | 方法 | 修改密码 |
 | `handleAvatarUpload()` | 方法 | 头像上传 |
-| `normalizeAvatarUrl()` / `formatTime()` | 方法 | 头像和时间展示 |
+| `normalizeApiAssetUrl()` / `formatTime()` | 工具函数 | 头像和时间展示（分别来自 `src/utils/url.js`、`src/utils/index.js` 的 `formatDateTime`） |
 
 ### `src/views/Login.vue`
 
@@ -742,7 +742,7 @@ flowchart LR
 
 ### `backend/main.py` / `backend/router/*.py`
 
-> `backend/main.py` 负责应用启动、CORS、静态资源和 `include_router`；具体接口处理函数由 `backend/router/*.py` 挂载到 `backend/service/*.py`。
+> `backend/main.py` 只有应用启动（`lifespan`）、CORS、静态资源挂载、`/` 与 `/health`、`include_router`。`backend/router/*.py` 每个文件只声明 `APIRouter()` 并用 `add_api_route(...)` 接线，不含处理函数定义；下表按“这层暴露的入口”组织，括号里标注真正的定义模块。Pydantic 请求/响应模型统一定义在 `backend/schema/schemas.py`。
 
 #### 启动与基础依赖
 
@@ -755,6 +755,8 @@ flowchart LR
 | `init_db()` | 调用 | 初始化表结构与轻量迁移 |
 | `seed_default_users()` | 调用 | 初始化默认用户 |
 | `rebuild_existing_knowledge_index()` | 调用 | 在显式开启配置时重建 Milvus 索引 |
+
+> 本节只有 `lifespan()` / `root()` / `health()` 定义在 `backend/main.py`；`init_db()` 定义在 `backend/database/session.py`，`seed_default_users()` 在 `backend/service/user_service.py`，`rebuild_existing_knowledge_index()` 在 `backend/service/knowledge_service.py`。
 
 #### 认证与用户
 
@@ -772,6 +774,8 @@ flowchart LR
 | `update_password()` | 路由 | `/api/user/password` |
 | `upload_avatar()` | 路由 | `/api/user/avatar` |
 
+> 本节处理函数定义在 `backend/service/auth_service.py`（`create_token` / `_decode_token` / `get_current_user` / `login` / `logout`）和 `backend/service/user_service.py`（`get_profile` / `update_password` / `upload_avatar`）；`backend/router/auth.py` / `backend/router/user.py` 只做接线。
+
 #### 会话、Trace 与聊天
 
 | 符号 | 类型 | 作用 |
@@ -784,7 +788,7 @@ flowchart LR
 | `delete_conversation()` | 路由 | 删除会话 |
 | `RenameRequest` | Pydantic 模型 | 重命名会话请求 |
 | `rename_conversation()` | 路由 | 重命名会话 |
-| `_serialize_message()` | 方法 | 消息序列化 |
+| `serialize_message()` | 方法 | 消息序列化（`backend/crud/chat.py`） |
 | `_trace_sse_payloads()` | 方法 | Trace SSE payload |
 | `trace_service._safe_trace_add()` / `_safe_trace_finish()` / `_safe_trace_attach()` | 方法 | 保护 Trace 的安全封装 |
 | `chat_service.stream_chat()` | 路由 | `/api/chat/stream` SSE 主链路 |
@@ -796,14 +800,14 @@ flowchart LR
 
 > 当前记忆策略：`MEMORY_WINDOW_TURNS` 控制最近窗口大小；assistant 保存后如果窗口发生滑动，滑出的完整问答轮次会合并进长期记忆。短期窗口文本超 `MEMORY_RECENT_MAX_CHARS` 时压缩成一条近期记忆；长期记忆超 `MEMORY_SUMMARY_MAX_CHARS` 时先做二次摘要，摘要失败才兜底裁剪。
 
-> 聊天主逻辑现在主要在 `backend/service/chat_service.py`，`main.py` 负责暴露路由和承接少量入口级依赖。
+> 聊天主逻辑现在主要在 `backend/service/chat_service.py`，`main.py` 负责暴露路由和承接少量入口级依赖。本节其余符号定义在 `backend/service/trace_service.py`（Trace 与 `stream_chat` 的安全封装）、`backend/crud/chat.py`（`serialize_message`）、`backend/rag/memory_service.py`（`_build_memory_context` 及记忆窗口/摘要辅助函数）。
 
 #### 知识库与知识文件
 
 | 符号 | 类型 | 作用 |
 |---|---|---|
 | `KnowledgeBaseRequest` | Pydantic 模型 | 知识库创建/重命名 |
-| `_serialize_knowledge_base()` | 方法 | 知识库对象序列化 |
+| `serialize_knowledge_base()` | 方法 | 知识库对象序列化（`backend/crud/knowledge_base.py`） |
 | `list_knowledge_bases()` | 路由 | `/api/knowledge-bases` |
 | `create_knowledge_base()` | 路由 | 创建知识库 |
 | `rename_knowledge_base()` | 路由 | 重命名知识库 |
@@ -819,7 +823,7 @@ flowchart LR
 | `knowledge_file_save_error_message()` | 方法 | 知识文件保存错误文案 |
 | `chunk_text()` | 方法 | 切块 |
 
-> 知识库 CRUD 与上传回滚逻辑已经下沉到 `backend/service/knowledge_service.py` 和 `backend/crud/knowledge_file.py`。
+> 知识库 CRUD 与上传回滚逻辑已经下沉到 `backend/service/knowledge_service.py` 和 `backend/crud/knowledge_file.py`。表格中的路由函数定义在 `backend/service/knowledge_service.py`（`upload_knowledge` 为 `knowledge_service.upload_knowledge()`）；`extract_file_text()` / `extract_docx_text()` / `extract_pdf_text()` / `chunk_text()` / `knowledge_file_save_error_message()` 定义在 `backend/crud/knowledge_file.py`，`serialize_knowledge_base()` 定义在 `backend/crud/knowledge_base.py`。
 
 #### OSS、图片与模型回退
 
@@ -831,29 +835,28 @@ flowchart LR
 | `_build_effective_question()` | 方法 | question + 图片描述 |
 | `_analyze_image_attachments()` | 方法 | 图片分析编排 |
 | `_image_analysis_prompts()` / `_request_image_description()` / `_classify_image_analysis()` | 方法 | 视觉分析 |
-| `stream_rag_answer()` | 方法 | 模型流式回答 |
-| `_stream_text_fallback_response()` | 方法 | 文本兜底 |
-| `_stream_openai_chat_chunks()` | 方法 | OpenAI 兼容流读取 |
-| `_should_use_text_fallback()` | 方法 | 是否走兜底 |
-| `_text_fallback_error_message()` / `_model_missing_error()` / `_model_error_message()` | 方法 | 模型异常文案 |
-| `_build_image_urls()` | 方法 | 附件 URL 提取 |
+| `stream_rag_answer()` | 方法 | 模型流式回答（`backend/rag/chains.py`） |
+| `stream_answer_events()` | 方法 | DeepSeek 流式生成；失败后按 `TEXT_FALLBACK_ENABLED` / `TEXT_FALLBACK_API_KEY` 决定是否报错，切换到文本后备模型前先下发 `reset` 事件（`backend/rag/llm.py`） |
+| `get_text_fallback_model()` | 方法 | 构造文本后备模型（`backend/rag/llm.py`） |
+| `_stream_openai_chat_chunks` | Trace 阶段名 | `stream_reset` / `first_content_chunk` 事件的阶段标签，不是函数（`backend/service/chat_service.py`） |
+| `_build_image_urls()` | 方法 | 附件 URL 提取（`backend/rag/vision_service.py`） |
 
-> 图片预处理主要在 `backend/rag/vision_service.py`，`main.py` 只保留路由入口和编排调用。
+> 图片预处理主要在 `backend/rag/vision_service.py`，`main.py` 只保留路由入口和编排调用。OSS 签名与上传助手（`_ensure_oss_config()` / `_oss_host()` / `_oss_object_path()` / `_oss_signature()` / `_put_oss_object()` / `_sign_oss_url()` / `_public_oss_url()`）定义在 `backend/service/oss_service.py`；`openai_chat_url()` 与文本后备模型链定义在 `backend/rag/llm.py`。
 
 #### Trace / 评估 / 工具
 
 | 符号 | 类型 | 作用 |
 |---|---|---|
-| `_build_sources()` | 方法 | 来源列表构造 |
-| `_loads_json()` | 方法 | JSON 解析兜底 |
-| `list_checkpointer_threads()` | 路由 | `/api/checkpointer/threads` |
+| `_build_sources()` | 方法 | 来源列表构造（`backend/service/utils_service.py`） |
+| `load_json_value()` | 方法 | JSON 解析兜底（`backend/service/json_utils.py`） |
+| `list_checkpointer_threads()` | 路由 | `/api/checkpointer/threads`（`backend/service/trace_service.py`） |
 
 ## 9. 怎么把这份文档和源码对照
 
 1. 先找页面入口：`src/main.js -> src/App.vue -> src/router/index.js -> src/views/Layout.vue`。
 2. 再看状态流：`src/stores/*.js` 负责数据，`src/api/*.js` 负责请求。
 3. 再回到后端：`backend/main.py` 主要负责路由汇聚和启动，业务细节分散到 `service/*.py`、`rag/*.py`、`milvus_client.py`、`ragas_eval.py`、`learning_trace.py`。
-4. 看数据库时，优先对照 `backend/model/models.py`，再回看 `database.py` 的字符集迁移逻辑。
+4. 看数据库时，优先对照 `backend/model/models.py`，再回看 `backend/database/session.py` 的字符集迁移逻辑。
 
 ## 10. 一句话总结
 

@@ -16,11 +16,13 @@ end in `.test.js` are included as well.
 Current files:
 
 - `chatApi.test.js`
+- `chatStore.test.js`
 - `clipboard.test.js`
 - `streamEvents.test.js`
+- `url.test.js`
 - `utils.test.js`
 
-These tests cover frontend stream parsing, stream response errors, clipboard fallback behavior, URL normalization, display formatting, status helpers, image validation, and memory trace helpers.
+These tests cover frontend stream parsing, stream response errors, chat store conversation switching, stale in-flight response handling and fallback reset events, clipboard fallback behavior, URL normalization and link safety, display formatting, status helpers, image validation, and memory trace helpers.
 
 ## Python Tests
 
@@ -36,11 +38,15 @@ Discovery is fixed by the repository `pytest.ini`: `testpaths = tests` and
 Current files:
 
 - `test_auth_service.py`
+- `test_chat_service_retrieval.py`
 - `test_checkpointer.py`
 - `test_chunking.py`
 - `test_config_helpers.py`
+- `test_default_users.py`
+- `test_env_example_parity.py`
 - `test_grounding.py`
 - `test_json_utils.py`
+- `test_knowledge_ownership.py`
 - `test_knowledge_service.py`
 - `test_learning_trace.py`
 - `test_llm_urls.py`
@@ -49,11 +55,15 @@ Current files:
 - `test_ragas_eval.py`
 - `test_rerank.py`
 - `test_retrieval.py`
+- `test_secret_key_guard.py`
+- `test_stream_fallback_reset.py`
 - `test_trace_crud.py`
 - `test_upload_validation.py`
 - `conftest.py`
 
-These tests cover retrieval planning and fusion, auth token validation, checkpointer helpers, semantic chunking, config parsing, grounding helpers, JSON loading, knowledge deletion ordering, learning trace handling, OpenAI-compatible URL helpers, memory context, Milvus client behavior, RAGAS text handling, rerank fallback, trace CRUD, upload validation, and shared fixtures.
+These tests cover retrieval planning and fusion, chat service retrieval wiring, auth token validation, default user seeding without hardcoded passwords, `.env.example`/`config.py` parity, checkpointer helpers, semantic chunking, config parsing, grounding helpers, JSON loading, knowledge ownership filtering, knowledge deletion ordering, learning trace handling, OpenAI-compatible URL helpers, memory context, Milvus client behavior, RAGAS text handling, rerank fallback, SECRET_KEY startup guard, stream fallback reset handling, trace CRUD, and upload validation.
+
+`conftest.py` only puts `backend/` on `sys.path` so the tests can import application modules; it defines no fixtures.
 
 ## Excluded Local Files
 
@@ -62,7 +72,7 @@ Do not stage generated or design-only files:
 - `__pycache__/`
 - `*.pyc`
 - `.pytest_cache/`
-- `.test.md`
-- `*.test.md`
+- `tests/.test.md`
+- `tests/*.test.md`
 
 The ignore rules are intentionally kept in the repository `.gitignore` so the executable test baseline can be staged without cache files.
