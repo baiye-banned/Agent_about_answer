@@ -17,12 +17,17 @@ bash scripts/scan_secrets.sh
   bash scripts/scan_secrets.sh --tracked-only
   ```
 
-- 本机装有 gitleaks 时会自动追加一次全历史扫描；要求「没有 gitleaks 就报错」
-  的严格模式：
+- gitleaks 是**必需**的：装了就扫「完整历史 + 工作区（含未跟踪文件）」，
+  没装则以退出码 2 失败，绝不会静默跳过——「什么都没扫」被当成「干净」是最危险的假绿。
+  仅想跑零依赖的模式扫描（例如没装 gitleaks 时快速看一眼）才用逃生口：
 
   ```bash
-  bash scripts/scan_secrets.sh --require-gitleaks
+  bash scripts/scan_secrets.sh --patterns-only
   ```
+
+  安装 gitleaks：<https://github.com/gitleaks/gitleaks#installing>。
+  在 git worktree 里（`.git` 是文件）gitleaks 无法打开历史，脚本会打印提示并只扫工作区，
+  历史扫描请在普通克隆或 CI 里做。
 
 ## 密钥与配置
 
@@ -33,6 +38,19 @@ bash scripts/scan_secrets.sh
   `credentials*.json`、`deepseek.txt`、`.envrc`。
 - 如果不小心提交了密钥：先在服务端**轮换**该密钥，再清理历史，最后才通知协作者；
   仅删除文件或改写提交都不足以挽回已泄漏的凭据。
+
+## 误报（false positive）处理约定
+
+扫描命中不等于一定是真密钥，但**不允许**用「关规则 / 跳过扫描」的方式让它变绿：
+
+- 优先改成不触发规则的形式，例如把示例值写成明显的占位串（`your-api-key-here`、
+  `example-token`）或从代码里挪进 `.env.example`；
+- 确需保留某个看起来像密钥的样例值时，在仓库根目录的 `.gitleaks.toml` 里做
+  **精确豁免**（只豁免该路径或该条规则，例如把样例文件放进 `paths` allowlist），
+  并在提交信息里说明原因；
+- **禁止**整体关闭某条规则、禁止 `--no-git`/`--patterns-only` 之类跳过扫描的做法
+  进入 CI（`--patterns-only` 只用于本地快速自查）；
+- 当前仓库无误报，因此暂未提供 `.gitleaks.toml`；一旦需要豁免，按上面三条添加。
 
 ## 提交信息
 
@@ -47,5 +65,6 @@ ci(security): 加固 .gitignore 并引入密钥扫描门禁
 ## CI
 
 `.github/workflows/secret-scan.yml` 在每次 push（所有分支）与 pull request 上运行：
-先跑上面的脚本，再用 gitleaks 扫描完整历史。任一环节发现疑似密钥，任务即为红色，
-必须处理后才合并。
+先跑上面的脚本（内含 gitleaks 完整历史扫描），再用官方 gitleaks action 扫本次推送范围。
+任一环节发现疑似密钥，任务即为红色。仓库目前未配置分支保护，红色任务不会从技术上
+阻止合并，**红了就不要合**——先把命中处理掉（真密钥先轮换，误报按上节约定做精确豁免）。

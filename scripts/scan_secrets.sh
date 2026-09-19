@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# Local secret scan for git-bash / POSIX shells. Run it before committing or
-# pushing; CI runs the same checks (plus gitleaks) on every push and PR.
+# Local secret scan for git-bash / POSIX shells (bash 3.2+, i.e. the bash that
+# ships with macOS). Run it before committing or pushing; CI runs the same
+# checks on every push and pull request.
 #
 # Layer 1 - built-in pattern scan, always on, no external dependency:
 #   every file tracked by git plus every untracked file is scanned, including
@@ -10,51 +11,66 @@
 #   Only "<file>:<line> [<pattern>]" is reported; the matched text is never
 #   printed, so a failing run cannot leak the very secret it found.
 #
-#   Patterns:
+#   Patterns (case-sensitive, as written):
 #     - "sk-" followed by 20+ token characters (OpenAI-style keys)
 #     - "-----BEGIN ... PRIVATE KEY-----" headers
 #     - API_KEY / SECRET / TOKEN / PASSWORD / ... followed by "=" or ":" and a
 #       value. Values that are empty, code expressions, pure numbers, or the
 #       documented placeholder words are configuration, not credentials, and
 #       are not reported.
+#   Deliberate limit: an assignment whose key name is lowercase (e.g.
+#   "password: hunter2" in a config file) is not matched here. Matching those
+#   case-insensitively was measured to flag plain code ("token = user.token",
+#   "password = self.password") and to cost a process per hit; the gitleaks
+#   layer below covers them with entropy-based rules instead.
 #
-# Layer 2 - gitleaks, used automatically when the binary is on PATH:
-#   rule/entropy scan of the working tree and of the full git history.
+# Layer 2 - gitleaks, required by default:
+#   inside a repository: one pass over the commit history and one over the
+#   working tree (the working-tree pass is what sees an untracked .env, which
+#   a history-only scan cannot see); outside a repository: a working-tree pass.
+#   In a git worktree (.git is a file) the history pass cannot run - gitleaks
+#   cannot open such a checkout - so it is skipped with a loud note; use a
+#   normal clone, or CI, for history scanning.
 #
 # Exit codes:
 #   0  clean
 #   1  findings (built-in scan and/or gitleaks)
-#   2  bad usage, or gitleaks required but not installed
+#   2  bad usage or gitleaks not installed
 #
-# Requires bash; the file list comes from git when the scanned directory is
-# inside a repository and from "find" otherwise.
+# A scan that quietly skips gitleaks reads as proof that the repository is
+# clean when nothing of the sort was checked, so a missing gitleaks is an
+# error, not a warning. --patterns-only opts out explicitly.
 #
-# Usage: bash scripts/scan_secrets.sh [PATH] [--tracked-only] [--require-gitleaks]
+# Usage: bash scripts/scan_secrets.sh [PATH] [--tracked-only] [--patterns-only]
+#                                    [--require-gitleaks]
 
 set -uo pipefail
 
-REQUIRE_GITLEAKS="${REQUIRE_GITLEAKS:-0}"
+PATTERNS_ONLY=0
 TRACKED_ONLY=0
 TARGET=""
 
 usage() {
   cat <<'USAGE'
-Usage: bash scripts/scan_secrets.sh [PATH] [--tracked-only] [--require-gitleaks]
+Usage: bash scripts/scan_secrets.sh [PATH] [--tracked-only] [--patterns-only]
+                                   [--require-gitleaks]
 
   PATH                directory to scan (default: the repository containing this script)
   --tracked-only      scan only files already tracked by git (skips untracked and
                       git-ignored files, e.g. a local .env that will never be committed)
-  --require-gitleaks  fail (exit 2) when the gitleaks binary is missing; same as
-                      REQUIRE_GITLEAKS=1
+  --patterns-only     run the built-in pattern scan only; gitleaks is skipped, so no
+                      history and no entropy scan happens (explicit opt-out)
+  --require-gitleaks  accepted for compatibility; gitleaks is required by default
 
-Exit codes: 0 clean, 1 findings, 2 bad usage or gitleaks required but missing.
+Exit codes: 0 clean, 1 findings, 2 bad usage or gitleaks not installed.
 USAGE
 }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --tracked-only) TRACKED_ONLY=1 ;;
-    --require-gitleaks) REQUIRE_GITLEAKS=1 ;;
+    --patterns-only) PATTERNS_ONLY=1 ;;
+    --require-gitleaks) : ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "scan_secrets: unknown option: $1" >&2; usage >&2; exit 2 ;;
     *) TARGET="$1" ;;
@@ -87,31 +103,39 @@ GITLEAKS_LOG="$TMP_SCAN/gitleaks.log"
 : > "$GITLEAKS_LOG"
 trap 'rm -rf "$TMP_SCAN"' EXIT
 
+SKIP_DIRS='.git node_modules .venv venv __pycache__ .pytest_cache dist'
+
+keep_file() {
+  local f=$1 skip
+  f=${f#./}
+  [ -n "$f" ] || return 0
+  [ -f "$f" ] || return 0
+  for skip in $SKIP_DIRS; do
+    case "$f" in
+      "$skip"/*|*/"$skip"/*) return 0 ;;
+    esac
+  done
+  FILES+=("$f")
+}
+
 # Every file to scan: tracked files plus untracked ones. --others also lists
 # git-ignored files, because a local .env holding real keys should be visible
 # to the scan even though git would never commit it.
+# A "while read -d ''" loop is used instead of mapfile: mapfile is bash 4+ and
+# silently produces an empty list on bash 3.2, which would turn this scan into
+# a clean report over zero files.
 collect_files() {
-  local entries=() f
+  local f
   FILES=()
   if [ -n "$GIT_ROOT" ]; then
     if [ "$TRACKED_ONLY" -eq 1 ]; then
-      mapfile -d '' -t entries < <(git ls-files -z --cached)
+      while IFS= read -r -d '' f; do keep_file "$f"; done < <(git ls-files -z --cached 2>/dev/null)
     else
-      mapfile -d '' -t entries < <(git ls-files -z --cached --others)
+      while IFS= read -r -d '' f; do keep_file "$f"; done < <(git ls-files -z --cached --others 2>/dev/null)
     fi
   else
-    mapfile -d '' -t entries < <(find . -type f -print0)
+    while IFS= read -r -d '' f; do keep_file "$f"; done < <(find . -type f -print0 2>/dev/null)
   fi
-  for f in ${entries[@]+"${entries[@]}"}; do
-    f=${f#./}
-    [ -n "$f" ] || continue
-    [ -f "$f" ] || continue
-    case "$f" in
-      .git/*|*/node_modules/*|node_modules/*|*/.venv/*|.venv/*|*/venv/*|venv/*) continue ;;
-      */__pycache__/*|__pycache__/*|*/.pytest_cache/*|.pytest_cache/*|*/dist/*|dist/*) continue ;;
-    esac
-    FILES+=("$f")
-  done
 }
 
 # A value is a placeholder or a configuration knob - and therefore not a
@@ -123,14 +147,17 @@ is_not_secret() {
   value=${value%\'}; value=${value#\'}
   value=${value#"${value%%[![:space:]]*}"}
   value=${value%"${value##*[![:space:]]}"}
-  lower=${value,,}
-  [ -n "$lower" ] || return 0
-  case "$lower" in
+  [ -n "$value" ] || return 0
+  case "$value" in
     *'('*|*')'*|*'['*|*']'*|*'{'*|*'}'*|*'"'*|*"'"*|*'`'*) return 0 ;;
   esac
-  if [[ $lower =~ ^[0-9]+$ ]]; then
+  if [[ $value =~ ^[0-9]+$ ]]; then
     return 0
   fi
+  # Only values that survive the checks above are lowercased: ${value,,} is
+  # bash 4+, and tr (the bash 3.2 replacement) costs one process per call, so
+  # it stays off the hot path - most hits are code expressions, already gone.
+  lower=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
   case "$lower" in
     none|null|nil|undefined|true|false|yes|no|on|off|password|passwd|secret|token|apikey|api_key|key|todo) return 0 ;;
     change-me*|change_me*|changeme*|change-this*|change_this*|your[-_]*|yourkey*|replace[-_]*|placehold*) return 0 ;;
@@ -159,8 +186,9 @@ line_value() {
 
 scan_builtin() {
   local hits hit content file lineno value
-  # -H: always prefix the file name. Without it grep omits the name when a
-  # single file is scanned, which would shift the "file:line" parsing below.
+  # -I skips binary files, -H always prefixes the file name (without it grep
+  # omits the name when a single file is scanned, which would shift the
+  # "file:line" parsing below).
   hits=$(grep -HInE -e "$RE_SK" -e "$RE_PEM" -e "$RE_PREFIX" -- "$@" 2>/dev/null || true)
   [ -n "$hits" ] || return 0
   while IFS= read -r hit; do
@@ -189,6 +217,17 @@ FILES=()
 collect_files
 FILE_TOTAL=${#FILES[@]}
 echo "scan_secrets: built-in pattern scan over $FILE_TOTAL file(s) in $PWD"
+
+# Never report a clean scan over an empty file list while git can see files:
+# that is the shape of a silently broken scan, not of a clean repository.
+if [ "$FILE_TOTAL" -eq 0 ] && [ -n "$GIT_ROOT" ]; then
+  TRACKED_COUNT=$(git ls-files 2>/dev/null | wc -l | tr -d '[:space:]')
+  if [ "${TRACKED_COUNT:-0}" -gt 0 ]; then
+    echo "scan_secrets: ERROR - git reports $TRACKED_COUNT tracked file(s) but none were collected; refusing to report a clean scan" >&2
+    exit 2
+  fi
+fi
+
 if [ "$FILE_TOTAL" -gt 0 ]; then
   scan_builtin "${FILES[@]}"
 fi
@@ -205,16 +244,33 @@ else
   echo "scan_secrets: built-in pattern scan clean"
 fi
 
+# Appends one gitleaks run to the shared log; the exit status is gitleaks'.
+gitleaks_pass() {
+  local label=$1 src=$2
+  shift 2
+  echo "scan_secrets: gitleaks - scanning $label"
+  gitleaks detect --source "$src" --redact --no-banner "$@" >> "$GITLEAKS_LOG" 2>&1
+}
+
 GITLEAKS_RC=0
-if command -v gitleaks >/dev/null 2>&1; then
-  echo "scan_secrets: gitleaks found on PATH - running deep scan"
+if [ "$PATTERNS_ONLY" -eq 1 ]; then
+  echo "scan_secrets: --patterns-only - gitleaks skipped, so no history and no entropy scan ran"
+elif command -v gitleaks >/dev/null 2>&1; then
   if [ -n "$GIT_ROOT" ]; then
-    gitleaks detect --source "$PWD" --redact --no-banner > "$GITLEAKS_LOG" 2>&1
+    if [ -f "$GIT_ROOT/.git" ]; then
+      {
+        echo "scan_secrets: NOTE - this checkout is a linked git worktree (.git is a file),"
+        echo "  which gitleaks cannot open; the history pass is skipped and only the"
+        echo "  working tree is scanned. Run in a normal clone, or rely on CI, for history."
+      } >&2
+    else
+      gitleaks_pass "commit history" "$GIT_ROOT" || GITLEAKS_RC=1
+    fi
+    gitleaks_pass "working tree" "$PWD" --no-git || GITLEAKS_RC=1
   else
-    gitleaks detect --source "$PWD" --no-git --redact --no-banner > "$GITLEAKS_LOG" 2>&1
+    gitleaks_pass "working tree" "$PWD" --no-git || GITLEAKS_RC=1
   fi
-  GITLEAKS_RC=$?
-  sed -n '1,80p' "$GITLEAKS_LOG"
+  sed -n '1,120p' "$GITLEAKS_LOG"
   if [ "$GITLEAKS_RC" -ne 0 ]; then
     echo "scan_secrets: FAIL - gitleaks reported findings (secrets are redacted above)" >&2
   else
@@ -222,16 +278,13 @@ if command -v gitleaks >/dev/null 2>&1; then
   fi
 else
   {
-    echo "scan_secrets: NOTE - gitleaks is not installed, only the built-in pattern scan ran"
-    echo "  full history and entropy based detection need gitleaks:"
-    echo "    https://github.com/gitleaks/gitleaks#installing"
-    echo "    docker run --rm -v \"\$PWD:/repo\" zricethezav/gitleaks:latest detect --source=/repo --redact -v"
-    echo "  CI runs gitleaks on every push and pull request"
+    echo "scan_secrets: ERROR - gitleaks is not installed, so the history and entropy"
+    echo "  checks did not run; refusing to report a clean scan."
+    echo "  install: https://github.com/gitleaks/gitleaks#installing"
+    echo "  pattern scan only (no history, no entropy): bash scripts/scan_secrets.sh --patterns-only"
+    echo "  CI installs gitleaks and scans the full history on every push and pull request"
   } >&2
-  if [ "$REQUIRE_GITLEAKS" = "1" ]; then
-    echo "scan_secrets: ERROR - gitleaks is required (--require-gitleaks / REQUIRE_GITLEAKS=1) but not on PATH" >&2
-    GITLEAKS_RC=2
-  fi
+  GITLEAKS_RC=2
 fi
 
 if [ "$BUILTIN_RC" -ne 0 ]; then
