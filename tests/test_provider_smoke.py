@@ -6,8 +6,9 @@ in-process stubs, covering the success contract, failures, timeouts and malforme
 responses. The point of the failure cases is that none of them may stay silent: each one
 must surface a warning, a failed trace entry or an explicit error event.
 
-The last test runs scripts/smoke_providers.py, the operator-facing entry point, and
-checks that it reports every provider offline with a zero exit code.
+The last two tests run scripts/smoke_providers.py, the operator-facing entry point: once
+offline (every provider reported, zero exit code) and once in `--live` mode without
+credentials, where the summary must report the skips instead of claiming a pass.
 
 No network access is required.
 """
@@ -418,4 +419,38 @@ def test_smoke_script_runs_offline_and_reports_every_provider():
     assert "LIVE MODE" not in result.stdout
     for name in ("deepseek", "embedding", "rerank", "rerank-fallback", "text-fallback"):
         assert f"[PASS] {name}" in result.stdout
-    assert "5/5 checks passed" in result.stdout
+    assert "5 checks: 5 passed, 0 skipped, 0 failed" in result.stdout
+
+
+def test_smoke_script_live_without_credentials_reports_skips_not_passes():
+    # Empty values, not just removed variables: config.py loads .env/.env.development
+    # through dotenv, which does not overwrite variables that are already set, so an
+    # empty value keeps a developer's real credentials out of the child process. Every
+    # live check then skips before it can open a socket.
+    env = {key: value for key, value in os.environ.items() if not key.endswith("API_KEY")}
+    env.update(
+        {
+            "DEEPSEEK_API_KEY": "",
+            "TEXT_FALLBACK_API_KEY": "",
+            "EMBEDDING_API_KEY": "",
+            "RERANK_API_KEY": "",
+            "DASHSCOPE_API_KEY": "",
+        }
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "smoke_providers.py"), "--live"],
+        cwd=str(ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "LIVE MODE" in result.stdout
+    for name in ("deepseek", "embedding", "rerank", "rerank-fallback", "text-fallback"):
+        assert f"[SKIP] {name}" in result.stdout
+    assert "5 checks: 0 passed, 5 skipped, 0 failed" in result.stdout
+    assert "no check executed" in result.stdout
+    assert "checks passed" not in result.stdout

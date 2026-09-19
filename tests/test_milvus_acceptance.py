@@ -7,17 +7,34 @@ round trips, knowledge-base isolation, and the index rebuild path.
 Only the embedding function is replaced, with a deterministic offline implementation,
 so the suite never touches the network and identical text always produces identical
 vectors.
+
+Milvus Lite serves the temporary database on a loopback port, which the gRPC client
+behind pymilvus would otherwise route through HTTP_PROXY/HTTPS_PROXY when the process
+has one configured; every test removes those variables for its own duration (see
+`isolate_from_environment_proxy`), so the module behaves the same with and without a
+proxy in the environment.
 """
 
 import hashlib
 import math
+import os
 import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from crud import knowledge_file as crud_knowledge_file
 from rag import milvus_client
 from service import knowledge_service
+
+ROOT = Path(__file__).resolve().parents[1]
+PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+NO_PROXY_VARIABLES = ("NO_PROXY", "no_proxy")
+PROXY_ENV_NAMES = {name.lower() for name in PROXY_VARIABLES + NO_PROXY_VARIABLES}
+LOOPBACK_NO_PROXY = "localhost,127.0.0.1,::1"
+DEAD_PROXY = "http://127.0.0.1:9"
 
 CHUNKS = [
     {"id": "0", "text": "员工迟到一次罚款50元，当月累计三次以上加倍处罚。"},
@@ -59,6 +76,25 @@ def _release_lite_server(uri: str) -> None:
         server_manager_instance.release_server(uri)
     except Exception:  # pragma: no cover - release is best effort cleanup
         pass
+
+
+@pytest.fixture(autouse=True)
+def isolate_from_environment_proxy(monkeypatch):
+    """Keep a globally configured proxy from hijacking the loopback connection.
+
+    gRPC resolves proxies from the process environment and applies them even to
+    127.0.0.1, so with a dead proxy configured every connection here is sent to that
+    proxy and fails after a ~10 s channel timeout instead of reaching Milvus Lite.
+    Removing the proxy variables (and excluding loopback via NO_PROXY as a second line of
+    defence) makes the tests pass at local-connection speed in both environments.
+
+    Function-scoped on purpose: pymilvus creates its channel lazily inside the test body,
+    so the environment only has to be clean for the duration of each test.
+    """
+    for name in PROXY_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    for name in NO_PROXY_VARIABLES:
+        monkeypatch.setenv(name, LOOPBACK_NO_PROXY)
 
 
 @pytest.fixture
@@ -246,3 +282,31 @@ def test_acceptance_query_window_and_missing_collection(lite_store):
     assert len(milvus_client.query_vectors("迟到", top_k=99, knowledge_base_id=17)) == 3
     assert milvus_client.query_vectors("   ", top_k=5, knowledge_base_id=17) == []
     assert milvus_client.query_vectors("迟到", top_k=5, knowledge_base_id=99) == []
+
+
+def test_acceptance_round_trip_survives_a_dead_proxy_environment():
+    """Re-run one case in a child process whose proxy variables point at a dead port.
+
+    Without the isolation above, gRPC sends the loopback connection to that proxy and the
+    child fails after a ~10 s channel timeout; the whole module then reports failures in
+    an environment whose only peculiarity is a proxy setting. The run must stay green.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.lower() not in PROXY_ENV_NAMES and key != "PYTEST_ADDOPTS"
+    }
+    env.update({name: DEAD_PROXY for name in PROXY_VARIABLES})
+    node = "tests/test_milvus_acceptance.py::test_acceptance_upload_query_delete_round_trip"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", node],
+        cwd=str(ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout

@@ -11,7 +11,12 @@ Pass ``--live`` to talk to the real endpoints. That requires configured credenti
 consumes quota and reaches the internet, so it is never the default and prints a banner.
 
 Checks: deepseek, embedding, rerank, rerank-fallback, text-fallback.
-Exit code is 0 only when every check passed (skips do not fail the run).
+
+The summary always reports passed, skipped and failed separately, and a skipped check is
+never counted as a pass: a `--live` run without credentials prints `5 checks: 0 passed,
+5 skipped, 0 failed` plus a "no check executed" line instead of claiming that 5/5 checks
+passed. Exit code is 0 unless a check failed (a skip is an unverified check, not a
+failure), so read the summary rather than the exit code to see what actually ran.
 """
 
 import argparse
@@ -296,9 +301,17 @@ def main() -> int:
     for name, status, detail in results:
         print(f"[{status}] {name.ljust(width)}  {detail}")
 
+    passed = [name for name, status, _ in results if status == "PASS"]
+    skipped = [name for name, status, _ in results if status == "SKIP"]
     failed = [name for name, status, _ in results if status == "FAIL"]
-    print(f"\n{len(results) - len(failed)}/{len(results)} checks passed"
-          + (f"; failed: {', '.join(failed)}" if failed else ""))
+
+    print(f"\n{len(results)} checks: {len(passed)} passed, {len(skipped)} skipped, {len(failed)} failed")
+    if skipped:
+        print(f"skipped, nothing verified: {', '.join(skipped)}")
+    if failed:
+        print(f"failed: {', '.join(failed)}")
+    if not passed:
+        print("no check executed: this run verified nothing against the providers")
     return 1 if failed else 0
 
 
