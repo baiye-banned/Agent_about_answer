@@ -178,7 +178,11 @@ export const useChatStore = defineStore('chat', () => {
             (!currentId.value || currentId.value === streamingConversationId.value)
           upsertConversation(conversation)
           streamingConversationId.value = conversation.id || streamingConversationId.value
-          pendingRouteConversationId.value = conversation.id || null
+          // 与下面的「认领会话」同理：视图已被用户显式清空时，也不得登记待跳转会话，
+          // 否则 Chat.vue 的 watcher 会 replace 回旧会话，把用户从「新对话」拽回去。
+          if (viewEpochAtSend === viewEpoch) {
+            pendingRouteConversationId.value = conversation.id || null
+          }
           if (!currentId.value && conversation.id && viewEpochAtSend === viewEpoch) {
             currentId.value = conversation.id
           }

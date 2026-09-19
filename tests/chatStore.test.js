@@ -398,6 +398,8 @@ test('流式期间点了「新对话」，旧流不得把会话认领回来', as
 
   assert.equal(store.currentId, null)
   assert.equal(store.selectedKnowledgeBaseId, null)
+  // 待跳转会话也不得登记：Chat.vue 的 watcher 会据此 router.replace('/chat/a')，把用户拽回旧会话。
+  assert.equal(store.pendingRouteConversationId, null)
   assert.deepEqual(contents(store), [])
 })
 
@@ -422,4 +424,28 @@ test('收尾刷新失败时，仍要启动评测轮询而不是中断收尾', as
 
   assert.equal(pollingStarts.length, 1)
   assert.deepEqual(contents(store), ['问题', '回答'])
+})
+
+test('流式期间点了「新对话」，迟到的会话事件不得登记待跳转会话', async () => {
+  const store = createStore([conversation('a', 'kb-a')])
+  store.setCurrentId('a')
+
+  store.sendMessage('问题')
+  const stream = streams.at(-1)
+  // 回答还在生成，用户点了「新对话」：视图被清空，路由回到 /chat。
+  store.clearMessages()
+
+  // 旧流此刻才投递 conversation 事件，带着会话 a。除了不得认领会话，也不得写入待跳转会话，
+  // 否则 Chat.vue 的 watcher 会 router.replace('/chat/a')，再由路由 watcher 把用户拽回旧会话。
+  stream.onMessage('', { type: 'conversation', conversation: conversation('a', 'kb-a') })
+
+  assert.equal(store.pendingRouteConversationId, null)
+  assert.equal(store.currentId, null)
+
+  stream.onMessage('回答')
+  stream.onDone()
+  respondConversations([conversation('a', 'kb-a')])
+  await flush()
+  assert.equal(store.pendingRouteConversationId, null)
+  assert.deepEqual(contents(store), [])
 })
