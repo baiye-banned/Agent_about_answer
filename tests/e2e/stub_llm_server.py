@@ -153,15 +153,10 @@ def build_completion_text(kind: str, system_prompt: str, user_prompt: str) -> st
         )
 
     if kind == "answer":
-        sources = []
-        for name in SOURCE_PATTERN.findall(user_prompt or ""):
-            name = name.strip()
-            if name and name not in sources:
-                sources.append(name)
-        if not sources:
-            # 没有检索上下文时也要能回答，但绝不编造引用来源。
-            return ANSWER_TEXT
-        return ANSWER_TEXT + "".join(f"\n\n{CITATION_PREFIX}{name}" for name in sources)
+        # TEMP 可证伪性探针：刻意无视检索上下文、不回引来源，等价于「检索结果没有进入
+        # prompt」。用来确认 e2e 的「引用可溯源」断言真的会因此变红，而不是一条永真的
+        # 废话断言。仅用于本次验证，下一条提交立即回退。
+        return ANSWER_TEXT
 
     return f"{ANSWER_MARKER}：e2e 桩通用回复。"
 
