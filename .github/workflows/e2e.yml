@@ -115,15 +115,17 @@ jobs:
       - name: 生成一次性 SECRET_KEY
         run: echo "SECRET_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
 
-      # 分片间隔刻意放大（700ms × 8 字符）：用例要能稳定观察到「生成中」这一帧，
+      # 分片间隔刻意放大（1200ms × 8 字符）：用例要能稳定观察到「生成中」这一帧，
       # 并断言此时答案尚未完整 —— 太快的话前端已经渲染完，这条断言就失去意义。
+      # 间隔也不能小：从「收到答案开头」到「收到完整标记串」跨 2 片，这个窗口要留得下
+      # runner 抖动与一次 read() 合并多片的余量，否则该断言会在绿意盎然的代码上假红。
       - name: 启动桩服务（本地 OpenAI 兼容替身）
         run: |
           set -euo pipefail
           nohup python tests/e2e/stub_llm_server.py \
             --port 8899 \
             --dim 1024 \
-            --chunk-delay-ms 700 \
+            --chunk-delay-ms 1200 \
             --chunk-size 8 \
             --log-file "$RUNNER_TEMP/stub-requests.jsonl" \
             > "$RUNNER_TEMP/stub.log" 2>&1 &
@@ -176,18 +178,30 @@ jobs:
           E2E_PASSWORD: dummy-e2e-dummy-e2e-dummy
           E2E_RUN_ID: ${{ github.run_id }}-${{ github.run_number }}
 
+      # 用例全绿不等于检索链路被完整走到：后端的路由 / 检索规划 / 重排都有兜底分支，
+      # 退化到兜底时用例照样绿。这一步读桩落盘的请求日志，把「五个角色真的被调过、
+      # 且没有落到通用兜底」变成 CI 上的硬断言，判定逻辑见 tests/e2e/check_stub_calls.py。
+      - name: 校验检索链路真的被走到
+        run: python tests/e2e/check_stub_calls.py "$RUNNER_TEMP/stub-requests.jsonl"
+
       # 红的运行要留现场，绿的运行同样要留证据：截图是「浏览器真的被点过」的直接凭据，
-      # 报告里能逐帧看到流式渲染。三段服务日志一并上传，便于判断是哪一环断的。
+      # 报告里能逐帧看到流式渲染。四份服务日志先归集进工作区再一并上传：upload-artifact
+      # 的压缩包根目录取所有 path 的公共祖先，混用工作区路径与 ${{ runner.temp }} 会让
+      # 包内凭空多出两层重复目录，下载后不便直接打开。
+      - name: 归集 e2e 日志
+        if: always()
+        run: |
+          mkdir -p tests/e2e/artifacts/logs
+          for name in stub.log stub-requests.jsonl backend.log frontend.log; do
+            # 服务没起来时日志本就不存在（那种情况上一步早已红），这里不额外制造噪声。
+            cp "$RUNNER_TEMP/$name" "tests/e2e/artifacts/logs/$name" 2>/dev/null || echo "没有 $name，跳过"
+          done
+
       - name: 上传 e2e 产物
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-artifacts
-          path: |
-            tests/e2e/artifacts/
-            ${{ runner.temp }}/stub.log
-            ${{ runner.temp }}/stub-requests.jsonl
-            ${{ runner.temp }}/backend.log
-            ${{ runner.temp }}/frontend.log
+          path: tests/e2e/artifacts/
           if-no-files-found: ignore
           retention-days: 7
