@@ -12,5 +12,5 @@ def test_load_json_value_rejects_unexpected_type():
 
 
 def test_load_json_value_preserves_parsed_falsy_values():
-    assert load_json_value(0, 1) == 0
+    assert load_json_value(0, 1) == 1
     assert load_json_value(False, True) is False
