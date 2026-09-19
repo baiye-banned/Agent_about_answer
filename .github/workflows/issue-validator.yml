@@ -27,13 +27,24 @@ jobs:
             const issue = context.payload.issue;
             const issuePath = `${process.env.RUNNER_TEMP}/issue.md`;
             fs.writeFileSync(issuePath, `${issue.title}\n\n${issue.body || ''}`, 'utf8');
+
+            const script = 'scripts/check_issue.mjs';
+            // 脚本缺失时 node 只会抛 ERR_MODULE_NOT_FOUND，先给出明确结论。
+            if (!fs.existsSync(script) || fs.statSync(script).size === 0) {
+              core.setFailed(`校验脚本缺失或为空：${script}`);
+              return;
+            }
+
             try {
               core.info(
-                execFileSync(process.execPath, ['scripts/check_issue.mjs', issuePath], {
+                execFileSync(process.execPath, [script, issuePath], {
                   encoding: 'utf8',
                 })
               );
             } catch (error) {
               const detail = `${error.stdout || ''}${error.stderr || ''}`.trim();
-              core.setFailed(detail || error.message);
+              core.setFailed(
+                detail ||
+                  `校验脚本异常退出（exit=${error.status}，signal=${error.signal}）：${error.message}`
+              );
             }

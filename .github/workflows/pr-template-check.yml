@@ -3,6 +3,8 @@ name: PR 描述校验
 # PR 描述里缺必填节时变红，并指出缺了哪一节。
 # 校验脚本优先取 base 分支上的版本，避免 PR 通过改脚本来放松自己的门禁；
 # base 分支上还没有脚本时（即引入本门禁的那个 PR）回退到当前分支的版本。
+# 注意：workflow 文件本身仍随 PR 的合并结果执行，这只是缓解措施；
+# 要让校验真正阻断合并，需在仓库设置里把它设为 required status check。
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
@@ -20,6 +22,8 @@ jobs:
 
       - name: 检出 base 分支（校验脚本首选来源）
         uses: actions/checkout@v4
+        # base 的提交可能已被 rebase / 回收而取不到；此时退回当前分支的脚本，不要因此把校验判红。
+        continue-on-error: true
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: .base
@@ -37,6 +41,11 @@ jobs:
             const headScript = 'scripts/check_pr_body.mjs';
             const script = fs.existsSync(baseScript) ? baseScript : headScript;
             core.info(`校验脚本：${script}`);
+            // 空文件也会让 node 静默退出 0，先确认脚本确实存在且有内容，避免门禁假绿。
+            if (!fs.existsSync(script) || fs.statSync(script).size === 0) {
+              core.setFailed(`校验脚本缺失或为空：${script}`);
+              return;
+            }
 
             try {
               core.info(
@@ -46,5 +55,8 @@ jobs:
               );
             } catch (error) {
               const detail = `${error.stdout || ''}${error.stderr || ''}`.trim();
-              core.setFailed(detail || error.message);
+              core.setFailed(
+                detail ||
+                  `校验脚本异常退出（exit=${error.status}，signal=${error.signal}）：${error.message}`
+              );
             }

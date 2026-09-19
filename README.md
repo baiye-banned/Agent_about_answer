@@ -484,7 +484,7 @@ npm run build
 ## 协作与提交规范
 
 - 提交信息与 PR 标题遵循 [Conventional Commits](https://www.conventionalcommits.org/)，type 与 scope 取值、合并方式见 [COMMIT_CONVENTION.md](COMMIT_CONVENTION.md)。
-- 新建 issue 必须选择模板；PR 描述按 [.github/pull_request_template.md](.github/pull_request_template.md) 逐节填写，必填节为空会被 CI 拦下。
+- 新建 issue 必须选择模板；PR 描述按 [.github/pull_request_template.md](.github/pull_request_template.md) 逐节填写，必填节为空时 CI 会变红。
 - CI 校验 PR 标题、PR 描述必填节与 issue 结构，脚本在 `scripts/` 下，可用 `node scripts/check_pr_body.mjs <文件>` 本地复现同一套规则。
 - 日常 PR squash 合并进 `develop`，发布 PR（`develop` → `main`）用 merge commit。
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // 校验 PR 标题是否符合 Conventional Commits 规范（见 COMMIT_CONVENTION.md）。
 // 用法：node scripts/check_title.mjs <标题文件路径>
-// 文件的第一行非空内容视为标题；通过退出码 0，不通过退出码 1。
+// 文件的第一行非空内容视为标题；通过退出码 0，不通过退出码 1，参数/IO 错误退出码 2。
 
 import { readFileSync } from 'node:fs';
 
@@ -20,7 +20,8 @@ const TYPES = [
 ];
 
 // type(scope)!: subject —— scope 与 ! 可选，冒号后必须有一个空格和实际描述。
-const TITLE_PATTERN = new RegExp(`^(${TYPES.join('|')})(\\((.+)\\))?(!)?: (.+)$`);
+// scope 内不允许再出现括号，否则贪婪匹配会把 "fix(rag): handle foo(bar)" 的 scope 取成 "rag): handle foo(bar"。
+const TITLE_PATTERN = new RegExp(`^(${TYPES.join('|')})(\\(([^()]*)\\))?(!)?: (.+)$`);
 
 function fail(lines) {
   console.error('[FAIL] PR 标题不符合 Conventional Commits 规范');
@@ -31,14 +32,20 @@ function fail(lines) {
   process.exit(1);
 }
 
+function usage(message) {
+  console.error(`[ERROR] ${message}`);
+  console.error('用法：node scripts/check_title.mjs <标题文件路径>');
+  process.exit(2);
+}
+
 const file = process.argv[2];
-if (!file) fail(['缺少参数。用法：node scripts/check_title.mjs <标题文件路径>']);
+if (!file) usage('缺少参数。');
 
 let raw;
 try {
   raw = readFileSync(file, 'utf8');
 } catch (err) {
-  fail([`无法读取文件 ${file}：${err.message}`]);
+  usage(`无法读取文件 ${file}：${err.message}`);
 }
 
 const title = raw

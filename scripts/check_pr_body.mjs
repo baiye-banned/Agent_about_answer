@@ -7,13 +7,25 @@ import { readFileSync } from 'node:fs';
 
 // 去掉 HTML 注释与空白后，小节正文至少要有这么多字符，避免「无」「-」蒙混过关。
 const MIN_LENGTH = 3;
-const EMPTY_VALUES = ['无', '暂无', 'n/a', 'na', 'todo', '待补充', '占位', '-', 'ok'];
+// _no response_ 是 GitHub issue 表单对空字段自动写入的占位文本，必须当作空。
+const EMPTY_VALUES = [
+  '无',
+  '暂无',
+  'n/a',
+  'na',
+  'todo',
+  '待补充',
+  '占位',
+  '-',
+  'ok',
+  '_no response_',
+];
 
 const REQUIRED_SECTIONS = [
   { key: '类型', label: '类型', kind: 'checkbox' },
   { key: '变更概述', label: '变更概述', kind: 'text' },
   { key: '背景问题', label: '背景·问题', kind: 'text' },
-  { key: '关联issue', label: '关联 issue', kind: 'text' },
+  { key: '关联issue', label: '关联 issue', kind: 'issueLink' },
   { key: '变更内容', label: '变更内容', kind: 'text' },
   { key: '日志验证证据', label: '日志·验证证据', kind: 'text' },
   { key: '测试情况', label: '测试情况', kind: 'text' },
@@ -56,10 +68,19 @@ const normalizeTitle = (text) =>
     .replace(/[\s·・/、|｜,，:：;；\-—–]+/g, '');
 
 // 按标题层级切分小节；同名更高层级标题才算下一节，允许小节内部使用 ### 子标题。
+// 代码围栏内的 # 行是粘贴进来的内容（日志、片段），不是小节标题，必须跳过。
 function parseSections(markdown) {
   const lines = markdown.split(/\r?\n/);
   const headings = [];
+  let fence = null;
   lines.forEach((line, index) => {
+    const fenceMark = line.match(/^\s*(```|~~~)/);
+    if (fenceMark) {
+      if (fence === null) fence = fenceMark[1];
+      else if (fence === fenceMark[1]) fence = null;
+      return;
+    }
+    if (fence !== null) return;
     const matched = line.match(/^(#{2,6})\s+(.*\S)\s*$/);
     if (matched) {
       headings.push({ level: matched[1].length, title: matched[2], line: index });
@@ -100,9 +121,14 @@ function cleanContent(content) {
     .trim();
 }
 
+// 占位内容即使写成列表项（`- 无`、`1. 无`）也算空；
+// 长度按码点算，避免两个字符的 emoji 凑够 UTF-16 长度蒙混过关。
 function isFilled(content) {
-  const cleaned = cleanContent(content);
-  if (cleaned.length < MIN_LENGTH) return false;
+  const cleaned = cleanContent(content)
+    .replace(/^\s*(?:[-*+]|\d+[.)])\s+/gm, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if ([...cleaned].length < MIN_LENGTH) return false;
   return !EMPTY_VALUES.includes(cleaned.toLowerCase());
 }
 
@@ -137,8 +163,22 @@ for (const required of REQUIRED_SECTIONS) {
     }
     continue;
   }
+  if (required.kind === 'issueLink') {
+    // 模板预填的裸 "Closes #" 不算关联：必须有 issue 编号，或写明无关联及原因。
+    const hasIssueRef = /#\d+/.test(section.content);
+    const declaresNone =
+      isFilled(section.content) && /(无|没有|不涉及|无需)\s*关联\s*issue/i.test(section.content);
+    if (!hasIssueRef && !declaresNone) {
+      problems.push(
+        `「${required.label}」节既没有「#编号」形式的 issue 引用，也没有写明「无关联 issue」及原因。`
+      );
+    }
+    continue;
+  }
   if (!isFilled(section.content)) {
-    problems.push(`「${required.label}」节为空或只有占位内容。`);
+    problems.push(
+      `「${required.label}」节内容过短或只有占位内容（至少 ${MIN_LENGTH} 个字符，且不能是「无」这类占位文本）。`
+    );
   }
 }
 

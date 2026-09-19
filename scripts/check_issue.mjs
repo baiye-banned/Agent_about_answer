@@ -8,19 +8,31 @@ import { readFileSync } from 'node:fs';
 
 // 小节正文去掉注释与空白后至少要有这么多字符，避免用「无」占位。
 const MIN_LENGTH = 3;
-const EMPTY_VALUES = ['无', '暂无', 'n/a', 'na', 'todo', '待补充', '占位', '-', 'ok'];
+// _no response_ 是 GitHub issue 表单对空字段自动写入的占位文本，必须当作空。
+const EMPTY_VALUES = [
+  '无',
+  '暂无',
+  'n/a',
+  'na',
+  'todo',
+  '待补充',
+  '占位',
+  '-',
+  'ok',
+  '_no response_',
+];
 
 const RULES = {
   BUG: {
     prefix: '[BUG]',
     keywords: [
-      { key: '复现', label: '复现步骤' },
-      { key: '日志', label: '日志' },
+      { section: '复现步骤', word: '复现' },
+      { section: '日志', word: '日志' },
     ],
   },
   FEATURE: {
     prefix: '[FEATURE]',
-    keywords: [{ key: '验收', label: '验收标准' }],
+    keywords: [{ section: '验收标准', word: '验收' }],
   },
 };
 
@@ -48,10 +60,19 @@ const normalizeTitle = (text) =>
     .replace(/[`*_#]/g, '')
     .replace(/[\s·・/、|｜,，:：;；\-—–]+/g, '');
 
+// 代码围栏内的 # 行是粘贴进来的日志内容，不是小节标题，必须跳过。
 function parseSections(markdown) {
   const lines = markdown.split(/\r?\n/);
   const headings = [];
+  let fence = null;
   lines.forEach((line, index) => {
+    const fenceMark = line.match(/^\s*(```|~~~)/);
+    if (fenceMark) {
+      if (fence === null) fence = fenceMark[1];
+      else if (fence === fenceMark[1]) fence = null;
+      return;
+    }
+    if (fence !== null) return;
     const matched = line.match(/^(#{2,6})\s+(.*\S)\s*$/);
     if (matched) {
       headings.push({ level: matched[1].length, title: matched[2], line: index });
@@ -83,9 +104,14 @@ function cleanContent(content) {
     .trim();
 }
 
+// 占位内容即使写成列表项（`- 无`、`1. 无`）也算空；
+// 长度按码点算，避免两个字符的 emoji 凑够 UTF-16 长度蒙混过关。
 function isFilled(content) {
-  const cleaned = cleanContent(content);
-  if (cleaned.length < MIN_LENGTH) return false;
+  const cleaned = cleanContent(content)
+    .replace(/^\s*(?:[-*+]|\d+[.)])\s+/gm, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if ([...cleaned].length < MIN_LENGTH) return false;
   return !EMPTY_VALUES.includes(cleaned.toLowerCase());
 }
 
@@ -120,19 +146,31 @@ if (!kind) {
   ]);
 }
 
+// 去掉标题行后的正文，供手写正文的关键字兜底使用：
+// 只看正文内容，避免「复现频率」这类同级标题把小节校验蒙混过去。
+const prose = body
+  .split(/\r?\n/)
+  .filter((line) => !/^\s*#{1,6}\s/.test(line))
+  .join('\n');
+
 const problems = [];
 for (const keyword of kind.keywords) {
-  const section = sections.find((item) => item.normalized.includes(keyword.key));
+  const key = normalizeTitle(keyword.section);
+  const section =
+    sections.find((item) => item.normalized === key) ||
+    sections.find((item) => item.normalized.includes(key));
   if (section) {
     if (!isFilled(section.content)) {
-      problems.push(`「${keyword.label}」小节为空或只有占位内容。`);
+      problems.push(
+        `「${keyword.section}」小节内容过短或只有占位内容（至少 ${MIN_LENGTH} 个字符，且不能是「无」这类占位文本）。`
+      );
     }
     continue;
   }
-  // 没有对应小节标题时，退回为全文关键字检查（兼容手写正文）。
-  if (!body.includes(keyword.key)) {
-    problems.push(`正文缺少「${keyword.label}」相关内容。`);
-  }
+  // 正文完全没有小节标题时（手写正文），退回关键字检查；
+  // 已经用了小节结构，就必须带上模板里的必填小节，否则结构性缺失会被关键字蒙混过关。
+  if (sections.length === 0 && prose.includes(keyword.word)) continue;
+  problems.push(`正文缺少「${keyword.section}」小节。`);
 }
 
 if (problems.length > 0) {
