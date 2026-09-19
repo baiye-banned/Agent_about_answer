@@ -1,0 +1,77 @@
+name: 功能请求
+description: 提出一个新功能或对现有能力的改进建议
+title: "[FEATURE] "
+labels: [enhancement, "Triage Needed"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提出功能建议时，请重点说明「为什么需要」和「怎样算做完」，
+        这样评审可以直接判断范围，而不是反复追问。
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 概述
+      description: 一句话说明你想要的功能
+      placeholder: 例如：支持按文件维度查看命中的检索片段
+    validations:
+      required: true
+
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景
+      description: 为什么需要它？现在遇到了什么痛点？
+      placeholder: |
+        当前…，导致…，所以我希望…
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 功能描述
+      description: 详细的功能行为、交互方式、涉及的前后端改动
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 备选方案
+      description: 选填。考虑过的其它实现思路，以及为什么没有选它
+    validations:
+      required: false
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: 优先级
+      description: P0 最高（阻塞使用），P3 最低（有更好）
+      options:
+        - P0
+        - P1
+        - P2
+        - P3
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 怎样算做完？请写成可逐条验证的条目
+      placeholder: |
+        - [ ] 在…页面可以看到…
+        - [ ] 当…时返回…
+    validations:
+      required: true
+
+  - type: textarea
+    id: references
+    attributes:
+      label: 参考资料
+      description: 选填。竞品截图、设计稿链接、相关文档
+    validations:
+      required: false
