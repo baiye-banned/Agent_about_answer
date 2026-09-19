@@ -1,0 +1,43 @@
+name: 前端测试
+
+# 触发：PR → develop / main；push → develop（合入后回归）。
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop]
+
+# CI 只需要读取仓库内容。
+permissions:
+  contents: read
+
+# 同一分支连续 push 时，取消上一次仍在跑的运行（按 workflow + ref 分组）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node-test:
+    name: node --test (Node 22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # npm 缓存命中会在日志里显示 "Cache restored from key: ..."。
+      # package-lock.json 是 npm ci 的输入，缓存键跟着它走。
+      - name: 安装 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      # 必须用 npm ci：未安装依赖时 node --test 会因找不到 element-plus 报
+      # ERR_MODULE_NOT_FOUND，看起来像"测试坏了"，实际只是没装依赖。
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 运行前端测试
+        run: npm test
