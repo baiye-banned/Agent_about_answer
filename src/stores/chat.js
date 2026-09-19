@@ -27,6 +27,10 @@ export const useChatStore = defineStore('chat', () => {
   const streamImageAnalysis = ref(null)
   const evaluationPollTimer = ref(null)
 
+  // 请求序号：切换会话会让在途的消息请求与流式响应失效，避免陈旧响应覆盖当前会话。
+  let loadSeq = 0
+  let streamSeq = 0
+
   const currentConversation = computed(() =>
     conversations.value.find((conversation) => conversation.id === currentId.value)
   )
@@ -60,11 +64,18 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  // 只有「最新一次加载」且「仍停留在该会话」的响应才允许写入状态。
+  function isLatestLoad(seq, id) {
+    return seq === loadSeq && currentId.value === id
+  }
+
   async function selectConversation(id) {
+    const seq = ++loadSeq
     currentId.value = id
     loading.value = true
     try {
       const response = await chatAPI.getMessages(id)
+      if (!isLatestLoad(seq, id)) return
       messages.value = Array.isArray(response) ? response.map(normalizeMessage) : []
       const conversation = conversations.value.find((item) => item.id === id)
       if (conversation?.knowledge_base_id) {
@@ -76,7 +87,7 @@ export const useChatStore = defineStore('chat', () => {
         stopEvaluationPolling()
       }
     } finally {
-      loading.value = false
+      if (seq === loadSeq) loading.value = false
     }
   }
 
@@ -141,6 +152,7 @@ export const useChatStore = defineStore('chat', () => {
     pendingRouteConversationId.value = null
     streamingHasAttachments.value = attachments.length > 0
     abortController.value = new AbortController()
+    const requestSeq = ++streamSeq
 
     addMessage({ role: 'user', content: displayText, attachments })
 
@@ -151,6 +163,7 @@ export const useChatStore = defineStore('chat', () => {
       attachments,
       signal: abortController.value.signal,
       onMessage: (content, event) => {
+        if (!isLatestStream(requestSeq)) return
         if (event?.type === 'conversation') {
           const conversation = event.conversation || {}
           upsertConversation(conversation)
@@ -178,12 +191,18 @@ export const useChatStore = defineStore('chat', () => {
         }
         streamContent.value += content
       },
-      onDone: handleStreamDone,
-      onError: handleStreamError,
+      onDone: () => handleStreamDone(requestSeq),
+      onError: (error) => handleStreamError(error, requestSeq),
     })
   }
 
-  async function handleStreamDone() {
+  // 只有最新一次流式请求的回调才允许写状态；旧的流既不能追加内容，也不能收尾。
+  function isLatestStream(seq) {
+    return seq === streamSeq
+  }
+
+  async function handleStreamDone(requestSeq) {
+    if (!isLatestStream(requestSeq)) return
     const targetConversationId = streamingConversationId.value
     const shouldTrackEvaluation = shouldTrackEvaluationFromTrace()
     const shouldShowLocalMessage = streamContent.value && currentId.value === targetConversationId
@@ -201,6 +220,7 @@ export const useChatStore = defineStore('chat', () => {
 
     finishStreaming()
     const nextConversations = await fetchConversations().catch(() => [])
+    if (!isLatestStream(requestSeq)) return
     if (!currentId.value && nextConversations?.[0]?.id) {
       setCurrentId(nextConversations[0].id)
     } else if (targetConversationId && !currentId.value) {
@@ -216,7 +236,8 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  function handleStreamError(error) {
+  function handleStreamError(error, requestSeq) {
+    if (!isLatestStream(requestSeq)) return
     if (error?.name === 'AbortError') {
       if (streamContent.value && currentId.value === streamingConversationId.value) {
         addMessage({
