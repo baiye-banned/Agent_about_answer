@@ -51,6 +51,60 @@ def test_retrieve_knowledge_uses_sub_questions_and_rewrites(monkeypatch):
     assert trace["query_plan"]["original_question"] == "迟到三个小时扣多少钱"
 
 
+def test_retrieve_knowledge_skips_vector_routes_when_embedding_backend_fails(monkeypatch):
+    keyword_chunk = {
+        "id": "kw-1",
+        "chunk_id": "1",
+        "content": "迟到30分钟以内罚款50元",
+        "file_name": "考勤制度.txt",
+        "file_id": 1,
+        "route": "keyword",
+    }
+    status_calls = []
+
+    def fake_query_vectors(query, top_k, knowledge_base_id, route):
+        raise retrieval.EmbeddingBackendError("向量化接口调用失败（https://embedding.example/v1/embeddings）：429 Too Many Requests")
+
+    def fake_keyword_recall(db, knowledge_base_id, keywords, top_k):
+        return [keyword_chunk]
+
+    async def fake_rerank_chunks(question, chunks):
+        return chunks, {"status": "done", "items": []}
+
+    def fake_embedding_backend_status():
+        status_calls.append(True)
+        if len(status_calls) == 1:
+            return {"mode": "openai-compatible", "last_error": ""}
+        return {"mode": "unavailable", "last_error": "向量化接口调用失败：429 Too Many Requests"}
+
+    monkeypatch.setattr(retrieval, "query_vectors", fake_query_vectors)
+    monkeypatch.setattr(retrieval, "keyword_recall", fake_keyword_recall)
+    monkeypatch.setattr(retrieval, "rerank_chunks", fake_rerank_chunks)
+    monkeypatch.setattr(retrieval, "embedding_backend_status", fake_embedding_backend_status)
+
+    chunks, trace = asyncio.run(
+        retrieval.retrieve_knowledge(
+            "考勤 迟到 处罚",
+            knowledge_base_id=1,
+            db=object(),
+            query_plan={
+                "original_question": "迟到30分钟以内罚款多少钱",
+                "simplified_question": "迟到罚款标准",
+                "sub_questions": [],
+                "rewrites": [],
+                "keywords": ["考勤", "迟到"],
+                "required_evidence": [],
+            },
+        )
+    )
+
+    assert [chunk["route"] for chunk in chunks] == ["keyword"]
+    assert trace["embedding_error"]
+    assert trace["embedding"]["mode"] == "unavailable"
+    assert [route["count"] for route in trace["routes"]] == [0, 0, 1]
+    assert len(status_calls) == 2
+
+
 def test_build_route_specs_does_not_reintroduce_empty_question():
     assert retrieval._build_route_specs("   ", {}) == []
 
