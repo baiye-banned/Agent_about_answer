@@ -260,14 +260,15 @@ SEED_DEMO_PASSWORD=
 ```
 
 - `SEED_DEFAULT_USERS` 默认为 `true`，设为 `false` 后启动过程不会创建任何账号。
-- 账号口令只来自 `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD`，仓库中不存在固定口令；未配置对应变量时会生成不可预测的随机口令，随机口令不会写入日志。
-- 因此未显式配置口令的账号无法直接登录，需要通过下面的重置方式设置新口令（`新口令` 换成自定义值）：
+- 账号口令只来自 `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD`，仓库中不存在固定口令；未配置对应变量时会生成不可预测的随机口令，随机口令不会写入日志。口令两端的空白字符会被忽略。
+- 因此未显式配置口令的账号无法直接登录，**已存在**的账号可以按下面的方式重置口令（`新口令` 换成自定义值）：
 
 ```bash
 cd backend
 python -c "from database.session import SessionLocal; from crud import user as crud_user; from model.models import User; from service.auth_service import pwd_context; db = SessionLocal(); u = db.query(User).filter_by(username='admin').first(); crud_user.update_password_hash(db, u, pwd_context.hash('新口令')); db.close(); print('password updated')"
 ```
 
+- 如果该账号还不存在（例如长期设置 `SEED_DEFAULT_USERS=false`，库里没有任何账号），临时把 `SEED_DEFAULT_USERS` 设回 `true` 并配置 `SEED_ADMIN_PASSWORD`，重启服务一次即可创建；播种只补建不存在的账号，不会覆盖已有账号的口令。
 - 对外提供服务前，建议设置 `SEED_DEFAULT_USERS=false`，或至少为启用的账号配置强口令。
 
 ### 4.3 初始化数据库

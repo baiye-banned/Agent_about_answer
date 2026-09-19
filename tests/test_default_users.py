@@ -11,7 +11,8 @@ from service.auth_service import pwd_context
 import service.user_service as user_service
 
 
-LEGACY_PASSWORDS = ("admin123", "demo123")
+# 修复前写死在仓库里的口令就是「用户名 + 123」；这里按用户名推导，避免再把明文口令写进仓库。
+LEGACY_PASSWORDS = tuple(f"{username}123" for username in ("admin", "demo"))
 BACKEND_DIR = Path(__file__).resolve().parents[1] / "backend"
 
 
@@ -133,6 +134,22 @@ def test_seed_logs_hint_once_without_leaking_generated_password(monkeypatch, cap
 
     users = _users(session_factory)
     assert pwd_context.verify(generated_password, users["admin"].password_hash)
+
+
+def test_seed_switch_is_read_from_env_and_defaults_to_on(monkeypatch):
+    import importlib
+
+    import config
+
+    try:
+        for raw_value, expected in (("false", False), ("0", False), ("off", False), ("true", True)):
+            monkeypatch.setenv("SEED_DEFAULT_USERS", raw_value)
+            assert importlib.reload(config).SEED_DEFAULT_USERS is expected
+        monkeypatch.delenv("SEED_DEFAULT_USERS", raising=False)
+        assert importlib.reload(config).SEED_DEFAULT_USERS is True
+    finally:
+        monkeypatch.delenv("SEED_DEFAULT_USERS", raising=False)
+        importlib.reload(config)
 
 
 def test_backend_sources_have_no_hardcoded_default_passwords():
