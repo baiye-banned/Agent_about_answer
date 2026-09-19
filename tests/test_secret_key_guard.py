@@ -66,8 +66,10 @@ def _run_in_subprocess(script: str, **env_overrides):
     env = dict(os.environ)
     env.pop("SECRET_KEY", None)
     env.pop("ALLOW_INSECURE_DEFAULT_SECRET", None)
-    # 空值等价于「未配置」，同时阻止仓库里的本地 .env 通过 load_dotenv 补上 SECRET_KEY。
+    # 显式置空：空值等价于「未配置」，同时因为 load_dotenv(override=False) 不会覆盖已存在的键，
+    # 可以挡住开发机本地 .env 里的 SECRET_KEY / ALLOW_INSECURE_DEFAULT_SECRET，保证用例可复现。
     env["SECRET_KEY"] = ""
+    env["ALLOW_INSECURE_DEFAULT_SECRET"] = ""
     env.update(env_overrides)
     return subprocess.run(
         [sys.executable, "-c", script],
