@@ -1,0 +1,78 @@
+name: 静态检查
+
+# 当前是**最低档**：只拦语法错误和未定义名这类确定性错误，不做风格规范。
+# 升级路线（改这里之前先确认不会把存量代码一次性判红）：
+#   1) 后端：现在 ruff 只用 E9/F63/F7/F82（语法错误、未定义名、比较写法错误）。
+#      为什么不直接开 E4/E7/E9/F：存量代码在该档下有 6 个历史告警、会让门禁一上来就红
+#      （backend/main.py 2 个 F401、backend/service/chat_service.py 2 个 F401、
+#      backend/rag/milvus_client.py 2 个 E402）。先清掉这 6 处，再把选择集放宽到 E4,E7,E9,F，
+#      之后加仓库根 ruff.toml，逐步放开 E/W/F 全量，再逐个评估 I（import 排序）、
+#      B（bugbear）、UP（pyupgrade）、SIM 等规则集。
+#   2) 前端：现在只有 node --check（只覆盖 src/**/*.js；.vue 由 build.yml 的 vite build 兜底），
+#      后续引入 eslint + eslint-plugin-vue，再考虑 prettier 与 vue-tsc。
+# 这个 workflow 不做"风格即门禁"的事，也不允许用 continue-on-error 把失败掩盖成绿色。
+
+# 触发：PR → develop / main；push → develop（合入后回归）。
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop]
+
+# CI 只需要读取仓库内容。
+permissions:
+  contents: read
+
+# 同一分支连续 push 时，取消上一次仍在跑的运行（按 workflow + ref 分组）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-lint:
+    name: 后端静态检查 (compileall + ruff, Python 3.10)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # 第一档不依赖任何第三方工具，保证即使 pip 装不上也有一道语法门禁。
+      - name: 语法级校验 (compileall)
+        run: python -m compileall -q backend
+
+      # 版本钉死，避免上游默认规则集变化让门禁悄悄变严或变松。
+      - name: 安装 ruff
+        run: pip install ruff==0.16.8
+
+      - name: ruff 基础规则集
+        run: ruff check --select E9,F63,F7,F82 backend
+
+  frontend-lint:
+    name: 前端静态检查 (node --check, Node 22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # node --check 只做语法解析，不需要 npm install。
+      # 只覆盖 .js：.vue 单文件组件不是合法 JS，交给 build.yml 的 vite build 兜底。
+      - name: 语法校验 src/**/*.js
+        run: |
+          failed=0
+          while IFS= read -r -d '' file; do
+            echo "checking $file"
+            node --check "$file" || failed=1
+          done < <(find src -name '*.js' -print0)
+          exit "$failed"

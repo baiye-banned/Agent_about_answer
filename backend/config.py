@@ -61,6 +61,10 @@ MILVUS_COLLECTION_NAME = os.getenv("MILVUS_COLLECTION_NAME", "")
 # SQLite checkpointer
 CHECKPOINTER_DB_PATH = os.getenv("CHECKPOINTER_DB_PATH", "./checkpointer.db")
 
+# Bootstrap accounts. When disabled, seed_default_users() creates nothing.
+# Account passwords come from SEED_<USERNAME>_PASSWORD and are never hardcoded.
+SEED_DEFAULT_USERS = _env_bool("SEED_DEFAULT_USERS", True)
+
 # DeepSeek OpenAI-compatible chat API
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")

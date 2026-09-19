@@ -203,6 +203,13 @@ export const useChatStore = defineStore('chat', () => {
           streamImageAnalysis.value = normalizeImageAnalysis(event.analysis || event)
           return
         }
+        if (event?.type === 'reset') {
+          // 首个模型中途失败、后备模型从头重新生成：作废已渲染的增量。
+          // 只清空正文缓冲，流式占位（streaming / streamSources / streamTrace）保持不变，
+          // 后备模型后续的增量会照常追加到这个占位上。
+          streamContent.value = ''
+          return
+        }
         streamContent.value += content
       },
       onDone: () => handleStreamDone(requestSeq, viewEpochAtSend),

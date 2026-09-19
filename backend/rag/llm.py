@@ -168,6 +168,23 @@ async def stream_answer_events(
             }
             return
 
+    # 后备模型是从头重新生成整段回答，而不是接着 DeepSeek 的半截话往下写。
+    # 因此在下发后备模型第一个 chunk 之前，必须先下发 reset 事件作废已输出的内容，
+    # 否则消费方（前端渲染、chat_service 落库）会把两段回答首尾拼接成重复文本。
+    reset_event = {
+        "type": "reset",
+        "reason": "text_fallback",
+        "message": "DeepSeek 生成中断，已切换到文本后备模型重新生成本轮回答。",
+    }
+    _trace_add(
+        trace,
+        "langchain_stream_reset",
+        "ChatOpenAI.astream",
+        params={"reason": reset_event["reason"], "model": TEXT_FALLBACK_MODEL},
+        note="下发 reset 事件作废已流式输出的 DeepSeek 内容，消费方需清空缓冲后重新累积后备模型输出。",
+    )
+    yield reset_event
+
     try:
         _trace_add(
             trace,

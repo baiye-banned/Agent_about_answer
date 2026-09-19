@@ -527,6 +527,29 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                         )
                         yield f"data: {data}\n\n"
                         break
+                    if event.get("type") == "reset":
+                        # 后备模型从头重新生成整段回答：先作废已下发的增量，
+                        # 落库文本也从零重新累积，绝不与重置前的内容拼接。
+                        full = ""
+                        first_chunk_seen = False
+                        trace.add(
+                            "stream_reset",
+                            "_stream_openai_chat_chunks",
+                            params={"reason": event.get("reason") or ""},
+                            note="已下发 reset 事件作废此前流式内容，本轮回答改为只保留重置后重新生成的部分。",
+                        )
+                        for payload in _trace_sse_payloads(trace):
+                            yield payload
+                        data = json.dumps(
+                            {
+                                "type": "reset",
+                                "reason": event.get("reason") or "",
+                                "message": event.get("message") or "",
+                            },
+                            ensure_ascii=False,
+                        )
+                        yield f"data: {data}\n\n"
+                        continue
                     chunk = event.get("content", "")
                 else:
                     chunk = event

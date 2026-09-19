@@ -1,5 +1,6 @@
 const STREAM_DONE_MESSAGE = '[DONE]'
-const CONTROL_EVENT_TYPES = new Set(['sources', 'conversation', 'image_analysis', 'trace'])
+// reset：后备模型接管前作废已渲染内容的控制事件，正文为空，消费方需清空当前流缓冲后重新累积。
+const CONTROL_EVENT_TYPES = new Set(['sources', 'conversation', 'image_analysis', 'trace', 'reset'])
 
 export async function readStreamEvents(body, onMessage) {
   const reader = body.getReader()
