@@ -1,7 +1,8 @@
 name: PR 标题校验
 
 # PR 标题必须符合 Conventional Commits，否则变红。
-# 校验脚本取 base 分支上的版本，避免 PR 通过改脚本来放松自己的门禁。
+# 校验脚本优先取 base 分支上的版本，避免 PR 通过改脚本来放松自己的门禁；
+# base 分支上还没有脚本时（即引入本门禁的那个 PR）回退到当前分支的版本。
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
@@ -14,10 +15,14 @@ jobs:
     name: PR 标题规范校验
     runs-on: ubuntu-latest
     steps:
-      - name: 检出 base 分支（校验脚本来源）
+      - name: 检出 PR 合并结果（脚本兜底来源）
+        uses: actions/checkout@v4
+
+      - name: 检出 base 分支（校验脚本首选来源）
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
+          path: .base
 
       - name: 校验 PR 标题
         uses: actions/github-script@v7
@@ -27,9 +32,15 @@ jobs:
             const { execFileSync } = require('child_process');
             const titlePath = `${process.env.RUNNER_TEMP}/pr_title.txt`;
             fs.writeFileSync(titlePath, context.payload.pull_request.title || '', 'utf8');
+
+            const baseScript = '.base/scripts/check_title.mjs';
+            const headScript = 'scripts/check_title.mjs';
+            const script = fs.existsSync(baseScript) ? baseScript : headScript;
+            core.info(`校验脚本：${script}`);
+
             try {
               core.info(
-                execFileSync(process.execPath, ['scripts/check_title.mjs', titlePath], {
+                execFileSync(process.execPath, [script, titlePath], {
                   encoding: 'utf8',
                 })
               );

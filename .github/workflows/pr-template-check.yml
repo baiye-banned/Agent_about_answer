@@ -1,7 +1,8 @@
 name: PR 描述校验
 
 # PR 描述里缺必填节时变红，并指出缺了哪一节。
-# 校验脚本取 base 分支上的版本，避免 PR 通过改脚本来放松自己的门禁。
+# 校验脚本优先取 base 分支上的版本，避免 PR 通过改脚本来放松自己的门禁；
+# base 分支上还没有脚本时（即引入本门禁的那个 PR）回退到当前分支的版本。
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
@@ -14,10 +15,14 @@ jobs:
     name: PR 描述必填节校验
     runs-on: ubuntu-latest
     steps:
-      - name: 检出 base 分支（校验脚本来源）
+      - name: 检出 PR 合并结果（脚本兜底来源）
+        uses: actions/checkout@v4
+
+      - name: 检出 base 分支（校验脚本首选来源）
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
+          path: .base
 
       - name: 校验 PR 描述
         uses: actions/github-script@v7
@@ -27,9 +32,15 @@ jobs:
             const { execFileSync } = require('child_process');
             const bodyPath = `${process.env.RUNNER_TEMP}/pr_body.md`;
             fs.writeFileSync(bodyPath, context.payload.pull_request.body || '', 'utf8');
+
+            const baseScript = '.base/scripts/check_pr_body.mjs';
+            const headScript = 'scripts/check_pr_body.mjs';
+            const script = fs.existsSync(baseScript) ? baseScript : headScript;
+            core.info(`校验脚本：${script}`);
+
             try {
               core.info(
-                execFileSync(process.execPath, ['scripts/check_pr_body.mjs', bodyPath], {
+                execFileSync(process.execPath, [script, bodyPath], {
                   encoding: 'utf8',
                 })
               );
