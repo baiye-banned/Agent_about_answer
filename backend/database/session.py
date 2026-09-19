@@ -84,11 +84,21 @@ def _ensure_schema_columns():
         if "knowledge_base_id" not in columns:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE knowledge_files ADD COLUMN knowledge_base_id INTEGER"))
+        if "user_id" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE knowledge_files ADD COLUMN user_id INTEGER"))
+                conn.execute(text("CREATE INDEX ix_knowledge_files_user_id ON knowledge_files (user_id)"))
         _ensure_mysql_varchar_column("knowledge_files", "name", 255, nullable=False)
         _ensure_mysql_text_column("knowledge_files", "content", "LONGTEXT")
 
     if "knowledge_bases" in table_names:
+        columns = {column["name"] for column in inspector.get_columns("knowledge_bases")}
+        if "user_id" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE knowledge_bases ADD COLUMN user_id INTEGER"))
+                conn.execute(text("CREATE INDEX ix_knowledge_bases_user_id ON knowledge_bases (user_id)"))
         _ensure_mysql_varchar_column("knowledge_bases", "name", 100, nullable=False)
+        _ensure_knowledge_base_owner_unique_index()
 
     if "users" in table_names:
         _ensure_mysql_varchar_column("users", "username", 50, nullable=False)
@@ -191,6 +201,49 @@ def _ensure_mysql_character_column(
                 f"CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci{null_clause}"
             )
         )
+
+
+def _ensure_knowledge_base_owner_unique_index():
+    """知识库名称改为按归属用户唯一：先摘掉旧的全局唯一索引，再补 (user_id, name)。
+
+    历史数据里 user_id 为 NULL 的行在唯一索引里互不冲突，因此回填前后都不会报错。
+    """
+    if engine.dialect.name != "mysql" or not _get_mysql_column_info("knowledge_bases", "user_id"):
+        return
+    try:
+        with engine.begin() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        """
+                        SELECT INDEX_NAME AS index_name,
+                               GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS index_columns
+                        FROM information_schema.STATISTICS
+                        WHERE TABLE_SCHEMA = DATABASE()
+                          AND TABLE_NAME = 'knowledge_bases'
+                          AND NON_UNIQUE = 0
+                        GROUP BY INDEX_NAME
+                        """
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            for row in rows:
+                index_columns = str(row["index_columns"] or "").lower()
+                if index_columns == "name":
+                    conn.execute(text(f"ALTER TABLE `knowledge_bases` DROP INDEX `{row['index_name']}`"))
+                    rows = [item for item in rows if item["index_name"] != row["index_name"]]
+            if not any(str(row["index_columns"] or "").lower() == "user_id,name" for row in rows):
+                conn.execute(
+                    text(
+                        "ALTER TABLE `knowledge_bases` "
+                        "ADD UNIQUE KEY `uq_knowledge_bases_user_name` (user_id, name)"
+                    )
+                )
+    except Exception:
+        # 迁移失败不阻塞启动；即使仍是旧的全局唯一索引，归属过滤依然生效。
+        pass
 
 
 def _get_mysql_column_info(table_name: str, column_name: str):

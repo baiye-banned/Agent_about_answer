@@ -41,20 +41,27 @@ from rag.retrieval import decide_need_rag, retrieve_knowledge
 logger = logging.getLogger(__name__)
 
 
+def _serialize_conversation(conv: Conversation, user_id: int) -> dict:
+    # 历史遗留的跨用户绑定不对外暴露，避免泄露他人知识库
+    knowledge_base = (
+        conv.knowledge_base
+        if conv.knowledge_base and conv.knowledge_base.user_id == user_id
+        else None
+    )
+    return {
+        "id": conv.id,
+        "title": conv.title,
+        "knowledge_base_id": knowledge_base.id if knowledge_base else None,
+        "knowledge_base_name": knowledge_base.name if knowledge_base else "",
+        "created_at": conv.created_at.isoformat() if conv.created_at else "",
+        "updated_at": conv.updated_at.isoformat() if conv.updated_at else "",
+    }
+
+
 def list_conversations(user: User = Depends(get_current_user),
                        db: Session = Depends(get_db)):
     rows = crud_chat.list_conversations(db, user.id)
-    return [
-        {
-            "id": c.id,
-            "title": c.title,
-            "knowledge_base_id": c.knowledge_base_id,
-            "knowledge_base_name": c.knowledge_base.name if c.knowledge_base else "",
-            "created_at": c.created_at.isoformat() if c.created_at else "",
-            "updated_at": c.updated_at.isoformat() if c.updated_at else "",
-        }
-        for c in rows
-    ]
+    return [_serialize_conversation(c, user.id) for c in rows]
 
 
 def get_messages(cid: str, user: User = Depends(get_current_user),
@@ -167,7 +174,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             note="后端收到一次聊天请求，先建立 trace_id，后续所有步骤都会挂到这次请求下面。",
         )
         cid = body.conversation_id
-        knowledge_base = resolve_knowledge_base(db, body.knowledge_base_id)
+        knowledge_base = resolve_knowledge_base(db, body.knowledge_base_id, user.id)
         raw_question = (body.question or "").strip()
         display_question = raw_question or ("请分析这张图片" if body.attachments else "")
         if not display_question:
@@ -259,7 +266,9 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 note="这是新对话，系统创建 conversation，并把它绑定到当前知识库。",
             )
         else:
-            knowledge_base = conv.knowledge_base or knowledge_base
+            # 只复用当前用户自己的知识库绑定，遗留的跨用户绑定回退到本次解析结果
+            if conv.knowledge_base and conv.knowledge_base.user_id == user.id:
+                knowledge_base = conv.knowledge_base
             trace.add(
                 "conversation_loaded",
                 "stream_chat",
