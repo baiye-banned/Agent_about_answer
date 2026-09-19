@@ -391,20 +391,26 @@ server {
 关于接口文档：本示例**故意不代理** `/docs`、`/redoc`、`/openapi.json`。这三个是 FastAPI 挂在根路径下的交互文档与 OpenAPI Schema，按上述配置在公网不可达（会被 `location /` 兜到前端页面），可以避免对外暴露完整的接口结构。如果确实需要在受控环境里访问，在 server 块内补充：
 
 ```nginx
-    location /docs {
+    # Swagger UI 页面本身是 /docs，它还会请求 /docs/oauth2-redirect，
+    # 因此精确匹配 /docs 之外还要放行 /docs/ 子路径。
+    location = /docs {
         proxy_pass http://127.0.0.1:8002/docs;
     }
 
-    location /redoc {
+    location /docs/ {
+        proxy_pass http://127.0.0.1:8002/docs/;
+    }
+
+    location = /redoc {
         proxy_pass http://127.0.0.1:8002/redoc;
     }
 
-    location /openapi.json {
+    location = /openapi.json {
         proxy_pass http://127.0.0.1:8002/openapi.json;
     }
 ```
 
-开启前建议配合 IP 白名单（`allow` / `deny`）或额外的鉴权，不要直接暴露在公网。
+这里统一用 `=` 精确匹配，避免 `/docsXYZ` 这类并不存在的路径也被转发到后端。开启前建议配合 IP 白名单（`allow` / `deny`）或额外的鉴权，不要直接暴露在公网。
 
 ### 4.7 DNS 配置
 
@@ -448,7 +454,23 @@ server {
 }
 ```
 
-HTTPS 部署后需要检查（`certbot --nginx` 会自行改写 443 的 server 块，请确认 4.6 里的 `location = /health` 也存在于该块中，否则 HTTPS 入口仍然拿不到健康检查）：
+上面是 HTTP → HTTPS 跳转。443 的 server 块由 `certbot --nginx` 改写生成，**4.6 里的 `location = /health` 不会被自动带过去**，需要手工确认它在 443 块里也存在，否则 HTTPS 入口的健康检查仍会被 `location /` 兜成前端页面：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name example.com;
+    # ssl_certificate / ssl_certificate_key 等由 certbot 写入
+
+    location = /health {
+        proxy_pass http://127.0.0.1:8002/health;
+    }
+
+    # 其余 location / 与 location /api/ 的配置同 4.6
+}
+```
+
+HTTPS 部署后需要检查：
 
 - `https://example.com` 可以打开前端页面。
 - `https://example.com/health` 可以正常返回健康检查 JSON。
