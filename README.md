@@ -510,6 +510,23 @@ npm run build
 
 当前 Vite 构建可能出现 `Chat` chunk 体积较大的提示，这是 bundle size 提醒，不代表构建失败。
 
+### CI（GitHub Actions）
+
+向 `develop`、`main` 提 PR，以及 push 到 `develop` 时会自动跑下面四个独立检查。同一分支连续 push 时，上一次还在跑的运行会被自动取消（各 workflow 内的 `concurrency`）。
+
+| Workflow | 检查项 | 内容 |
+| --- | --- | --- |
+| `.github/workflows/python-tests.yml` | 后端测试 pytest (Python 3.10) | 版本对齐 `runtime.txt`（`python-3.10.11`），`pip install -r backend/requirements.txt` + `pytest`，跑 `python -m pytest -q tests` |
+| `.github/workflows/frontend-tests.yml` | 前端测试 node --test (Node 22) | `npm ci` 后跑 `npm test` |
+| `.github/workflows/build.yml` | 前端构建 vite build (Node 22) | `npm run build`，产物 `dist/` 上传为 artifact |
+| `.github/workflows/static-checks.yml` | 静态检查 (最低档) | 后端 `python -m compileall` + `ruff check --select E9,F63,F7,F82`；前端 `node --check src/**/*.js` |
+
+说明：
+
+- 静态检查目前只拦语法错误、未定义名等确定性错误，**不是**完整规范；为什么不直接开 `ruff --select E,F` 以及后续怎么加严，写在 `static-checks.yml` 顶部注释里。
+- 四个 workflow 都是 `permissions: contents: read`，不配置任何密钥，也不使用 `continue-on-error`：失败就是失败。
+- 后端测试只需 `backend/requirements.txt` + `pytest`；RAGAS 等可选评估依赖是延迟导入，CI 不安装。
+
 ## 协作与提交规范
 
 - 提交信息与 PR 标题遵循 [Conventional Commits](https://www.conventionalcommits.org/)，type 与 scope 取值、合并方式见 [COMMIT_CONVENTION.md](COMMIT_CONVENTION.md)。
