@@ -30,21 +30,26 @@ const PLACEHOLDER_WORDS = EMPTY_VALUES.map(stripPunctuation)
 // 实质字符：汉字、字母、数字。emoji 与纯符号不算，避免「🐛✨📝」凑够长度。
 const SUBSTANTIVE = /[\p{L}\p{N}]/u;
 
-// 整段内容由占位词拼成（`- 无`、`无 待补充`、`TODO（待补充）`）就算空：
-// 逐个抠掉占位词后什么都不剩才算占位，因此「无 UI 变更」这类真实内容不会被误杀。
-function isOnlyPlaceholders(normalized) {
-  let rest = normalized;
+// 反复抠掉给定的词，直到没有可抠的为止；长词优先，避免被短词先切走。
+function removeWords(text, words) {
+  let rest = text;
   let changed = true;
   while (changed) {
     changed = false;
-    for (const word of PLACEHOLDER_WORDS) {
+    for (const word of words) {
       if (rest.includes(word)) {
         rest = rest.split(word).join('');
         changed = true;
       }
     }
   }
-  return rest.length === 0;
+  return rest;
+}
+
+// 整段内容由占位词拼成（`- 无`、`无 待补充`、`TODO（待补充）`）就算空：
+// 逐个抠掉占位词后什么都不剩才算占位，因此「无 UI 变更」这类真实内容不会被误杀。
+function isOnlyPlaceholders(normalized) {
+  return removeWords(normalized, PLACEHOLDER_WORDS).length === 0;
 }
 
 const REQUIRED_SECTIONS = [
@@ -73,13 +78,19 @@ const IMAGE_PATTERNS = [
 // 容忍「无关联的 issue」这类自然写法。
 const NO_ISSUE_PHRASE = /(?:无|没有|不涉及|无需|未有|不存在)\s*关联\s*(?:的)?\s*issue/gi;
 const REASON_MIN_LENGTH = 3;
+// 「原因」「理由」这类标签与「因为」「是」这类连接词本身不是原因，占位词更不是。
+// 长度与实质判定都在抠掉这两类词之后的剩余串上做，否则「原因：无」＝标签 2 字 + 占位词就能凑够 3 字阈值。
+const REASON_FILLER_WORDS = ['原因', '理由', '因为', '由于', '是'];
 
 function declaresNoIssueWithReason(content) {
   const stripped = content.replace(NO_ISSUE_PHRASE, ' ');
   if (stripped === content) return false;
-  const reason = stripPunctuation(stripped);
+  const reason = removeWords(
+    removeWords(stripPunctuation(stripped), PLACEHOLDER_WORDS),
+    REASON_FILLER_WORDS
+  );
   if (!SUBSTANTIVE.test(reason)) return false;
-  return [...reason].length >= REASON_MIN_LENGTH && !isOnlyPlaceholders(reason);
+  return [...reason].length >= REASON_MIN_LENGTH;
 }
 
 function fail(problems) {
