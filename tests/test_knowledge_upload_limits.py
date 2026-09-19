@@ -155,6 +155,17 @@ def test_content_length_precheck_rejects_before_reading_body(api, monkeypatch):
     assert _stored_files(api) == []
 
 
+def test_upload_exactly_at_limit_is_accepted(api):
+    # 边界：恰好达到上限的文件必须放行，预检的 multipart 开销余量不能反过来误伤合法上传。
+    payload = b"a" * utils_service.KNOWLEDGE_UPLOAD_MAX_BYTES
+
+    response = _upload(api, "exact.txt", payload, "text/plain")
+
+    assert response.status_code == 200
+    assert response.json()["size"] == utils_service.KNOWLEDGE_UPLOAD_MAX_BYTES
+    assert len(_stored_files(api)) == 1
+
+
 def test_unsupported_extension_is_rejected(api):
     response = _upload(api, "run.exe", b"MZ" + b"\x00" * 1024, "application/x-msdownload")
 
