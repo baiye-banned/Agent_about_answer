@@ -4,6 +4,33 @@ This directory contains the executable regression baseline for the current RAG m
 
 ## Node Tests
 
+Requires Node.js **>= 22.15**. `chatStore.test.js` imports `module.registerHooks`, which Node
+documents as *Added in: v23.5.0, v22.15.0*; on Node 18/20 and 22.0-22.14 that import fails and
+`node --test` counts the file as failed, so the whole `npm test` run exits non-zero - not just
+that one file. The 23.x line needs **23.5+** (23.0.0-23.4.x lacks the export); 24+ is fine.
+
+The floor is declared in `engines.node` (`>=22.15`) in `package.json` and in the environment
+list in `README.md`; keep the three in sync. `npm install` / `npm ci` prints an `EBADENGINE`
+warning when the running Node does not satisfy `engines.node`. Because `>=22.15` is a plain
+floor it also admits the EOL 23.0.0-23.4.x releases, which this check rejects:
+
+```bash
+node -e "const [M,m]=process.versions.node.split('.').map(Number); process.exit((M===22&&m>=15)||(M===23&&m>=5)||M>=24?0:1)"
+```
+
+The workflows in `.github/workflows/` pin `node-version: "22"`, which resolves to the latest
+22.x and therefore sits above the floor - nothing in CI runs at 22.15.0 itself. To cover the
+floor locally, pin it with any version manager and run the suite from the repository root:
+
+```bash
+nvm install 22.15.0 && nvm use 22.15.0    # or fnm/asdf with the same version
+npm ci && npm test                        # exits 0
+nvm use 22.14.0 && npm test               # exits 1: chatStore.test.js fails to load
+```
+
+Re-run this whenever `engines.node` or the tests' API usage changes; 22.14.0 is the cheap
+half of the check, since a floor that is too low only shows up on the version below it.
+
 Run from the repository root:
 
 ```powershell

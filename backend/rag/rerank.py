@@ -183,7 +183,9 @@ def select_final_chunks(ranked_chunks: list[dict], keyword_chunks: list[dict]) -
         best_keyword = clean_keyword_chunks[0]
         best_score = _to_number(best_keyword.get("keyword_score"))
         already_selected = any(chunk_key(chunk) == chunk_key(best_keyword) for chunk in selected)
-        if best_score >= 10 and not already_selected:
+        # 绝对分值只说明「它像自己文档里的关键字内容」，不说明「它跟本次提问有关」：
+        # 插前还必须确认候选命中了查询关键词（issue #56），配额不被跑题候选挤占。
+        if best_score >= 10 and _keyword_chunk_hits_query(best_keyword) and not already_selected:
             selected = [best_keyword, *selected]
     deduped = []
     seen = set()
@@ -194,6 +196,17 @@ def select_final_chunks(ranked_chunks: list[dict], keyword_chunks: list[dict]) -
         seen.add(key)
         deduped.append(chunk)
     return deduped[:RETRIEVAL_RERANK_TOP_N]
+
+
+def _keyword_chunk_hits_query(chunk: dict) -> bool:
+    """关键字候选是否命中了本次查询关键词。
+
+    keyword_recall 会把命中数写进 ``keyword_hits``；没有该字段的候选来自不经过
+    关键字召回的调用方（历史行为），保持原有的「只看绝对分值」语义。
+    """
+    if "keyword_hits" not in chunk:
+        return True
+    return _to_number(chunk.get("keyword_hits")) > 0
 
 
 def chunk_key(chunk: dict) -> str:

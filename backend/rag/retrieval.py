@@ -258,6 +258,11 @@ def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top
         if not any(_normalize_for_match(keyword) in normalized_content for keyword in clean_keywords):
             continue
         for chunk in _split_keyword_chunks(content):
+            # 文件级命中不代表每个窗口都相关：窗口自己也得命中本次查询关键词，
+            # 否则同一份文档里与提问无关的段落会以「关键字候选」的身份进入上下文。
+            matched_keywords = _matched_query_keywords(chunk["content"], clean_keywords)
+            if not matched_keywords:
+                continue
             score = _keyword_score(chunk["content"], clean_keywords)
             if score <= 0:
                 continue
@@ -270,6 +275,9 @@ def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top
                     "file_id": file_entry.id,
                     "route": "keyword",
                     "keyword_score": score,
+                    # 命中证据随候选一起带出，供 select_final_chunks 校验（issue #56）。
+                    "keyword_hits": len(matched_keywords),
+                    "matched_keywords": matched_keywords,
                 }
             )
     candidates.sort(key=lambda item: item["keyword_score"], reverse=True)
@@ -444,19 +452,33 @@ def _keyword_score(content: str, keywords: list[str]) -> float:
             weight += 4.0
         score += count * weight
         matched_positions.append(normalized_content.find(normalized_keyword))
-    if any(term in normalized_content for term in ("考勤", "上下班")):
-        score += 6.0
-    if "迟到" in normalized_content and "早退" in normalized_content:
-        score += 10.0
-    if re.search(r"30分钟(?:以内|以上)", normalized_content):
-        score += 10.0
-    if "罚款50元" in normalized_content or "罚款200元" in normalized_content:
-        score += 10.0
+    # 这里不再按内容自身的特征短语（考勤/迟到+早退/30分钟以内/罚款50元…）无条件加分：
+    # 那与「本次查询问的是什么」无关，会让整段跑题内容拿到高分并被插到上下文首位。
+    # 相关性只由上面的「命中本次查询关键词」决定，零命中内容得 0 分。
     unique_hits = len({pos for pos in matched_positions if pos >= 0})
     score += unique_hits * 1.5
     if _has_close_matches(normalized_content, keywords):
         score += 8.0
     return score
+
+
+def _matched_query_keywords(content: str, keywords: list[str]) -> list[str]:
+    """返回内容里真正命中的查询关键词（保持传入顺序、按归一化形式去重）。
+
+    issue #56：窗口是否与本次提问相关，只由这个命中集合决定；内容自身的场景
+    特征词（考勤、迟到、罚款…）不构成相关性证据。
+    """
+    normalized_content = _normalize_for_match(content)
+    matched: list[str] = []
+    seen: set[str] = set()
+    for keyword in keywords:
+        normalized_keyword = _normalize_for_match(keyword)
+        if len(normalized_keyword) < 2 or normalized_keyword in seen:
+            continue
+        if normalized_keyword in normalized_content:
+            seen.add(normalized_keyword)
+            matched.append(keyword)
+    return matched
 
 
 def _has_close_matches(content: str, keywords: list[str], window: int = 120) -> bool:

@@ -428,3 +428,91 @@ def test_rrf_fuse_skips_non_dict_chunks():
 
     assert len(fused) == 1
     assert fused[0]["chunk_id"] == "a"
+
+
+class _FakeFileQuery:
+    def __init__(self, files):
+        self.files = files
+
+    def filter_by(self, **_kwargs):
+        return self
+
+    def all(self):
+        return self.files
+
+
+class _FakeFileDb:
+    """keyword_recall 只需要 db.query(KnowledgeFile).filter_by(...).all()。"""
+
+    def __init__(self, files):
+        self.files = files
+
+    def query(self, _model):
+        return _FakeFileQuery(self.files)
+
+
+class _FakeKnowledgeFile:
+    def __init__(self, file_id, name, content):
+        self.id = file_id
+        self.name = name
+        self.content = content
+
+
+def test_keyword_recall_drops_window_that_misses_the_query(monkeypatch):
+    """issue #56：文件级命中不代表每个窗口都相关，跑题窗口不得进入关键字候选。"""
+    filler = "本制度由行政部负责解释。" * 85
+    document = (
+        "报销申请需提交原始发票，由财务部在五个工作日内完成审核并付款。"
+        + filler
+        + "迟到30分钟以内罚款50元，早退按同等标准处理，由人事部按月汇总。"
+        + "员工如有疑问可向人事部咨询。" * 20
+    )
+    keywords = retrieval._expand_keywords(["报销", "发票", "财务"])
+
+    hits = retrieval.keyword_recall(
+        _FakeFileDb([_FakeKnowledgeFile(7, "员工手册.md", document)]), 1, keywords, 8
+    )
+
+    assert hits
+    # 第 1 位必须是真正命中本次查询关键词的窗口，而不是另一段考勤条款。
+    assert any(keyword in hits[0]["content"] for keyword in keywords)
+    assert "迟到" not in hits[0]["content"]
+    assert all(hit["keyword_hits"] > 0 for hit in hits)
+    assert all(
+        any(keyword in hit["content"] for keyword in keywords) for hit in hits
+    )
+
+
+def test_keyword_recall_drops_off_topic_window_that_only_hits_hardcoded_phrases():
+    """非考勤语料同样成立：只命中写死场景短语（30分钟以内）的窗口必须落选。"""
+    filler = "本制度由行政部负责解释。" * 80
+    document = (
+        "报销申请需提交原始发票，由财务部审核。"
+        + filler
+        + "付款审批将在30分钟以内完成，超时自动升级。"
+    )
+    keywords = retrieval._expand_keywords(["报销", "发票", "财务"])
+
+    hits = retrieval.keyword_recall(
+        _FakeFileDb([_FakeKnowledgeFile(7, "财务制度.md", document)]), 1, keywords, 8
+    )
+
+    assert hits
+    assert all("30分钟以内" not in hit["content"] for hit in hits)
+    assert all(
+        any(keyword in hit["content"] for keyword in keywords) for hit in hits
+    )
+
+
+def test_keyword_score_ignores_scenario_phrases_absent_from_the_query():
+    """issue #56：内容自身的场景特征词不再加分，零命中内容必须得 0 分。"""
+    keywords = retrieval._expand_keywords(["报销", "发票", "财务"])
+    on_topic = "报销申请需提交原始发票，由财务部在五个工作日内完成审核并付款。"
+
+    for off_topic in (
+        "迟到30分钟以内罚款50元，早退按同等标准处理，由人事部按月汇总。",
+        "员工须按时上下班，考勤记录由人事部按月汇总，罚款200元。",
+        "付款审批将在30分钟以内完成，超时自动升级。",
+    ):
+        assert retrieval._keyword_score(off_topic, keywords) == 0.0
+        assert retrieval._keyword_score(off_topic, keywords) < retrieval._keyword_score(on_topic, keywords)

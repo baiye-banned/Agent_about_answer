@@ -91,9 +91,11 @@ test('isUrlAttribute covers href, src and xlink:href synonyms', () => {
 })
 
 test('MarkdownRenderer sanitizes URL attributes through the shared policy', () => {
-  const source = readFileSync(new URL('../src/components/MarkdownRenderer.vue', import.meta.url), 'utf8')
+  // The sanitizer lives in its own module so the renderer and the tests run the
+  // exact same code; keep asserting on the source that is actually executed.
+  const source = readFileSync(new URL('../src/utils/sanitizeHtml.js', import.meta.url), 'utf8')
 
-  assert.match(source, /import \{ isSafeLinkUrl, isUrlAttribute \} from '\.\.\/utils\/url\.js'/)
+  assert.match(source, /import \{ isSafeLinkUrl, isUrlAttribute \} from '\.\/url\.js'/)
   assert.match(source, /isUrlAttribute\(name\) && !isSafeLinkUrl\(attr\.value\)/)
   // The prefix check that issue #12 bypassed must not come back.
   assert.equal(source.includes("startsWith('javascript:')"), false)

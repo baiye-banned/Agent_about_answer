@@ -1,4 +1,25 @@
-from crud.knowledge_file import chunk_text
+from crud.knowledge_file import (
+    KNOWLEDGE_INDEX_MIN_COVERAGE_RATIO,
+    _heading_level,
+    chunk_coverage_ratio,
+    chunk_text,
+)
+
+
+# issue #53 的语料：条款编号与正文同一行，正文句在整篇文档里大量重复。
+CLAUSE_COUNT = 40
+SENTENCES_PER_CLAUSE = 3
+CLAUSE_BODY = "本制度适用于全体员工，由人事部负责解释与修订。"
+CLAUSE_LINES = [f"第{i}条 {CLAUSE_BODY * SENTENCES_PER_CLAUSE}" for i in range(1, CLAUSE_COUNT + 1)]
+
+
+def _assert_clause_document_fully_indexed(source: str, chunks: list[dict]) -> None:
+    """入库文本合计覆盖原文 ≥ 90%，且每条条款编号都真的进了库（无损）。"""
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    for index in range(1, CLAUSE_COUNT + 1):
+        assert f"第{index}条" in joined
+    assert joined.count(CLAUSE_BODY) >= CLAUSE_COUNT * SENTENCES_PER_CLAUSE
 
 
 def test_chunk_text_tolerates_missing_text():
@@ -83,3 +104,59 @@ def test_chunk_text_treats_long_numbered_clause_as_body():
     assert long_clause in chunks[0]["text"]
     assert not any(chunk["text"].startswith(long_clause) for chunk in chunks)
     assert any("三、考勤" in chunk["text"] and "2、短标题" in chunk["text"] for chunk in chunks)
+
+
+def test_heading_level_treats_clause_line_with_inline_body_as_body():
+    """issue #53：42 字的示例行低于 48 字长度阈值，必须靠句末标点判定为正文。"""
+    line = "第十条 员工迟到30分钟以内罚款50元，由人事部按月汇总后归档保存，保存期限为三年。"
+    assert len(line) < 48
+    assert _heading_level(line) is None
+
+
+def test_heading_level_treats_overlong_clause_line_as_body():
+    line = "第十条 " + "罚款标准与执行口径说明" * 5
+    assert len(line) > 48
+    assert _heading_level(line) is None
+
+
+def test_heading_level_keeps_clause_heading_without_inline_body():
+    """条款标记后没有正文的行仍然是标题，标题层级不被破坏。"""
+    assert _heading_level("第一章 总则") == 1
+    assert _heading_level("第十条") == 2
+    assert _heading_level("第十条 罚款标准") == 2
+
+
+def test_chunk_coverage_ratio_reports_share_of_source_text():
+    assert chunk_coverage_ratio("", []) == 1.0
+    assert chunk_coverage_ratio("第一段", []) == 0.0
+    assert chunk_coverage_ratio("第一段", [{"text": "第一"}, {"text": "段"}]) == 1.0
+    assert chunk_coverage_ratio("第一段落", [{"text": "第一"}]) == 0.5
+    assert KNOWLEDGE_INDEX_MIN_COVERAGE_RATIO == 0.5
+
+
+def test_chunk_text_keeps_clause_text_when_heading_shares_line():
+    """条款与正文同行、条款之间无空行的制度文档，正文不能被整行当标题丢掉。"""
+    source = "\n".join(CLAUSE_LINES)
+
+    chunks = chunk_text(source, file_id=1)
+
+    _assert_clause_document_fully_indexed(source, chunks)
+
+
+def test_chunk_text_keeps_clause_text_when_clauses_are_blank_line_separated():
+    """同样排版但条款之间空一行，入库覆盖率同样要达标。"""
+    source = "\n\n".join(CLAUSE_LINES)
+
+    chunks = chunk_text(source, file_id=1)
+
+    _assert_clause_document_fully_indexed(source, chunks)
+
+
+def test_chunk_text_keeps_clause_text_when_number_sits_on_its_own_line():
+    """对照排版：编号单独占一行，同样要无损，分块数量保持同一量级（约 40）。"""
+    source = "\n".join(f"第{i}条\n{CLAUSE_BODY * SENTENCES_PER_CLAUSE}" for i in range(1, CLAUSE_COUNT + 1))
+
+    chunks = chunk_text(source, file_id=1)
+
+    _assert_clause_document_fully_indexed(source, chunks)
+    assert len(chunks) >= 20

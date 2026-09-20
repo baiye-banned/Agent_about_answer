@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 import pytest
 from fastapi import HTTPException
@@ -102,6 +103,57 @@ def test_upload_knowledge_other_index_failure_keeps_generic_500(monkeypatch):
     assert exc_info.value.status_code == 500
     assert exc_info.value.detail == "知识文件上传失败，向量库写入异常。"
     assert calls == [("vectors", 11), ("mysql", 11)]
+
+
+def test_upload_knowledge_warns_when_indexed_text_far_below_source(monkeypatch, caplog):
+    """入库文本远少于原文时必须留痕，不能再静默返回成功。"""
+    calls = []
+    source = "第1条 " + "本制度适用于全体员工，由人事部负责解释与修订。" * 20
+    _patch_upload(monkeypatch, calls, RuntimeError("unused"))
+    monkeypatch.setattr(knowledge_service.crud_knowledge_file, "extract_file_text", lambda name, content: source)
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "chunk_text",
+        lambda text, file_id: [{"id": "0", "text": text[:10]}],
+    )
+    monkeypatch.setattr(knowledge_service.crud_knowledge_file, "serialize_knowledge_file", lambda entry: {"id": entry.id})
+    monkeypatch.setattr(knowledge_service, "add_chunks", lambda *args, **kwargs: calls.append(("indexed", args[1])))
+
+    with caplog.at_level(logging.WARNING):
+        result = _upload()
+
+    assert result == {"id": 11}
+    assert ("indexed", 11) in calls
+    assert "chunk coverage too low" in caplog.text
+
+
+def test_rebuild_existing_knowledge_index_warns_when_chunking_produces_nothing(monkeypatch, caplog):
+    calls = []
+    closed = []
+
+    class FakeSession:
+        def query(self, model):
+            return self
+
+        def filter(self, *args):
+            return self
+
+        def all(self):
+            return [type("Entry", (), {"id": 1, "content": "第一段", "name": "文件1.txt", "knowledge_base_id": 2})()]
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(knowledge_service, "SessionLocal", lambda: FakeSession())
+    monkeypatch.setattr(knowledge_service.crud_knowledge_file, "chunk_text", lambda text, file_id: [])
+    monkeypatch.setattr(knowledge_service, "add_chunks", lambda *args, **kwargs: calls.append(args[1]))
+
+    with caplog.at_level(logging.WARNING):
+        knowledge_service.rebuild_existing_knowledge_index()
+
+    assert calls == [1]
+    assert closed == [True]
+    assert "chunk coverage too low" in caplog.text
 
 
 def test_rebuild_existing_knowledge_index_continues_after_single_file_failure(monkeypatch):
