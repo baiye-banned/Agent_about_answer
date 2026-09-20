@@ -4,10 +4,23 @@ name: Sync main into develop
 # develop 没有的提交。这些提交必须回流到集成分支，否则两侧持续漂移，下一次发布
 # 会把 develop 上的旧代码重新盖回 main。
 #
-# 本工作流只做一件事：main 领先 develop 时开一个 main → develop 的 PR，然后停手。
-# 不自动合并、不推送任何提交、不删除任何分支。合并动作由维护者按 BRANCHING.md
-# 的约定用 **merge commit** 完成：squash 会产生一条内容相同但没有血缘关系的新
-# 提交，main 的提交仍然不是 develop 的祖先，回同步 PR 会一次次重复出现。
+# 本工作流只做两件事：把一次性 bot 分支 sync/main-into-develop 重置到 main 的当前
+# tip，再开一个「该 bot 分支 → develop」的 PR，然后停手。不自动合并、不推 main /
+# develop、不删除任何分支。合并动作由维护者按 BRANCHING.md 的约定用 **merge commit**
+# 完成：squash 会产生一条内容相同但没有血缘关系的新提交，main 的提交仍然不是
+# develop 的祖先，回同步 PR 会一次次重复出现。
+#
+# 为什么回同步 PR 的 head 不能是长期分支 main：
+#   仓库开着 delete_branch_on_merge（合并 PR 后由平台删除该 PR 的 head 分支），这条
+#   设置不区分 head 是短生命周期分支还是长期分支。2026-09-20 的现场：回同步 PR #46
+#   （head=main）在 01:36:08Z 合并，01:36:10Z 平台按该设置自动删除了 main
+#   （events API 里可复核的 DeleteEvent：ref=main；main 事后用 5e596ca 重建）。
+#   只要 head 还是 main，每次回同步合并都是一次新的删 main 尝试。
+#   改用一次性 bot 分支后，合并时被自动删除的就是这个 bot 分支——这正是预期行为，
+#   下一次运行由本工作流重新创建并重置到当时的 main tip；main 不再出现在任何 PR 的
+#   head 位置。main / develop 的「禁止删除」保护只是平台层兜底：保护规则与仓库设置
+#   是两处独立配置，任何一处被单独改动，head=main 的写法就会重新变成删 main 的
+#   触发器，因此它不作为本工作流正确性的前提。
 on:
   push:
     branches: [main]
@@ -27,7 +40,42 @@ jobs:
   sync:
     name: Open the main → develop sync PR
     runs-on: ubuntu-latest
+    # 回同步 PR 的 head：由本工作流维护的一次性 bot 分支，内容始终等于 main 的 tip。
+    # 它是本工作流唯一会强推的引用，且强推只作用于这个名字（见下面的步骤注释）。
+    env:
+      SYNC_BRANCH: sync/main-into-develop
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 需要一个带 origin 凭据的完整仓库：下面要把 main 的 tip 推到 bot 分支。
+          # 取全量历史而不是浅克隆，避免推送对象是否齐备依赖浅克隆的边界行为。
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point the sync branch at the current main tip
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin "main:refs/remotes/origin/main"
+          main_sha="$(git rev-parse --verify refs/remotes/origin/main)"
+
+          # 分支不存在时创建、已存在时重置到 main 的当前 tip。
+          git branch -f "$SYNC_BRANCH" "$main_sha"
+
+          # 这里的强推是设计内行为，且只作用于 $SYNC_BRANCH：它是一次性 bot 分支，
+          # 语义就是「当前 main 的镜像」，没有需要保留的历史。main / develop 以及
+          # 其它任何分支都不会被本工作流推送，更不会被强推。
+          git push --force origin "refs/heads/${SYNC_BRANCH}:refs/heads/${SYNC_BRANCH}"
+
+          # 读回校验：远端 bot 分支必须等于 main 的 tip，否则后面的 PR 会指向过期提交。
+          remote_sha="$(git ls-remote --heads origin "refs/heads/${SYNC_BRANCH}" | cut -f1)"
+          if [ "$remote_sha" != "$main_sha" ]; then
+            echo "::error::${SYNC_BRANCH} 的远端 tip（${remote_sha:-不存在}）与 main 的 tip（${main_sha}）不一致。"
+            exit 1
+          fi
+          echo "${SYNC_BRANCH} 已重置到 main 的 tip ${main_sha}。"
+
       - name: Create the sync PR when main is ahead of develop
         uses: actions/github-script@v7
         env:
@@ -38,25 +86,30 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const base = 'develop';
-            const head = 'main';
+            // source 是回同步的来源（发布分支 main）；head 只是它的载体，必须是一次性
+            // bot 分支——head=main 会让 delete_branch_on_merge 在合并后删掉 main。
+            const source = 'main';
+            const head = process.env.SYNC_BRANCH;
             const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
 
             // basehead 是 "base...head"，ahead_by 即「head 有而 base 没有」的提交数。
             const compare = await github.rest.repos.compareCommitsWithBasehead({
               owner,
               repo,
-              basehead: `${base}...${head}`,
+              basehead: `${base}...${source}`,
             });
             const aheadBy = compare.data.ahead_by;
             core.info(
-              `${head} 相对 ${base}：ahead_by=${aheadBy} behind_by=${compare.data.behind_by} status=${compare.data.status}`
+              `${source} 相对 ${base}：ahead_by=${aheadBy} behind_by=${compare.data.behind_by} status=${compare.data.status}`
             );
             if (aheadBy === 0) {
-              core.notice(`${base} 已包含 ${head} 的全部提交，无需回同步。`);
+              core.notice(`${base} 已包含 ${source} 的全部提交，无需回同步。`);
               return;
             }
 
-            // 去重：只认「同一个 head 仓库的 main 分支 → develop」的未合并 PR。
+            // 去重：只认「同一个 head 仓库的 bot 分支 → develop」的未合并 PR。上一步已经
+            // 把 bot 分支重置到 main 的当前 tip，所以已存在的 PR 自己就跟上了最新提交，
+            // 这里只要不重复创建。
             const open = await github.rest.pulls.list({
               owner,
               repo,
@@ -90,11 +143,11 @@ jobs:
               '',
               '## 变更概述',
               '',
-              `自动回同步：把 \`${head}\` 上领先 \`${base}\` 的提交通过一个 \`${head} → ${base}\` 的 PR 回流到集成分支。`,
+              `自动回同步：把 \`${source}\` 上领先 \`${base}\` 的提交，通过 \`${head} → ${base}\` 的 PR 回流到集成分支。\`${head}\` 是工作流维护的一次性 bot 分支，内容等于当时的 \`${source}\` tip。`,
               '',
               '## 背景·问题',
               '',
-              `\`${head}\` 是发布分支，发布合并与紧急热修复会直接在 \`${head}\` 上产生提交。这些提交如果不回到 \`${base}\`，两侧就会持续漂移：下一次从 \`${base}\` 发布时，\`${head}\` 上已有的修复会被旧代码重新盖回去。`,
+              `\`${source}\` 是发布分支，发布合并与紧急热修复会直接在 \`${source}\` 上产生提交。这些提交如果不回到 \`${base}\`，两侧就会持续漂移：下一次从 \`${base}\` 发布时，\`${source}\` 上已有的修复会被旧代码重新盖回去。`,
               '',
               '## 关联 issue',
               '',
@@ -102,25 +155,26 @@ jobs:
               '',
               '## 变更内容',
               '',
-              `本次回同步包含 \`${base}...${head}\` 中 \`${head}\` 领先的 ${aheadBy} 个提交：`,
+              `本次回同步包含 \`${base}...${source}\` 中 \`${source}\` 领先的 ${aheadBy} 个提交：`,
               '',
               commitList,
               '',
-              `本 PR 不新增任何代码改动，内容完全等于上面这些已经存在于 \`${head}\` 的提交。`,
+              `本 PR 不新增任何代码改动，内容完全等于上面这些已经存在于 \`${source}\` 的提交。`,
               '',
               '## 日志·验证证据',
               '',
               `- 触发来源：\`${context.eventName}\`，运行记录：${runUrl}`,
-              `- 判定依据：GitHub compare API \`${base}...${head}\` 返回 \`ahead_by = ${aheadBy}\`（\`${head}\` 有而 \`${base}\` 没有的提交数）。`,
+              `- 判定依据：GitHub compare API \`${base}...${source}\` 返回 \`ahead_by = ${aheadBy}\`（\`${source}\` 有而 \`${base}\` 没有的提交数）。`,
+              `- head 分支：\`${head}\`，由本 run 的 \`Point the sync branch at the current main tip\` 步骤重置到 \`${source}\` 的 tip，推送后用 \`git ls-remote\` 读回校验。写成 bot 分支而不是 \`${source}\` 本身，是因为仓库开着 \`delete_branch_on_merge\`，head=长期分支会让平台在合并后删掉该长期分支。`,
               `- 去重依据：创建前查询 \`state=open\`、\`base=${base}\`、\`head=${owner}:${head}\` 的 PR 列表，为空才创建。`,
-              `- 提交明细：\`gh api repos/${owner}/${repo}/compare/${base}...${head} --jq '.commits[].sha'\``,
+              `- 提交明细：\`gh api repos/${owner}/${repo}/compare/${base}...${source} --jq '.commits[].sha'\``,
               '',
               '## 测试情况',
               '',
               '本 PR 由工作流自动生成，不含代码改动，没有可跑的测试；合并前需要人确认两点：',
               '',
-              `1. 合并方式必须是 **merge commit**，不能用 squash：squash 会让 \`${head}\` 的提交永远不是 \`${base}\` 的祖先，回同步 PR 会反复重现。`,
-              `2. 合并后确认 \`${head}\` 与 \`${base}\` 都仍然存在：\`gh api repos/${owner}/${repo}/branches --jq '.[].name'\`。即使仓库开了「合并后自动删除 head 分支」，head 是受保护的 \`${head}\`，GitHub 不会删除它；本工作流也从不执行删除分支的写操作。`,
+              `1. 合并方式必须是 **merge commit**，不能用 squash：squash 会让 \`${source}\` 的提交永远不是 \`${base}\` 的祖先，回同步 PR 会反复重现。`,
+              `2. 合并后确认 \`${source}\` 与 \`${base}\` 都仍然存在：\`gh api repos/${owner}/${repo}/branches --jq '.[].name'\`。本 PR 的 head 是一次性 bot 分支 \`${head}\`，仓库开着 \`delete_branch_on_merge\` 时它会在合并后被平台自动删除——这是预期行为，下一次运行由工作流重新创建；\`${source}\` 不出现在任何 PR 的 head 位置，\`${source}\` / \`${base}\` 上的删除保护只是兜底。本工作流自身不执行任何删除分支的写操作。`,
               '',
               '## 截图',
               '',
