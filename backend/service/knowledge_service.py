@@ -81,6 +81,7 @@ def rebuild_existing_knowledge_index():
     try:
         for entry in db.query(KnowledgeFile).filter(KnowledgeFile.knowledge_base_id.isnot(None)).all():
             chunks = crud_knowledge_file.chunk_text(entry.content or "", entry.id)
+            _warn_on_low_chunk_coverage(entry, entry.content or "", chunks, scope="Knowledge index rebuild")
             try:
                 add_chunks(chunks, entry.id, entry.name, entry.knowledge_base_id)
             except Exception as exc:
@@ -95,6 +96,23 @@ def _index_failure_detail(exc: Exception) -> str:
     if isinstance(exc, EmbeddingBackendError):
         return f"知识文件上传失败：{exc}"
     return "知识文件上传失败，向量库写入异常。"
+
+
+def _warn_on_low_chunk_coverage(entry, text: str, chunks: list[dict], *, scope: str) -> None:
+    """分块覆盖率异常时留痕：入库文本可能远少于原文，不允许静默成功。"""
+    coverage = crud_knowledge_file.chunk_coverage_ratio(text, chunks)
+    if coverage >= crud_knowledge_file.KNOWLEDGE_INDEX_MIN_COVERAGE_RATIO:
+        return
+    logger.warning(
+        "%s chunk coverage too low: file_id=%s filename=%s chunks=%s covered_chars=%s source_chars=%s coverage=%.1f%%",
+        scope,
+        entry.id,
+        entry.name,
+        len(chunks),
+        sum(len(chunk.get("text") or "") for chunk in chunks),
+        len(text or ""),
+        coverage * 100,
+    )
 
 
 def _delete_file_vectors_or_500(file_id: int, *, scope: str, detail: str) -> None:
@@ -186,6 +204,7 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
         raise HTTPException(500, crud_knowledge_file.knowledge_file_save_error_message(exc))
 
     chunks = crud_knowledge_file.chunk_text(text, entry.id)
+    _warn_on_low_chunk_coverage(entry, text, chunks, scope="Knowledge file upload")
     try:
         add_chunks(chunks, entry.id, entry.name, knowledge_base.id)
     except Exception as exc:
