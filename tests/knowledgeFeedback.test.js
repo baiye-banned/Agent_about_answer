@@ -164,9 +164,10 @@ test('runConfirmedDelete treats a close (ESC / overlay) as a cancellation too', 
 })
 
 test('runConfirmedDelete leaves no unhandled rejection at an event-handler call site', async () => {
-  // 模板上的三处调用点（:32 / :78 / :128）都是 @click 事件处理器直调，
-  // Vue 不会接管处理器返回的 Promise：这里按同样的方式调用并把返回的 Promise 丢掉，
-  // 模拟"点了取消"以后有没有拒绝逃逸到进程的 unhandledRejection。
+  // 模板上的三处调用点（:32 / :78 / :128）都是 @click 直调。Vue 的事件层
+  // （callWithAsyncErrorHandling）会接住处理器返回的 Promise：dev 构建在 warn 后重新
+  // 抛出成未捕获拒绝，prod 构建只记一条 console.error。这里绕过该层、直接丢掉返回的
+  // Promise，断言修复后任意分支（成功 / 失败 / 取消）都不再产生控制台输出。
   const unhandled = []
   const onUnhandled = (reason) => unhandled.push(reason)
   process.on('unhandledRejection', onUnhandled)
