@@ -1,0 +1,207 @@
+name: 端到端验收
+
+# 触发：PR → develop / main；push → develop（合入后回归）。
+# 额外保留 workflow_dispatch：这条流水线最重，排查时需要在分支上单独重跑。
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+# CI 只需要读取仓库内容。
+permissions:
+  contents: read
+
+# 同一分支连续 push 时，取消上一次仍在跑的运行（按 workflow + ref 分组）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: Playwright e2e (chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # 元数据库用一次性容器，跑完即弃。容器里的口令只对本次运行的容器有效，
+    # 是公开占位值，不是任何真实服务的密钥。
+    # MYSQL_ROOT_HOST=% 是必需的：runner 从容器外部（宿主机）连进来，
+    # 默认只创建 root@localhost，不声明就只能在容器内部登录。
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: dummy-e2e-dummy-e2e-dummy
+          MYSQL_ROOT_HOST: "%"
+          MYSQL_DATABASE: rag_system
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pdummy-e2e-dummy-e2e-dummy --silent"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+    # 全链路不访问任何外部模型服务：三个上游（对话 / 向量化 / 重排）全部指向
+    # 本地桩 tests/e2e/stub_llm_server.py。下面的 key 是桩不校验的占位值，
+    # 之所以非空，是为了让后端真的去走「调上游」这条路，而不是因为缺 key 短路。
+    # SECRET_KEY 不在这里写死 —— 它由下一步现场生成，见该步骤的说明。
+    env:
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: dummy-e2e-dummy-e2e-dummy
+      MYSQL_DATABASE: rag_system
+
+      DEEPSEEK_BASE_URL: http://127.0.0.1:8899/v1
+      DEEPSEEK_API_KEY: dummy-e2e-dummy-e2e-dummy
+      TEXT_FALLBACK_BASE_URL: http://127.0.0.1:8899/v1
+      TEXT_FALLBACK_API_KEY: dummy-e2e-dummy-e2e-dummy
+      EMBEDDING_BASE_URL: http://127.0.0.1:8899/v1
+      EMBEDDING_API_KEY: dummy-e2e-dummy-e2e-dummy
+      EMBEDDING_DIM: "1024"
+      # 重排端点填的是完整 URL（与 .env.example 里 dashscope 的写法一致），桩按后缀匹配。
+      RERANK_BASE_URL: http://127.0.0.1:8899/v1/reranks
+      RERANK_API_KEY: dummy-e2e-dummy-e2e-dummy
+      VISION_BASE_URL: http://127.0.0.1:8899/v1
+      VISION_API_KEY: dummy-e2e-dummy-e2e-dummy
+
+      # 向量库与检查点落在 backend/ 下的一次性文件（相对路径以 uvicorn 的工作目录为准）。
+      MILVUS_LITE_URI: ./e2e-milvus.db
+      MILVUS_URI: ./e2e-milvus.db
+      CHECKPOINTER_DB_PATH: ./e2e-checkpointer.db
+
+      SEED_DEFAULT_USERS: "true"
+      SEED_DEMO_PASSWORD: dummy-e2e-dummy-e2e-dummy
+
+      # 前端在构建期把后端地址固化进产物。preview 不复用 vite.config.js 里的 dev 代理，
+      # 因此这里必须是绝对地址；后端已开 CORS，跨端口直连可用。
+      # 末尾的 /api 不能省：dev 代理是 '/api' → :8002 且不做 rewrite，后端路由本身
+      # 就挂在 /api 下（见 backend/router/*.py），前端请求的是 `${base}/chat/...`。
+      VITE_API_BASE_URL: http://127.0.0.1:8002/api
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # Python 版本来源：仓库根目录 runtime.txt（与 python-tests.yml 保持一致）。
+      - name: 安装 Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: 安装 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      # 后端依赖里已含 uvicorn 与 pymilvus[milvus_lite]，无需额外装启动器。
+      - name: 安装后端依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      # 每次运行现场生成签名密钥：SECRET_KEY 留空或仍是仓库里的公开占位值时后端拒绝启动
+      # （backend/config.py），而把它写进 workflow 等于往公开仓库里提交一个可用密钥。
+      # 生成的值只进本次运行的进程环境，不落盘、不打进日志。
+      - name: 生成一次性 SECRET_KEY
+        run: echo "SECRET_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+
+      # 分片间隔刻意放大（1200ms × 8 字符）：用例要能稳定观察到「生成中」这一帧，
+      # 并断言此时答案尚未完整 —— 太快的话前端已经渲染完，这条断言就失去意义。
+      # 间隔也不能小：从「收到答案开头」到「收到完整标记串」跨 2 片，这个窗口要留得下
+      # runner 抖动与一次 read() 合并多片的余量，否则该断言会在绿意盎然的代码上假红。
+      - name: 启动桩服务（本地 OpenAI 兼容替身）
+        run: |
+          set -euo pipefail
+          nohup python tests/e2e/stub_llm_server.py \
+            --port 8899 \
+            --dim 1024 \
+            --chunk-delay-ms 1200 \
+            --chunk-size 8 \
+            --log-file "$RUNNER_TEMP/stub-requests.jsonl" \
+            > "$RUNNER_TEMP/stub.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8899/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          # 循环结束不代表成功（等满 30 次也会退出），这里再确认一次，失败即让步骤红。
+          curl -fsS http://127.0.0.1:8899/health
+
+      - name: 构建前端
+        run: |
+          npm run build
+          test -f dist/index.html
+
+      # 后端首次启动要建表 + 播种账号（demo/admin），比单纯进程起来慢，因此等待窗口给足。
+      - name: 启动后端（连临时 MySQL，上游指向桩）
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          nohup python -m uvicorn main:app --host 127.0.0.1 --port 8002 \
+            > "$RUNNER_TEMP/backend.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8002/health >/dev/null 2>&1 && break
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8002/health
+
+      - name: 启动前端静态服务（构建产物）
+        run: |
+          set -euo pipefail
+          nohup npm run preview -- --port 4173 --strictPort --host 127.0.0.1 \
+            > "$RUNNER_TEMP/frontend.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:4173/ >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:4173/ >/dev/null
+
+      # 只装 chromium：用例只跑一个浏览器，本地与 CI 的结论才对得上。
+      - name: 安装 Playwright 浏览器（chromium）
+        run: npx playwright install --with-deps chromium
+
+      # 知识库名带上 run id：重跑同名会被后端拒绝（「知识库名称已存在」）。
+      - name: 运行端到端验收
+        run: npm run test:e2e
+        env:
+          E2E_BASE_URL: http://127.0.0.1:4173
+          E2E_USERNAME: demo
+          E2E_PASSWORD: dummy-e2e-dummy-e2e-dummy
+          E2E_RUN_ID: ${{ github.run_id }}-${{ github.run_number }}
+
+      # 用例全绿不等于检索链路被完整走到：后端的路由 / 检索规划 / 重排都有兜底分支，
+      # 退化到兜底时用例照样绿。这一步读桩落盘的请求日志，把「五个角色真的被调过、
+      # 且没有落到通用兜底」变成 CI 上的硬断言，判定逻辑见 tests/e2e/check_stub_calls.py。
+      - name: 校验检索链路真的被走到
+        run: python tests/e2e/check_stub_calls.py "$RUNNER_TEMP/stub-requests.jsonl"
+
+      # 红的运行要留现场，绿的运行同样要留证据：截图是「浏览器真的被点过」的直接凭据，
+      # 报告里能逐帧看到流式渲染。四份服务日志先归集进工作区再一并上传：upload-artifact
+      # 的压缩包根目录取所有 path 的公共祖先，混用工作区路径与 ${{ runner.temp }} 会让
+      # 包内凭空多出两层重复目录，下载后不便直接打开。
+      - name: 归集 e2e 日志
+        if: always()
+        run: |
+          mkdir -p tests/e2e/artifacts/logs
+          for name in stub.log stub-requests.jsonl backend.log frontend.log; do
+            # 服务没起来时日志本就不存在（那种情况上一步早已红），这里不额外制造噪声。
+            cp "$RUNNER_TEMP/$name" "tests/e2e/artifacts/logs/$name" 2>/dev/null || echo "没有 $name，跳过"
+          done
+
+      - name: 上传 e2e 产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: tests/e2e/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
