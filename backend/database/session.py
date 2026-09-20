@@ -1,8 +1,12 @@
+import logging
+
 from sqlalchemy import create_engine
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
 from config import DATABASE_URL, MYSQL_CONNECT_ARGS
+
+logger = logging.getLogger(__name__)
 
 engine = create_engine(DATABASE_URL, connect_args=MYSQL_CONNECT_ARGS, pool_pre_ping=True, pool_recycle=3600)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -84,11 +88,21 @@ def _ensure_schema_columns():
         if "knowledge_base_id" not in columns:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE knowledge_files ADD COLUMN knowledge_base_id INTEGER"))
+        if "user_id" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE knowledge_files ADD COLUMN user_id INTEGER"))
+                conn.execute(text("CREATE INDEX ix_knowledge_files_user_id ON knowledge_files (user_id)"))
         _ensure_mysql_varchar_column("knowledge_files", "name", 255, nullable=False)
         _ensure_mysql_text_column("knowledge_files", "content", "LONGTEXT")
 
     if "knowledge_bases" in table_names:
+        columns = {column["name"] for column in inspector.get_columns("knowledge_bases")}
+        if "user_id" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE knowledge_bases ADD COLUMN user_id INTEGER"))
+                conn.execute(text("CREATE INDEX ix_knowledge_bases_user_id ON knowledge_bases (user_id)"))
         _ensure_mysql_varchar_column("knowledge_bases", "name", 100, nullable=False)
+        _ensure_knowledge_base_owner_unique_index()
 
     if "users" in table_names:
         _ensure_mysql_varchar_column("users", "username", 50, nullable=False)
@@ -193,6 +207,49 @@ def _ensure_mysql_character_column(
         )
 
 
+def _ensure_knowledge_base_owner_unique_index():
+    """知识库名称改为按归属用户唯一：先摘掉旧的全局唯一索引，再补 (user_id, name)。
+
+    历史数据里 user_id 为 NULL 的行在唯一索引里互不冲突，因此回填前后都不会报错。
+    """
+    if engine.dialect.name != "mysql" or not _get_mysql_column_info("knowledge_bases", "user_id"):
+        return
+    try:
+        with engine.begin() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        """
+                        SELECT INDEX_NAME AS index_name,
+                               GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS index_columns
+                        FROM information_schema.STATISTICS
+                        WHERE TABLE_SCHEMA = DATABASE()
+                          AND TABLE_NAME = 'knowledge_bases'
+                          AND NON_UNIQUE = 0
+                        GROUP BY INDEX_NAME
+                        """
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            for row in rows:
+                index_columns = str(row["index_columns"] or "").lower()
+                if index_columns == "name":
+                    conn.execute(text(f"ALTER TABLE `knowledge_bases` DROP INDEX `{row['index_name']}`"))
+                    rows = [item for item in rows if item["index_name"] != row["index_name"]]
+            if not any(str(row["index_columns"] or "").lower() == "user_id,name" for row in rows):
+                conn.execute(
+                    text(
+                        "ALTER TABLE `knowledge_bases` "
+                        "ADD UNIQUE KEY `uq_knowledge_bases_user_name` (user_id, name)"
+                    )
+                )
+    except Exception:
+        # 迁移失败不阻塞启动；即使仍是旧的全局唯一索引，归属过滤依然生效。
+        logger.warning("Failed to switch knowledge_bases to a per-owner unique index", exc_info=True)
+
+
 def _get_mysql_column_info(table_name: str, column_name: str):
     if engine.dialect.name != "mysql":
         return None
@@ -228,6 +285,17 @@ def _ensure_default_knowledge_base():
             db.add(default_base)
             db.commit()
             db.refresh(default_base)
+
+        # 只把悬挂引用挂到「无归属」的历史全局默认库上：knowledge_bases 里的库一旦有归属，
+        # 把别人的会话/文件改绑过去就是跨用户写入，宁可留空（聊天会按用户重新解析默认库，
+        # 无归属文件继续不可见并由 scripts/backfill_knowledge_owner.py 回填）。
+        if default_base.user_id is not None:
+            logger.warning(
+                "Skip rebinding orphan rows: knowledge base %s already belongs to user %s",
+                default_base.id,
+                default_base.user_id,
+            )
+            return
 
         default_id = default_base.id
         with engine.begin() as conn:

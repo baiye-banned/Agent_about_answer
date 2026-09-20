@@ -1,0 +1,142 @@
+name: Sync main into develop
+
+# main 是发布分支：发布合并（develop → main）和紧急热修复都会在 main 上产生
+# develop 没有的提交。这些提交必须回流到集成分支，否则两侧持续漂移，下一次发布
+# 会把 develop 上的旧代码重新盖回 main。
+#
+# 本工作流只做一件事：main 领先 develop 时开一个 main → develop 的 PR，然后停手。
+# 不自动合并、不推送任何提交、不删除任何分支。合并动作由维护者按 BRANCHING.md
+# 的约定用 **merge commit** 完成：squash 会产生一条内容相同但没有血缘关系的新
+# 提交，main 的提交仍然不是 develop 的祖先，回同步 PR 会一次次重复出现。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一时刻只跑一个：两个并发 run 会各自查到「没有 open PR」，然后各开一个，
+# 直接造出重复 PR。这里选择排队（cancel-in-progress: false）而不是互相取消。
+concurrency:
+  group: sync-main-into-develop
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Open the main → develop sync PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the sync PR when main is ahead of develop
+        uses: actions/github-script@v7
+        env:
+          SYNC_TITLE: 'chore(sync): merge main into develop'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const base = 'develop';
+            const head = 'main';
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            // basehead 是 "base...head"，ahead_by 即「head 有而 base 没有」的提交数。
+            const compare = await github.rest.repos.compareCommitsWithBasehead({
+              owner,
+              repo,
+              basehead: `${base}...${head}`,
+            });
+            const aheadBy = compare.data.ahead_by;
+            core.info(
+              `${head} 相对 ${base}：ahead_by=${aheadBy} behind_by=${compare.data.behind_by} status=${compare.data.status}`
+            );
+            if (aheadBy === 0) {
+              core.notice(`${base} 已包含 ${head} 的全部提交，无需回同步。`);
+              return;
+            }
+
+            // 去重：只认「同一个 head 仓库的 main 分支 → develop」的未合并 PR。
+            const open = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: 'open',
+              base,
+              head: `${owner}:${head}`,
+            });
+            if (open.data.length > 0) {
+              const numbers = open.data.map((pr) => `#${pr.number}`).join(', ');
+              core.notice(`已存在 ${head} → ${base} 的未合并 PR：${numbers}，不重复创建。`);
+              return;
+            }
+
+            const commits = compare.data.commits || [];
+            const commitList = commits.length
+              ? commits
+                  .map((c) => `- \`${c.sha.slice(0, 7)}\` ${(c.commit.message || '').split('\n')[0]}`)
+                  .join('\n')
+              : '- （compare API 未返回提交明细，见 compare 视图）';
+
+            // 正文按 .github/pull_request_template.md 的必填节生成：这两个自动 PR 会
+            // 落到 develop / main 上，同样要过 PR 描述校验（pr-template-check），
+            // 缺节会把门禁判红。
+            //
+            // 用字符串数组拼而不是多行模板字符串：模板字符串的续行如果顶格写，
+            // 会把 YAML 的 `script: |` 块标量提前截断（块内容必须整体缩进）。
+            const body = [
+              '## 类型',
+              '',
+              '- [x] 🔧 其他',
+              '',
+              '## 变更概述',
+              '',
+              `自动回同步：把 \`${head}\` 上领先 \`${base}\` 的提交通过一个 \`${head} → ${base}\` 的 PR 回流到集成分支。`,
+              '',
+              '## 背景·问题',
+              '',
+              `\`${head}\` 是发布分支，发布合并与紧急热修复会直接在 \`${head}\` 上产生提交。这些提交如果不回到 \`${base}\`，两侧就会持续漂移：下一次从 \`${base}\` 发布时，\`${head}\` 上已有的修复会被旧代码重新盖回去。`,
+              '',
+              '## 关联 issue',
+              '',
+              `无关联 issue，原因：这是由 \`Sync main into develop\` 工作流自动创建的例行回同步 PR，不对应单条 issue。`,
+              '',
+              '## 变更内容',
+              '',
+              `本次回同步包含 \`${base}...${head}\` 中 \`${head}\` 领先的 ${aheadBy} 个提交：`,
+              '',
+              commitList,
+              '',
+              `本 PR 不新增任何代码改动，内容完全等于上面这些已经存在于 \`${head}\` 的提交。`,
+              '',
+              '## 日志·验证证据',
+              '',
+              `- 触发来源：\`${context.eventName}\`，运行记录：${runUrl}`,
+              `- 判定依据：GitHub compare API \`${base}...${head}\` 返回 \`ahead_by = ${aheadBy}\`（\`${head}\` 有而 \`${base}\` 没有的提交数）。`,
+              `- 去重依据：创建前查询 \`state=open\`、\`base=${base}\`、\`head=${owner}:${head}\` 的 PR 列表，为空才创建。`,
+              `- 提交明细：\`gh api repos/${owner}/${repo}/compare/${base}...${head} --jq '.commits[].sha'\``,
+              '',
+              '## 测试情况',
+              '',
+              '本 PR 由工作流自动生成，不含代码改动，没有可跑的测试；合并前需要人确认两点：',
+              '',
+              `1. 合并方式必须是 **merge commit**，不能用 squash：squash 会让 \`${head}\` 的提交永远不是 \`${base}\` 的祖先，回同步 PR 会反复重现。`,
+              `2. 合并后确认 \`${head}\` 与 \`${base}\` 都仍然存在：\`gh api repos/${owner}/${repo}/branches --jq '.[].name'\`。即使仓库开了「合并后自动删除 head 分支」，head 是受保护的 \`${head}\`，GitHub 不会删除它；本工作流也从不执行删除分支的写操作。`,
+              '',
+              '## 截图',
+              '',
+              '无需截图（无 UI 变更）',
+              '',
+              '## 后续计划',
+              '',
+              '无。',
+            ].join('\n');
+
+            const pr = await github.rest.pulls.create({
+              owner,
+              repo,
+              head,
+              base,
+              title: process.env.SYNC_TITLE,
+              body,
+            });
+            core.notice(`已创建回同步 PR #${pr.data.number}：${pr.data.html_url}`);

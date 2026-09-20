@@ -58,15 +58,16 @@ test('formatScore preserves zero and formats numeric input', () => {
   assert.equal(formatScore(Infinity), '--')
 })
 
-test('storage helpers tolerate unavailable localStorage', () => {
+function withLocalStorage(value, run) {
   const originalLocalStorage = globalThis.localStorage
 
   try {
-    delete globalThis.localStorage
-
-    assert.equal(storage.get('missing'), null)
-    assert.doesNotThrow(() => storage.set('missing', { ok: true }))
-    assert.doesNotThrow(() => storage.remove('missing'))
+    if (value === undefined) {
+      delete globalThis.localStorage
+    } else {
+      globalThis.localStorage = value
+    }
+    return run()
   } finally {
     if (originalLocalStorage === undefined) {
       delete globalThis.localStorage
@@ -74,31 +75,78 @@ test('storage helpers tolerate unavailable localStorage', () => {
       globalThis.localStorage = originalLocalStorage
     }
   }
+}
+
+test('storage helpers degrade to no-ops when localStorage is unavailable', () => {
+  withLocalStorage(undefined, () => {
+    // 无 localStorage：读必须回落到 null，写/删必须静默失败而不是抛错
+    storage.set('missing', { ok: true })
+    storage.remove('missing')
+
+    assert.equal(storage.get('missing'), null)
+  })
+})
+
+test('storage get returns null for malformed payloads instead of throwing', () => {
+  withLocalStorage({ getItem: () => '{not json' }, () => {
+    assert.equal(storage.get('broken'), null)
+  })
+})
+
+test('storage set failure keeps previously stored values intact', () => {
+  const items = new Map([['profile', '{"name":"Alice"}']])
+
+  withLocalStorage(
+    {
+      getItem: (key) => items.get(key) ?? null,
+      setItem: () => {
+        throw new Error('QuotaExceededError')
+      },
+      removeItem: (key) => items.delete(key),
+    },
+    () => {
+      // 写入被底层拒绝：既不能冒泡异常，也不能破坏已有数据
+      storage.set('profile', { name: 'Bob' })
+      assert.deepEqual(storage.get('profile'), { name: 'Alice' })
+
+      // remove 仍应真实生效
+      storage.remove('profile')
+      assert.equal(storage.get('profile'), null)
+    }
+  )
 })
 
 test('storage helpers round-trip JSON values through localStorage', () => {
-  const originalLocalStorage = globalThis.localStorage
   const items = new Map()
+  const calls = []
 
-  globalThis.localStorage = {
-    getItem: (key) => items.get(key) ?? null,
-    setItem: (key, value) => items.set(key, String(value)),
-    removeItem: (key) => items.delete(key),
-  }
+  withLocalStorage(
+    {
+      getItem: (key) => {
+        calls.push(['getItem', key])
+        return items.get(key) ?? null
+      },
+      setItem: (key, value) => {
+        calls.push(['setItem', key, value])
+        items.set(key, String(value))
+      },
+      removeItem: (key) => {
+        calls.push(['removeItem', key])
+        items.delete(key)
+      },
+    },
+    () => {
+      storage.set('profile', { name: 'Alice', count: 0 })
+      // 序列化格式与 key 必须真的落到 localStorage 上
+      assert.deepEqual(calls, [['setItem', 'profile', '{"name":"Alice","count":0}']])
+      assert.deepEqual(storage.get('profile'), { name: 'Alice', count: 0 })
 
-  try {
-    storage.set('profile', { name: 'Alice', count: 0 })
-    assert.deepEqual(storage.get('profile'), { name: 'Alice', count: 0 })
-
-    storage.remove('profile')
-    assert.equal(storage.get('profile'), null)
-  } finally {
-    if (originalLocalStorage === undefined) {
-      delete globalThis.localStorage
-    } else {
-      globalThis.localStorage = originalLocalStorage
+      storage.remove('profile')
+      assert.deepEqual(calls[2], ['removeItem', 'profile'])
+      assert.equal(storage.get('profile'), null)
+      assert.equal(storage.get('never-written'), null)
     }
-  }
+  )
 })
 
 test('buildMemoryVariables preserves primitive trace groups', () => {

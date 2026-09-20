@@ -1,0 +1,219 @@
+name: Release
+
+# 发布流程的第一步（也是唯一的自动化步骤）：从集成分支切一个发布分支、把
+# package.json 版本号改掉、开一个指向 main 的 PR，然后停手。
+#
+# 明确不做的三件事，避免"自动发布"失控：
+#   1. 不自动合并：release PR 必须有人评审后手动合并，且用 **merge commit**
+#      （保留 develop 上的提交分组与发布节点）。
+#   2. 不自动打 tag：tag 是"这次发布发生了什么"的锚点，由维护者在合并后用
+#      BRANCHING.md 里给出的命令手动创建，本工作流不碰 refs/tags。
+#   3. 不直接推 main：所有改动先落到 chore/release-v<version> 分支，再走 PR。
+#
+# 事件触发同样受限（沿用 GitHub 的既定行为）：用 GITHUB_TOKEN 推的分支、用
+# GITHUB_TOKEN 开的 PR 都不会自动拉起其他 workflow，所以这个 PR 上的 CI
+# 需要维护者点一次 Close → Reopen（或推一个空提交）来触发。见 BRANCHING.md
+# 的「已知限制」。
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要发布的版本号，不带 v 前缀，例如 1.1.0'
+        required: true
+        type: string
+      ref:
+        description: '切发布分支的来源 ref（默认集成分支 develop）'
+        required: false
+        default: develop
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-v${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    name: Open the release PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate the version input
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$VERSION" in
+            *[!0-9.]*|'')
+              echo "::error::version 只能由数字和点组成，收到：$VERSION"
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::version 必须是 X.Y.Z 形式（不带 v 前缀），收到：$VERSION"
+            exit 1
+          fi
+          echo "版本号校验通过：$VERSION"
+
+      - name: Checkout the source ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          # 需要与 origin/main 做比较来生成变更分类，浅克隆取不到共同祖先。
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Create the release branch, bump the version and open the PR
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_REF: ${{ inputs.ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          branch="chore/release-v${VERSION}"
+
+          # 同名发布分支已存在时直接失败：否则 push 会被拒（或更糟，覆盖别人正在
+          # 评审的发布分支），而"发布到一半"的分支需要人工判断怎么处理。
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "::error::$branch 已存在于远端，请先合并或删除它再重新发起发布。"
+            exit 1
+          fi
+
+          current="$(node -p "require('./package.json').version")"
+          if [ "$current" = "$VERSION" ]; then
+            echo "::error::package.json 已经是 $VERSION，版本号没有变化，无需发布。"
+            exit 1
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+
+          # --no-git-tag-version：只改 package.json / package-lock.json，不在本地
+          # 打 tag（tag 由维护者在合并后手动创建）。
+          npm version "$VERSION" --no-git-tag-version
+          git add package.json package-lock.json
+          git commit -m "chore(release): v${VERSION}"
+          git push origin "HEAD:refs/heads/$branch"
+
+          # 变更分类的数据源：develop 有而 main 没有的提交。origin/main 在
+          # fetch-depth: 0 的检出里已经存在，这里再显式取一次，避免用到过期引用。
+          git fetch --no-tags origin main
+          git log --no-merges --pretty=format:'%s%x09%h' origin/main..HEAD > "$RUNNER_TEMP/commits.txt"
+
+          # 按 Conventional Commits 的 type 分组；没命中的归入「其他」。
+          section() {
+            local pattern=$1 out
+            out="$(grep -E "$pattern" "$RUNNER_TEMP/commits.txt" | sed -E 's/^(.*)\t([0-9a-f]+)$/- \1 (`\2`)/' || true)"
+            if [ -z "$out" ]; then
+              printf -- '- （本版本无此类改动）\n'
+            else
+              printf '%s\n' "$out"
+            fi
+          }
+          # 三段互斥且穷尽：feat|perf / fix / 其余全部。不用白名单过滤「其他」，
+          # 否则 chore、docs、ci 这类提交会被静默丢掉，正文里"待合并的提交"就不是全集。
+          section '^(feat|perf)(\(|!|:)' > "$RUNNER_TEMP/feat.txt"
+          section '^fix(\(|!|:)' > "$RUNNER_TEMP/fix.txt"
+          grep -Ev '^(feat|perf|fix)(\(|!|:)' "$RUNNER_TEMP/commits.txt" | sed -E 's/^(.*)\t([0-9a-f]+)$/- \1 (`\2`)/' > "$RUNNER_TEMP/other.txt" || true
+          if [ ! -s "$RUNNER_TEMP/other.txt" ]; then
+            printf -- '- （本版本无此类改动）\n' > "$RUNNER_TEMP/other.txt"
+          fi
+
+          body="$RUNNER_TEMP/pr_body.md"
+          : > "$body"
+          add() { printf '%s\n' "$@" >> "$body"; }
+
+          add \
+            '## 类型' \
+            '' \
+            '- [x] 🔧 其他' \
+            '' \
+            '## 变更概述' \
+            '' \
+            "发布 PR：把 \`${SOURCE_REF}\` 上的改动作为 **v${VERSION}** 发布到 \`main\`。" \
+            '' \
+            '## 背景·问题' \
+            '' \
+            "日常改动都合入 \`develop\`，对外发布需要一个可回溯的发布点。本次把 \`${SOURCE_REF}\` 整体合并到 \`main\`，并附上该版本的变更分类与合并后待办。" \
+            '' \
+            '## 关联 issue' \
+            '' \
+            '无关联 issue，原因：例行发布 PR，发布范围由 develop 上已合并的 PR 决定，不对应单条 issue。' \
+            '' \
+            '## 变更内容' \
+            '' \
+            "- \`package.json\` 版本号：\`${current}\` → \`${VERSION}\`（\`npm version ${VERSION} --no-git-tag-version\`，同时更新 \`package-lock.json\`）" \
+            "- 发布分支：\`${branch}\`（从 \`${SOURCE_REF}\` 切出）" \
+            "- 待合并进 \`main\` 的提交（\`origin/main..HEAD\`，不含 merge commit）按 Conventional Commits 分类：" \
+            '' \
+            '### feat / perf' \
+            '' \
+            "$(cat "$RUNNER_TEMP/feat.txt")" \
+            '' \
+            '### fix' \
+            '' \
+            "$(cat "$RUNNER_TEMP/fix.txt")" \
+            '' \
+            '### 其他（chore / docs / ci / test / refactor 等）' \
+            '' \
+            "$(cat "$RUNNER_TEMP/other.txt")" \
+            '' \
+            '## 日志·验证证据' \
+            '' \
+            "- 触发方式：\`workflow_dispatch\`（version=\`${VERSION}\`，ref=\`${SOURCE_REF}\`），运行记录：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            "- 版本号改动：\`git diff origin/main -- package.json\` 与 \`git show --stat HEAD\`" \
+            "- 变更分类命令：\`git log --no-merges --pretty=format:'%s%x09%h' origin/main..HEAD\`（本 PR 的分类逐条来自该输出，无人工润色）" \
+            "- 工作流只做上面这些写操作：推 \`${branch}\` + 开本 PR；不打 tag、不合并、不推 \`main\`。" \
+            '' \
+            '## 测试情况' \
+            '' \
+            '本 PR 只改版本号，不含业务代码改动，因此没有新增测试；合并前需要人确认几步（见 `BRANCHING.md` 的发布步骤）：' \
+            '' \
+            '1. 用 **merge commit** 合并本 PR（不要 squash，否则发布点会被压平）。' \
+            "2. 合并后在 \`main\` 上打 tag 并建 release：\`git tag -a v${VERSION} -m 'Release v${VERSION}'\`、\`git push origin v${VERSION}\`、\`gh release create v${VERSION} --title v${VERSION}\`（正文可直接复用本 PR 「变更内容」的分类）。" \
+            '3. 合并到 `main` 之后 `Sync main into develop` 会自动开一个 `main → develop` 的回同步 PR，确认它出现，并同样用 **merge commit** 合并。' \
+            '' \
+            '## 截图' \
+            '' \
+            '无需截图（无 UI 变更）' \
+            '' \
+            '## 后续计划' \
+            '' \
+            'tag 与 GitHub Release 由维护者在合并后手动创建（本工作流不自动打 tag）。' \
+            ''
+
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$branch" \
+            --title "chore(release): v${VERSION}" \
+            --body-file "$body"
+
+          {
+            echo "### Release v${VERSION}"
+            echo ''
+            echo "发布分支：\`$branch\`（来源 \`$SOURCE_REF\`），版本号 \`$current\` → \`$VERSION\`。"
+            echo ''
+            echo '变更分类：'
+            echo ''
+            echo '**feat / perf**'
+            echo ''
+            cat "$RUNNER_TEMP/feat.txt"
+            echo ''
+            echo '**fix**'
+            echo ''
+            cat "$RUNNER_TEMP/fix.txt"
+            echo ''
+            echo '**其他**'
+            echo ''
+            cat "$RUNNER_TEMP/other.txt"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -15,6 +15,14 @@ dist/
 .env
 .env.*
 !.env.example
+*.key
+*.pem
+*.pfx
+*.p12
+secrets*.json
+credentials*.json
+deepseek.txt
+.envrc
 
 # Runtime data
 backend/chroma_data/
@@ -48,6 +56,9 @@ feature_list.json
 # AI-generated planning/test notes, not executable test suites
 tests/.test.md
 tests/*.test.md
+
+# e2e 运行产物：Playwright 截图 / trace / HTML 报告，属临时证据不入库
+tests/e2e/artifacts/
 
 # OS
 .DS_Store

@@ -214,8 +214,11 @@ MYSQL_SSL_CA=
 DEEPSEEK_API_KEY=your_deepseek_api_key
 DASHSCOPE_API_KEY=your_dashscope_api_key
 
-SECRET_KEY=replace-with-a-long-random-secret
+SECRET_KEY=change-this-secret-key-in-production
 ```
+
+上面 `SECRET_KEY` 写的是与 `.env.example` 一致的公开占位值，**必须替换**成随机值再启动：
+保持占位值（或留空）时后端会拒绝启动。生成方式见文末安全说明。
 
 Render 后端 Web Service 建议额外设置 Python 版本，避免平台默认使用过新的 Python 版本：
 
@@ -251,6 +254,26 @@ MILVUS_PASSWORD=
 MILVUS_DB_NAME=
 ```
 
+默认账号播种由环境变量控制：
+
+```env
+SEED_DEFAULT_USERS=true
+SEED_ADMIN_PASSWORD=
+SEED_DEMO_PASSWORD=
+```
+
+- `SEED_DEFAULT_USERS` 默认为 `true`，设为 `false` 后启动过程不会创建任何账号。
+- 账号口令只来自 `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD`，仓库中不存在固定口令；未配置对应变量时会生成不可预测的随机口令，随机口令不会写入日志。口令两端的空白字符会被忽略。
+- 因此未显式配置口令的账号无法直接登录，**已存在**的账号可以按下面的方式重置口令（`新口令` 换成自定义值）：
+
+```bash
+cd backend
+python -c "from database.session import SessionLocal; from crud import user as crud_user; from model.models import User; from service.auth_service import pwd_context; db = SessionLocal(); u = db.query(User).filter_by(username='admin').first(); crud_user.update_password_hash(db, u, pwd_context.hash('新口令')); db.close(); print('password updated')"
+```
+
+- 如果该账号还不存在（例如长期设置 `SEED_DEFAULT_USERS=false`，库里没有任何账号），临时把 `SEED_DEFAULT_USERS` 设回 `true` 并配置 `SEED_ADMIN_PASSWORD`，重启服务一次即可创建；播种只补建不存在的账号，不会覆盖已有账号的口令。
+- 对外提供服务前，建议设置 `SEED_DEFAULT_USERS=false`，或至少为启用的账号配置强口令。
+
 ### 4.3 初始化数据库
 
 创建 MySQL 数据库：
@@ -261,7 +284,16 @@ CREATE DATABASE IF NOT EXISTS rag_system
   COLLATE utf8mb4_unicode_ci;
 ```
 
-启动 FastAPI 时，`backend/main.py` 会调用 `init_db()` 创建表结构，并调用 `seed_default_users()` 初始化默认用户数据。
+启动 FastAPI 时，`backend/main.py` 会调用 `init_db()` 创建表结构，并调用 `seed_default_users()` 初始化默认账号。
+
+`seed_default_users()` 受 `SEED_DEFAULT_USERS` 控制：该开关为 `false` 时不创建任何账号；为 `true` 时仅为尚不存在的 `admin`、`demo` 创建账号，且不会覆盖已有账号的口令。账号口令取自 `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD`，未配置时使用随机生成的口令（不落日志），不再使用任何公开的固定口令。
+
+知识库与知识文件按归属用户隔离，历史数据（`user_id` 为 NULL）对任何用户都不可见，需要一次性回填：
+
+```bash
+python scripts/backfill_knowledge_owner.py --user-id <用户ID>            # 默认只打印回填计划
+python scripts/backfill_knowledge_owner.py --user-id <用户ID> --apply    # 真正写入
+```
 
 ### 4.4 本地启动
 
@@ -272,11 +304,13 @@ cd backend
 python -m uvicorn main:app --host 127.0.0.1 --port 8002
 ```
 
-健康检查：
+健康检查（注意是根路径 `/health`，不在 `/api/` 前缀下）：
 
 ```bash
-curl http://127.0.0.1:8002/health
+curl -i http://127.0.0.1:8002/health
 ```
+
+期望返回 `200` 与 `{"status":"ok"}`。
 
 启动前端：
 
@@ -327,6 +361,10 @@ server {
     root /var/www/rag/dist;
     index index.html;
 
+    location = /health {
+        proxy_pass http://127.0.0.1:8002/health;
+    }
+
     location / {
         try_files $uri $uri/ /index.html;
     }
@@ -350,6 +388,42 @@ server {
 ```
 
 `proxy_buffering off` 对 SSE 很重要，否则流式回答可能被 Nginx 缓冲，导致前端不能实时显示。
+
+健康检查必须单独代理：后端的健康检查路由注册在**根路径 `/health`**，不在 `/api/` 前缀下，所以上面的 `location = /health` 不能省。省略它的话，`/health` 会落进 `location /` 的 `try_files`，返回前端 `index.html`（`200` + `text/html`）而不是健康检查的 JSON，部署自检就会误判。另外**`/api/health` 并不存在**，请求它只会得到 `404`。
+
+关于接口文档：本示例**故意不代理** `/docs`、`/redoc`、`/openapi.json`。这三个是 FastAPI 挂在根路径下的交互文档与 OpenAPI Schema，按上述配置在公网不可达（会被 `location /` 兜到前端页面），可以避免对外暴露完整的接口结构。如果确实需要在受控环境里访问，在 server 块内补充：
+
+```nginx
+    # Swagger UI 页面本身是 /docs，它还会请求 /docs/oauth2-redirect，
+    # 因此精确匹配 /docs 之外还要放行 /docs/ 子路径。
+    # proxy_set_header 在 location 之间互不继承（写在 server 级才会被各 location 继承），
+    # 这里逐块书写，方便单独复制其中一段。
+    location = /docs {
+        proxy_pass http://127.0.0.1:8002/docs;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /docs/ {
+        proxy_pass http://127.0.0.1:8002/docs/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location = /redoc {
+        proxy_pass http://127.0.0.1:8002/redoc;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location = /openapi.json {
+        proxy_pass http://127.0.0.1:8002/openapi.json;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+```
+
+这里统一用 `=` 精确匹配，避免 `/docsXYZ` 这类并不存在的路径也被转发到后端。`proxy_set_header Host $host;` 同样是必须的：不写的话 Nginx 默认把 `Host` 设成上游地址（`127.0.0.1:8002`），而 Starlette 对 `/docs/` 会回一个 `307` 跳转到 `/docs`，跳转目标里就会带上 `http://127.0.0.1:8002` 这个只在服务器内部可达的地址，浏览器拿到后会跳不过去。四个块里还一并设置了 `X-Forwarded-Proto`（与上面 `/api/` 块保持一致），这样从 HTTPS 入口访问时 `307` 直接跳到 `https://`；少了它，跳转目标会是 `http://`，还要经 80 端口再 `301` 回 443，白多一次往返。开启前建议配合 IP 白名单（`allow` / `deny`）或额外的鉴权，不要直接暴露在公网。
 
 ### 4.7 DNS 配置
 
@@ -393,14 +467,38 @@ server {
 }
 ```
 
+上面是 HTTP → HTTPS 跳转。`certbot --nginx` 是**原地改写**匹配到 `example.com` 的那个 server 块（也就是 4.6 里监听 80 的那一个），所以 4.6 的 `location = /health` 通常会被一并保留；但如果你另行编写了 443 的 server 块，或换用了其它证书签发方式，就必须逐条确认 443 块里也有这条规则，否则 HTTPS 入口的健康检查仍会被 `location /` 兜成前端页面：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name example.com;
+    # ssl_certificate / ssl_certificate_key 等由 certbot 写入
+
+    location = /health {
+        proxy_pass http://127.0.0.1:8002/health;
+    }
+
+    # 其余 location / 与 location /api/ 的配置同 4.6
+}
+```
+
 HTTPS 部署后需要检查：
 
 - `https://example.com` 可以打开前端页面。
-- `/api/health` 可以正常返回。
+- `https://example.com/health` 可以正常返回健康检查 JSON。
 - `/api/chat/stream` 流式输出不会被代理缓冲。
 - `VITE_API_BASE_URL` 与 Nginx 代理路径一致。
-- 生产环境 `SECRET_KEY` 已替换为强随机值。
+- 生产环境 `SECRET_KEY` 已替换为强随机值（未替换时后端会拒绝启动）。
 - CORS、Cookie、安全响应头按真实部署域名收紧。
+
+其中健康检查这一项可以直接用命令验证：
+
+```bash
+curl -i https://example.com/health
+```
+
+期望结果是 `200`、`content-type: application/json`，响应体为 `{"status":"ok"}`。如果拿到的是 `text/html`，说明 `/health` 被 `location /` 兜到了前端页面（缺少 4.6 的 `location = /health`）；如果拿到 `404`，则是请求了并不存在的 `/api/health`。
 
 ## 项目亮点
 
@@ -447,6 +545,7 @@ HTTPS 部署后需要检查：
 │   └── service/                 # 业务服务
 ├── docs/                        # 架构和流程文档
 ├── tests/                       # Node 和 pytest 回归测试
+│   └── e2e/                     # Playwright 浏览器验收（用例 / 夹具 / 模型桩服务）
 ├── package.json
 ├── pytest.ini
 └── backend/requirements.txt
@@ -481,11 +580,106 @@ npm run build
 
 当前 Vite 构建可能出现 `Chat` chunk 体积较大的提示，这是 bundle size 提醒，不代表构建失败。
 
+### CI（GitHub Actions）
+
+向 `develop`、`main` 提 PR，以及 push 到 `develop` 时会自动跑下面五个独立检查。同一分支连续 push 时，上一次还在跑的运行会被自动取消（各 workflow 内的 `concurrency`）。
+
+| Workflow | 检查项 | 内容 |
+| --- | --- | --- |
+| `.github/workflows/python-tests.yml` | 后端测试 pytest (Python 3.10) | 版本对齐 `runtime.txt`（`python-3.10.11`），`pip install -r backend/requirements.txt` + `pytest`，跑 `python -m pytest -q tests` |
+| `.github/workflows/frontend-tests.yml` | 前端测试 node --test (Node 22) | `npm ci` 后跑 `npm test` |
+| `.github/workflows/build.yml` | 前端构建 vite build (Node 22) | `npm run build`，产物 `dist/` 上传为 artifact |
+| `.github/workflows/static-checks.yml` | 静态检查 (最低档) | 后端 `python -m compileall` + `ruff check --select E9,F63,F7,F82`；前端 `node --check src/**/*.js` |
+| `.github/workflows/e2e.yml` | 端到端验收 Playwright e2e (chromium) | 起 MySQL 8.0 服务容器 + 本地模型桩（`tests/e2e/stub_llm_server.py`，替掉全部模型上游）→ 构建前端并以 `vite preview` 托管 → 真实浏览器跑 `tests/e2e/chat.spec.mjs` → 用桩的请求日志确认检索链路真被走到（`tests/e2e/check_stub_calls.py`）→ 截图与各服务日志上传为 artifact |
+
+说明：
+
+- 静态检查目前只拦语法错误、未定义名等确定性错误，**不是**完整规范；为什么不直接开 `ruff --select E,F` 以及后续怎么加严，写在 `static-checks.yml` 顶部注释里。
+- 五个 workflow 都是 `permissions: contents: read`，不配置任何密钥，也不使用 `continue-on-error`：失败就是失败。
+- 后端测试只需 `backend/requirements.txt` + `pytest`；RAGAS 等可选评估依赖是延迟导入，CI 不安装。
+- e2e 不需要任何真实密钥：模型上游由仓库内的桩服务顶替，元数据库是一次性容器，`SECRET_KEY` 每次运行现场生成（写进仓库等于提交一个可用密钥）。审批用的占位口令只对本次运行的临时容器有效。
+
+### 端到端验收（e2e）
+
+`tests/e2e/chat.spec.mjs` 用真实浏览器走一遍主干：登录 → 新建知识库 → 上传资料 → 提问 → 观察流式作答 → 展开参考资料核对引用。它打的是**构建产物**（`vite build` + `vite preview`）而不是 dev server，后端连的也是真实 MySQL 与向量库，所以前端渲染、HTTP 接口、检索与 SSE 都在验收范围内。
+
+唯一的替身是模型上游：`tests/e2e/stub_llm_server.py` 是只依赖标准库的 OpenAI 兼容服务，返回固定文本与确定性向量。它不替后端检索，也不替前端渲染——链路里任何一环断掉，用例都会失败，而不是被桩兜住。
+
+本地跑一遍（下列命令分四个终端）：
+
+```bash
+# 0) 只装 chromium：CI 里也只装这一个浏览器，本地与 CI 的结论才对得上
+npx playwright install chromium
+
+# 1) 模型桩服务（日志目录先建好：桩启动时会校验日志文件可写，不可写直接以退出码 2 失败）
+#    分片间隔与 CI 保持一致，见 .github/workflows/e2e.yml
+mkdir -p tests/e2e/artifacts/logs
+python tests/e2e/stub_llm_server.py --port 8899 --dim 1024 \
+  --chunk-delay-ms 1200 --chunk-size 8 \
+  --log-file tests/e2e/artifacts/logs/stub-requests.jsonl
+```
+
+```bash
+# 2) 后端：上游全部指向桩，MySQL / 向量库用本地实例
+cd backend
+export MYSQL_HOST=127.0.0.1 MYSQL_PORT=<端口> MYSQL_USER=<用户> \
+  MYSQL_PASSWORD=<口令> MYSQL_DATABASE=<库名>
+export SECRET_KEY="$(openssl rand -hex 32)"
+export DEEPSEEK_BASE_URL=http://127.0.0.1:8899/v1 DEEPSEEK_API_KEY=<任意非空占位值>
+export TEXT_FALLBACK_BASE_URL=http://127.0.0.1:8899/v1 TEXT_FALLBACK_API_KEY=<同上>
+export EMBEDDING_BASE_URL=http://127.0.0.1:8899/v1 EMBEDDING_API_KEY=<同上>
+export EMBEDDING_DIM=1024
+export RERANK_BASE_URL=http://127.0.0.1:8899/v1/reranks RERANK_API_KEY=<同上>
+export VISION_BASE_URL=http://127.0.0.1:8899/v1 VISION_API_KEY=<同上>
+export SEED_DEFAULT_USERS=true SEED_DEMO_PASSWORD=<与下面的 E2E_PASSWORD 一致>
+python -m uvicorn main:app --host 127.0.0.1 --port 8002
+```
+
+```bash
+# 3) 前端：构建期固化后端绝对地址（preview 不复用 vite.config.js 的 dev 代理），再托管产物
+#    末尾的 /api 与 dev 代理的目标一致：后端路由本身挂在 /api 下，前端请求 `${base}/chat/...`
+VITE_API_BASE_URL=http://127.0.0.1:8002/api npm run build
+npm run preview -- --port 4173 --strictPort --host 127.0.0.1
+```
+
+```bash
+# 4) 跑用例
+E2E_BASE_URL=http://127.0.0.1:4173 E2E_USERNAME=demo \
+  E2E_PASSWORD=<与 SEED_DEMO_PASSWORD 一致> npm run test:e2e
+
+# 5) 确认检索链路真被走到（CI 里也跑这一步，见 e2e.yml）
+#    用例全绿不等于链路完整：后端路由 / 检索规划 / 重排都有兜底分支，
+#    退化到兜底时用例照样绿。这一步读桩的请求日志，判定各角色是否都被调过。
+python tests/e2e/check_stub_calls.py tests/e2e/artifacts/logs/stub-requests.jsonl
+```
+
+产物落在 `tests/e2e/artifacts/`（已 gitignore）：7 张截图与 HTML 报告在 `artifacts/report/`，用 `npx playwright show-report tests/e2e/artifacts/report` 回看，截图挂在测试报告的每一步上；用例失败时还会额外留下 `trace.zip`（配置为 `trace: 'retain-on-failure'`，**绿跑没有 trace**，这是 Playwright 的预期行为而不是产物缺失）。
+
+CI 与本地唯一的环境差异是各服务的地址由 `.github/workflows/e2e.yml` 注入；用例本身不感知环境，也不做 `if (CI)` 分支。
+
+## 协作与提交规范
+
+- 提交信息与 PR 标题遵循 [Conventional Commits](https://www.conventionalcommits.org/)，type 与 scope 取值、合并方式见 [COMMIT_CONVENTION.md](COMMIT_CONVENTION.md)。
+- 新建 issue 必须选择模板；PR 描述按 [.github/pull_request_template.md](.github/pull_request_template.md) 逐节填写，必填节为空时 CI 会变红。
+- CI 校验 PR 标题、PR 描述必填节与 issue 结构，脚本在 `scripts/` 下，可用 `node scripts/check_pr_body.mjs <文件>` 本地复现同一套规则。
+- 日常 PR squash 合并进 `develop`，发布 PR（`develop` → `main`）用 merge commit。
+
+## 分支与发布
+
+- `main` 是发布分支，只接受来自 `develop` 的发布 PR 和紧急热修复；`develop` 是集成分支，日常改动都提到这里。
+- 短分支从 `develop` 切出，命名为 `<type>/<topic>-<issue号>`，合入后删除；一律通过 PR 合入，不直接 push 公共分支。
+- 合并方式：日常 PR 用 squash；发布 PR 和 `main → develop` 回同步 PR 用 merge commit（否则回同步会反复重现）。
+- 发布：手动运行 `Release` 工作流（输入版本号）→ 评审并合并发布 PR 到 `main` → 手动打 tag；合并到 `main` 后 `Sync main into develop` 会自动开回同步 PR。
+- 完整约定（分支命名、发布步骤、门禁、已知限制）见 [BRANCHING.md](BRANCHING.md)。
+
 ## 安全说明
 
 - `.env`、本地数据库、上传文件、日志、PID 文件、缓存、`node_modules` 和构建产物都应加入 Git 忽略规则。
 - `.env.example` 只保留占位配置，不应提交真实 API key、OSS 凭证、数据库密码或 JWT secret。
 - 生产环境需要替换默认本地配置，配置 HTTPS / 反向代理，强化 JWT secret 管理，并进行外部模型与对象存储连通性检查。
+- `SECRET_KEY` 缺失或仍是 `.env.example` 里的公开占位值 `change-this-secret-key-in-production` 时，后端会在启动阶段直接报错退出，不会带着这个人人可读的值对外提供服务；该值能让任何人伪造包括 `admin` 在内的任意用户登录态，不可用于任何对外可访问的部署。生成真实值：`python -c "import secrets; print(secrets.token_urlsafe(48))"`。
+- 仅本地开发可用 `ALLOW_INSECURE_DEFAULT_SECRET=true` 放行启动：此时进程使用一次性随机密钥，每次重启已签发 token 全部失效，多进程/多副本之间互不认可对方签发的 token，禁止用于生产。
+- 启动播种的演示账号不再是公开固定口令：账号口令由 `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD` 提供，未配置时随机生成且不写入日志；不需要演示账号时设置 `SEED_DEFAULT_USERS=false`。
 
 ## 文档
 

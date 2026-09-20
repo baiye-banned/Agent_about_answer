@@ -1,4 +1,8 @@
 import asyncio
+import threading
+import time
+
+import pytest
 
 from rag import retrieval
 
@@ -45,10 +49,278 @@ def test_retrieve_knowledge_uses_sub_questions_and_rewrites(monkeypatch):
         )
     )
 
-    routes = [route for route, _ in vector_calls]
-    assert routes == ["planned", "sub_question_1", "rewrite_1"]
+    # 多路召回并发执行后调用发生的先后不再有保证，trace 中的顺序才是对外语义
+    # （它按 route_specs 的生成顺序固定），这里同样能验证“采纳子问题/改写 + 同义 query 去重”。
+    assert {route for route, _ in vector_calls} == {"planned", "sub_question_1", "rewrite_1"}
+    vector_routes_in_trace = [item["route"] for item in trace["routes"] if item["route"] != "keyword"]
+    assert vector_routes_in_trace == ["planned", "sub_question_1", "rewrite_1"]
     assert chunks
     assert trace["query_plan"]["original_question"] == "迟到三个小时扣多少钱"
+
+
+def test_retrieve_knowledge_keeps_event_loop_responsive_and_recalls_concurrently(monkeypatch):
+    """一轮多路检索期间事件循环必须仍在被调度，且各路召回是并发而不是串行等待。"""
+    route_count = 8
+    route_delay = 0.2
+    keyword_delay = 0.2
+    lock = threading.Lock()
+    inflight = {"now": 0, "max": 0}
+    windows = {"vectors_end": 0.0, "keyword_start": None}
+    calls = []
+
+    def fake_query_vectors(query, top_k, knowledge_base_id, route):
+        with lock:
+            calls.append(route)
+            inflight["now"] += 1
+            inflight["max"] = max(inflight["max"], inflight["now"])
+        try:
+            time.sleep(route_delay)
+            return []
+        finally:
+            with lock:
+                inflight["now"] -= 1
+                windows["vectors_end"] = max(windows["vectors_end"], time.perf_counter())
+
+    def fake_keyword_recall(db, knowledge_base_id, keywords, top_k):
+        with lock:
+            windows["keyword_start"] = time.perf_counter()
+        time.sleep(keyword_delay)
+        return []
+
+    async def fake_rerank_chunks(question, chunks):
+        return chunks, {"status": "done", "items": []}
+
+    monkeypatch.setattr(retrieval, "query_vectors", fake_query_vectors)
+    monkeypatch.setattr(retrieval, "keyword_recall", fake_keyword_recall)
+    monkeypatch.setattr(retrieval, "rerank_chunks", fake_rerank_chunks)
+
+    async def scenario():
+        heartbeats = []
+
+        async def ticker():
+            while True:
+                await asyncio.sleep(0.02)
+                heartbeats.append(time.perf_counter())
+
+        ticker_task = asyncio.create_task(ticker())
+        await asyncio.sleep(0.05)  # 先让心跳协程真正跑起来
+        started_at = time.perf_counter()
+        _, trace = await retrieval.retrieve_knowledge(
+            "迟到怎么处理",
+            knowledge_base_id=1,
+            db=object(),
+            query_plan={
+                "original_question": "迟到怎么处理",
+                "simplified_question": "考勤 迟到 处理",
+                "sub_questions": ["迟到多久算旷工", "迟到罚款多少"],
+                "hyde_document": "员工迟到30分钟以内罚款50元。",
+                "rewrites": ["迟到怎么罚", "上班迟到扣多少钱", "迟到处罚规定"],
+                "keywords": ["迟到"],
+            },
+        )
+        finished_at = time.perf_counter()
+        ticker_task.cancel()
+        during = [beat for beat in heartbeats if started_at < beat < finished_at]
+        return during, finished_at - started_at, trace
+
+    heartbeats_during_retrieval, elapsed, trace = asyncio.run(scenario())
+
+    assert [item["route"] for item in trace["routes"]] == [
+        "planned",
+        "simplified",
+        "sub_question_1",
+        "sub_question_2",
+        "hyde",
+        "rewrite_1",
+        "rewrite_2",
+        "rewrite_3",
+        "keyword",
+    ]
+    assert len(calls) == route_count
+    # 检索期间事件循环仍在调度心跳协程：修复前这里是 0（同步调用独占事件循环）。
+    assert heartbeats_during_retrieval
+    # 多路召回并发：任一时刻都有多路在途，而不是一路接一路。
+    assert inflight["max"] >= 2
+    # 关键字召回也在同一个 gather 里：它必须在最后一路向量召回结束前就启动。
+    assert windows["keyword_start"] is not None
+    assert windows["keyword_start"] < windows["vectors_end"]
+    # 8 路各 0.2s：串行需要 1.6s，并发后应明显低于串行耗时。
+    assert elapsed < route_count * route_delay * 0.6
+
+
+def test_retrieve_knowledge_skips_vector_routes_when_embedding_backend_fails(monkeypatch):
+    keyword_chunk = {
+        "id": "kw-1",
+        "chunk_id": "1",
+        "content": "迟到30分钟以内罚款50元",
+        "file_name": "考勤制度.txt",
+        "file_id": 1,
+        "route": "keyword",
+    }
+    status_calls = []
+
+    def fake_query_vectors(query, top_k, knowledge_base_id, route):
+        raise retrieval.EmbeddingBackendError("向量化接口调用失败（https://embedding.example/v1/embeddings）：429 Too Many Requests")
+
+    def fake_keyword_recall(db, knowledge_base_id, keywords, top_k):
+        return [keyword_chunk]
+
+    async def fake_rerank_chunks(question, chunks):
+        return chunks, {"status": "done", "items": []}
+
+    def fake_embedding_backend_status():
+        status_calls.append(True)
+        if len(status_calls) == 1:
+            return {"mode": "openai-compatible", "last_error": ""}
+        return {"mode": "unavailable", "last_error": "向量化接口调用失败：429 Too Many Requests"}
+
+    monkeypatch.setattr(retrieval, "query_vectors", fake_query_vectors)
+    monkeypatch.setattr(retrieval, "keyword_recall", fake_keyword_recall)
+    monkeypatch.setattr(retrieval, "rerank_chunks", fake_rerank_chunks)
+    monkeypatch.setattr(retrieval, "embedding_backend_status", fake_embedding_backend_status)
+
+    chunks, trace = asyncio.run(
+        retrieval.retrieve_knowledge(
+            "考勤 迟到 处罚",
+            knowledge_base_id=1,
+            db=object(),
+            query_plan={
+                "original_question": "迟到30分钟以内罚款多少钱",
+                "simplified_question": "迟到罚款标准",
+                "sub_questions": [],
+                "rewrites": [],
+                "keywords": ["考勤", "迟到"],
+                "required_evidence": [],
+            },
+        )
+    )
+
+    assert [chunk["route"] for chunk in chunks] == ["keyword"]
+    assert trace["embedding_error"]
+    assert trace["embedding"]["mode"] == "unavailable"
+    assert [route["count"] for route in trace["routes"]] == [0, 0, 1]
+    assert len(status_calls) == 2
+
+
+def test_retrieve_knowledge_degrades_only_the_failing_vector_route(monkeypatch):
+    """单路向量化失败只降级该路：其余向量路与关键词路照常返回（并发 x 逐路隔离的并集语义）。"""
+    healthy_chunk = {
+        "id": "vec-2",
+        "chunk_id": "2",
+        "content": "迟到30分钟以内罚款50元",
+        "file_name": "考勤制度.txt",
+        "file_id": 1,
+        "route": "simplified",
+    }
+    keyword_chunk = {
+        "id": "kw-1",
+        "chunk_id": "kw-1",
+        "content": "迟到超过30分钟按旷工处理",
+        "file_name": "考勤制度.txt",
+        "file_id": 2,
+        "route": "keyword",
+    }
+    vector_calls = []
+
+    def fake_query_vectors(query, top_k, knowledge_base_id, route):
+        vector_calls.append(route)
+        if route == "planned":
+            raise retrieval.EmbeddingBackendError("向量化接口调用失败：429 Too Many Requests")
+        return [healthy_chunk]
+
+    def fake_keyword_recall(db, knowledge_base_id, keywords, top_k):
+        return [keyword_chunk]
+
+    async def fake_rerank_chunks(question, chunks):
+        return chunks, {"status": "done", "items": []}
+
+    monkeypatch.setattr(retrieval, "query_vectors", fake_query_vectors)
+    monkeypatch.setattr(retrieval, "keyword_recall", fake_keyword_recall)
+    monkeypatch.setattr(retrieval, "rerank_chunks", fake_rerank_chunks)
+
+    chunks, trace = asyncio.run(
+        retrieval.retrieve_knowledge(
+            "考勤 迟到 处罚",
+            knowledge_base_id=1,
+            db=object(),
+            query_plan={
+                "original_question": "迟到30分钟以内罚款多少钱",
+                "simplified_question": "迟到罚款标准",
+                "sub_questions": [],
+                "rewrites": [],
+                "keywords": ["考勤", "迟到"],
+                "required_evidence": [],
+            },
+        )
+    )
+
+    # 失败路仍然被检索过（不是提前退出），只是该路 0 命中；其余路不受影响。
+    assert set(vector_calls) == {"planned", "simplified"}
+    assert [item["route"] for item in trace["routes"]] == ["planned", "simplified", "keyword"]
+    assert [item["count"] for item in trace["routes"]] == [0, 1, 1]
+    assert trace["embedding_error"]
+    # 失败路没有退化成哈希向量召回（否则这里会混入该路的伪命中）。
+    assert {chunk["id"] for chunk in chunks} >= {"vec-2", "kw-1"}
+    assert not any(chunk.get("route") == "planned" for chunk in chunks)
+
+
+def test_retrieve_knowledge_waits_for_all_recalls_before_propagating(monkeypatch):
+    """非降级异常上抛前必须等全部召回结束：否则兄弟线程会在请求级 Session 关闭后继续跑。"""
+    finished = []
+    lock = threading.Lock()
+
+    def fake_query_vectors(query, top_k, knowledge_base_id, route):
+        if route == "planned":
+            raise RuntimeError("boom")
+        try:
+            time.sleep(0.2)
+            return []
+        finally:
+            with lock:
+                finished.append(route)
+
+    def fake_keyword_recall(db, knowledge_base_id, keywords, top_k):
+        try:
+            time.sleep(0.2)
+            return []
+        finally:
+            with lock:
+                finished.append("keyword")
+
+    async def fake_rerank_chunks(question, chunks):
+        return chunks, {"status": "done", "items": []}
+
+    monkeypatch.setattr(retrieval, "query_vectors", fake_query_vectors)
+    monkeypatch.setattr(retrieval, "keyword_recall", fake_keyword_recall)
+    monkeypatch.setattr(retrieval, "rerank_chunks", fake_rerank_chunks)
+
+    # 自建事件循环而不是 asyncio.run：asyncio.run 收尾会 join 线程池，
+    # 把「异常上抛瞬间兄弟线程还在跑」这个差异掩盖掉，用不了作用例的判别力。
+    loop = asyncio.new_event_loop()
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            loop.run_until_complete(
+                retrieval.retrieve_knowledge(
+                    "考勤 迟到 处罚",
+                    knowledge_base_id=1,
+                    db=object(),
+                    query_plan={
+                        "original_question": "迟到30分钟以内罚款多少钱",
+                        "simplified_question": "迟到罚款标准",
+                        "sub_questions": [],
+                        "rewrites": [],
+                        "keywords": ["考勤", "迟到"],
+                        "required_evidence": [],
+                    },
+                )
+            )
+
+        # 非 EmbeddingBackendError 异常原样上抛，但上抛那一刻其余召回必须已全部结束
+        # （否则请求级 Session 已关闭、兄弟线程仍在使用它）。
+        assert set(finished) == {"simplified", "keyword"}
+    finally:
+        loop.run_until_complete(loop.shutdown_default_executor())
+        loop.close()
 
 
 def test_build_route_specs_does_not_reintroduce_empty_question():

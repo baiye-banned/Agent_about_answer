@@ -1,4 +1,6 @@
+import logging
 import os
+import secrets
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -59,6 +61,13 @@ MILVUS_COLLECTION_NAME = os.getenv("MILVUS_COLLECTION_NAME", "")
 # SQLite checkpointer
 CHECKPOINTER_DB_PATH = os.getenv("CHECKPOINTER_DB_PATH", "./checkpointer.db")
 
+# Bootstrap accounts. When disabled, seed_default_users() creates nothing.
+# Account passwords come from SEED_<USERNAME>_PASSWORD and are never hardcoded.
+SEED_DEFAULT_USERS = _env_bool("SEED_DEFAULT_USERS", True)
+
+# Knowledge base upload
+KNOWLEDGE_UPLOAD_MAX_MB = _env_int("KNOWLEDGE_UPLOAD_MAX_MB", 10)
+
 # DeepSeek OpenAI-compatible chat API
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
@@ -93,6 +102,10 @@ EMBEDDING_BASE_URL = os.getenv(
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v4")
 EMBEDDING_DIM = _env_int("EMBEDDING_DIM", 1024)
+# Single embedding request timeout, in seconds. Retrieval issues up to 9 route
+# queries per round, so a 60s default can stall the whole round; keep it at
+# online-QA scale and let deployments raise it for bulk ingestion.
+EMBEDDING_TIMEOUT_SECONDS = _env_int("EMBEDDING_TIMEOUT_SECONDS", 10)
 
 # Dedicated reranker for retrieved chunks.
 RERANK_PROVIDER = os.getenv("RERANK_PROVIDER", "dashscope")
@@ -134,6 +147,76 @@ OSS_BUCKET = os.getenv("oss_bucket") or os.getenv("OSS_BUCKET", "")
 OSS_ENDPOINT = os.getenv("oss_endpoint") or os.getenv("OSS_ENDPOINT", "")
 
 # JWT
-SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret-key-in-production")
+# The literal below is a public placeholder shipped with the repository; anyone can
+# read it, so it must never be used as an actual HS256 signing key.
+DEFAULT_SECRET_KEY = "change-this-secret-key-in-production"
+ALLOW_INSECURE_DEFAULT_SECRET = _env_bool("ALLOW_INSECURE_DEFAULT_SECRET", False)
+
+SECRET_KEY_SOURCE_ENV = "env"  # scan-secrets:allow source label, not a credential
+SECRET_KEY_SOURCE_INSECURE_DEV = "insecure-dev"  # scan-secrets:allow source label, not a credential
+SECRET_KEY_SOURCE_UNCONFIGURED = "unconfigured"  # scan-secrets:allow source label, not a credential
+
+SECRET_KEY_ERROR = (
+    "SECRET_KEY 未配置，或仍是仓库内置的公开占位值，服务拒绝启动。\n"
+    "请在环境变量或 .env 中设置一个足够长的随机值，例如：\n"
+    "  python -c \"import secrets; print(secrets.token_urlsafe(48))\"\n"
+    "仅本地开发可临时设置 ALLOW_INSECURE_DEFAULT_SECRET=true 放行：该开关让进程使用一次性\n"
+    "随机密钥启动，每次重启都会使已签发的 token 全部失效，禁止用于任何对外可访问的部署。"
+)
+
+_logger = logging.getLogger(__name__)
+
+
+class SecretKeyError(RuntimeError):
+    """Raised at startup when SECRET_KEY is missing or still the public placeholder."""
+
+
+def resolve_secret_key(secret_key, allow_insecure_default):
+    """Resolve the JWT signing key into ``(key, source)``.
+
+    The repository placeholder is never returned as a usable key. When the value is
+    missing or still the placeholder, an ephemeral random key is generated instead, so
+    the process can never sign or verify with a publicly known secret -- not even when
+    it is imported by a script or test that skips the startup check.
+    """
+    candidate = (secret_key or "").strip()
+    if candidate and candidate != DEFAULT_SECRET_KEY:
+        return candidate, SECRET_KEY_SOURCE_ENV
+    if allow_insecure_default:
+        _logger.warning(
+            "SECRET_KEY is not configured; ALLOW_INSECURE_DEFAULT_SECRET=true so this "
+            "process runs on an ephemeral random key. Never use it for a deployment "
+            "reachable by others, and expect every restart to invalidate issued tokens."
+        )
+        return secrets.token_urlsafe(48), SECRET_KEY_SOURCE_INSECURE_DEV
+    _logger.warning(
+        "SECRET_KEY is not configured or is still the public repository placeholder. "
+        "The process will refuse to start; set SECRET_KEY to a long random value."
+    )
+    return secrets.token_urlsafe(48), SECRET_KEY_SOURCE_UNCONFIGURED
+
+
+def secret_key_is_usable() -> bool:
+    """True when the process has a non-placeholder key to sign and verify with.
+
+    That is either an explicitly configured SECRET_KEY, or the local-dev escape hatch
+    (ephemeral random key). Only the unconfigured case is unusable.
+    """
+    return SECRET_KEY_SOURCE != SECRET_KEY_SOURCE_UNCONFIGURED
+
+
+def ensure_secret_key_configured() -> None:
+    """Fail fast when the process would run on an unpredictable-but-unusable config.
+
+    Called from the application startup path: a deployment that forgot to set
+    SECRET_KEY must not silently serve traffic.
+    """
+    if not secret_key_is_usable():
+        raise SecretKeyError(SECRET_KEY_ERROR)
+
+
+SECRET_KEY, SECRET_KEY_SOURCE = resolve_secret_key(
+    os.getenv("SECRET_KEY"), ALLOW_INSECURE_DEFAULT_SECRET
+)
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = _env_int("ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 24)

@@ -6,6 +6,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from model.models import KnowledgeFile
+from service.utils_service import KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE
 
 
 def serialize_knowledge_file(file_entry: KnowledgeFile) -> dict:
@@ -18,17 +19,17 @@ def serialize_knowledge_file(file_entry: KnowledgeFile) -> dict:
     }
 
 
-def list_knowledge_files(db: Session, knowledge_base_id: int) -> list[KnowledgeFile]:
+def list_knowledge_files(db: Session, knowledge_base_id: int, user_id: int) -> list[KnowledgeFile]:
     return (
         db.query(KnowledgeFile)
-        .filter_by(knowledge_base_id=knowledge_base_id)
+        .filter_by(knowledge_base_id=knowledge_base_id, user_id=user_id)
         .order_by(KnowledgeFile.created_at.desc())
         .all()
     )
 
 
-def get_knowledge_file(db: Session, fid: int) -> KnowledgeFile | None:
-    return db.query(KnowledgeFile).filter_by(id=fid).first()
+def get_knowledge_file(db: Session, fid: int, user_id: int) -> KnowledgeFile | None:
+    return db.query(KnowledgeFile).filter_by(id=fid, user_id=user_id).first()
 
 
 def create_knowledge_file(
@@ -38,12 +39,14 @@ def create_knowledge_file(
     name: str,
     size: int,
     content: str,
+    user_id: int,
 ) -> KnowledgeFile:
     entry = KnowledgeFile(
         knowledge_base_id=knowledge_base_id,
         name=name,
         size=size,
         content=content,
+        user_id=user_id,
     )
     db.add(entry)
     db.commit()
@@ -51,8 +54,8 @@ def create_knowledge_file(
     return entry
 
 
-def delete_knowledge_file(db: Session, fid: int) -> KnowledgeFile | None:
-    entry = get_knowledge_file(db, fid)
+def delete_knowledge_file(db: Session, fid: int, user_id: int) -> KnowledgeFile | None:
+    entry = get_knowledge_file(db, fid, user_id)
     if not entry:
         return None
     db.delete(entry)
@@ -60,8 +63,8 @@ def delete_knowledge_file(db: Session, fid: int) -> KnowledgeFile | None:
     return entry
 
 
-def get_knowledge_content(db: Session, fid: int) -> dict | None:
-    entry = get_knowledge_file(db, fid)
+def get_knowledge_content(db: Session, fid: int, user_id: int) -> dict | None:
+    entry = get_knowledge_file(db, fid, user_id)
     if not entry:
         return None
     content = entry.content or ""
@@ -75,12 +78,15 @@ def get_knowledge_content(db: Session, fid: int) -> dict | None:
 
 
 def extract_file_text(filename: str, content: bytes) -> str:
-    lower_name = filename.lower()
+    """按扩展名抽取文本；白名单外的类型直接拒绝，不再兜底当纯文本解码。"""
+    lower_name = (filename or "").lower()
     if lower_name.endswith(".docx"):
         return extract_docx_text(content)
     if lower_name.endswith(".pdf"):
         return extract_pdf_text(content)
-    return content.decode("utf-8", errors="replace")
+    if lower_name.endswith(".txt") or lower_name.endswith(".md"):
+        return content.decode("utf-8", errors="replace")
+    raise HTTPException(400, KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE)
 
 
 def extract_docx_text(content: bytes) -> str:
