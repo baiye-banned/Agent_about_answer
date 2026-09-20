@@ -152,9 +152,9 @@ OSS_ENDPOINT = os.getenv("oss_endpoint") or os.getenv("OSS_ENDPOINT", "")
 DEFAULT_SECRET_KEY = "change-this-secret-key-in-production"
 ALLOW_INSECURE_DEFAULT_SECRET = _env_bool("ALLOW_INSECURE_DEFAULT_SECRET", False)
 
-SECRET_KEY_SOURCE_ENV = "env"
-SECRET_KEY_SOURCE_INSECURE_DEV = "insecure-dev"
-SECRET_KEY_SOURCE_UNCONFIGURED = "unconfigured"
+SECRET_KEY_SOURCE_ENV = "env"  # scan-secrets:allow source label, not a credential
+SECRET_KEY_SOURCE_INSECURE_DEV = "insecure-dev"  # scan-secrets:allow source label, not a credential
+SECRET_KEY_SOURCE_UNCONFIGURED = "unconfigured"  # scan-secrets:allow source label, not a credential
 
 SECRET_KEY_ERROR = (
     "SECRET_KEY 未配置，或仍是仓库内置的公开占位值，服务拒绝启动。\n"
