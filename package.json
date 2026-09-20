@@ -29,6 +29,7 @@
     "autoprefixer": "^10.4.0",
     "unplugin-auto-import": "^0.17.0",
     "unplugin-vue-components": "^0.27.0",
-    "@playwright/test": "^1.63.0"
+    "@playwright/test": "^1.63.0",
+    "jsdom": "^30.1.0"
   }
 }
