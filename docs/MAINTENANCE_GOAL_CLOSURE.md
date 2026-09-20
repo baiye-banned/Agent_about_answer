@@ -76,10 +76,78 @@ Immediate next step:
 Next batch:
 
 2. Milvus acceptance goal: verify index rebuild, upload, query, knowledge-base isolation, and deletion cleanup end to end.
+   - Acceptance tests: `tests/test_milvus_acceptance.py` (see [Acceptance Test Index](#acceptance-test-index)).
 3. Retrieval acceptance goal: verify query planning, vector recall, keyword recall, RRF fusion, and rerank with focused behavior tests.
+   - Acceptance tests: `tests/test_retrieval_acceptance.py` (see [Acceptance Test Index](#acceptance-test-index)).
 4. Rerank and provider goal: smoke-test DashScope rerank, LLM fallback, embedding, and DeepSeek connectivity in the target environment.
+   - Acceptance tests: `tests/test_provider_smoke.py` plus the offline smoke entry point `scripts/smoke_providers.py` (`--live` for the real endpoints); see [Acceptance Test Index](#acceptance-test-index).
 5. Frontend behavior goal: partially done. Narrow tests for knowledge batch delete/upload feedback and chat RAGAS polling/message merge behavior were added (`tests/knowledgeFeedback.test.js`, `tests/chatStore.test.js`). Still open: no test covers the Vue view glue, and the delete paths take no error branch when the user cancels the confirm dialog or `knowledgeAPI.delete` rejects.
 6. Documentation alignment goal: keep startup commands and environment variables consistent across README, docs, and project instructions.
+
+## Acceptance Test Index
+
+Behavior-level acceptance tests for follow-up goals 2-4, added by issue #22. All of
+them run offline and deterministic; no credentials and no network access are required.
+
+### Goal 2 - Milvus acceptance (`tests/test_milvus_acceptance.py`)
+
+Runs against a real Milvus Lite database created in a temporary directory (only the
+embedding function is replaced, with a deterministic offline implementation).
+
+- `test_acceptance_upload_query_delete_round_trip` - upload, query with cosine distance 0, delete, then query again returns nothing.
+- `test_acceptance_knowledge_base_isolation` - a query in knowledge base A never sees knowledge base B chunks, while a query without a knowledge base filter sees both.
+- `test_acceptance_reupload_replaces_previous_chunks` - re-uploading a file replaces its previous chunks instead of appending.
+- `test_acceptance_delete_removes_only_target_file` - deleting one file leaves the other files of the same knowledge base searchable.
+- `test_acceptance_index_rebuild_restores_recall_without_duplicates` - `rebuild_existing_knowledge_index()` rebuilds a deleted index with the same chunk count and the same recall result.
+- `test_acceptance_query_window_and_missing_collection` - `top_k` window behavior, blank query, missing collection, and a knowledge base with no data.
+- `test_acceptance_round_trip_survives_a_dead_proxy_environment` - the round trip stays green in a child process whose proxy variables point at a dead port, so a proxy setting cannot masquerade as a Milvus failure.
+
+### Goal 3 - Retrieval acceptance (`tests/test_retrieval_acceptance.py`)
+
+Drives the full `retrieve_knowledge` chain: multi-route recall, RRF fusion, rerank, and
+final context selection. Only the marginal recall and the rerank HTTP transport are
+replaced; the real fusion, truncation and selection logic runs. Keyword recall reads the
+relational store rather than Milvus, so the last three cases call that implementation
+unpatched against real `KnowledgeFile` rows in a real SQLite database.
+
+- `test_acceptance_multi_route_rrf_rerank_final_order` - one path from plan to final context: route order and `top_k`, RRF order and scores, rerank request payload, and a final order that follows the rerank scores.
+- `test_acceptance_rerank_failure_falls_back_to_fused_order` - a failed rerank keeps the fused order and reports a failed rerank trace.
+- `test_acceptance_rerank_falls_back_to_llm_with_real_fused_candidates` - the LLM fallback receives the real fused candidates and its scores decide the final order.
+- `test_acceptance_keyword_boost_prepends_best_keyword_chunk` - a strongly matching keyword chunk is prepended to the final context.
+- `test_acceptance_keyword_boost_does_not_duplicate_selected_chunk` - the keyword boost never duplicates an already selected chunk.
+- `test_acceptance_empty_recall_skips_rerank_without_provider_call` - an empty recall returns an empty context and never calls the rerank provider.
+- `test_acceptance_partial_empty_routes_still_produce_context` - empty routes are reported as count 0 while the remaining route still produces context.
+- `test_acceptance_single_route_failure_is_not_swallowed` - a failing recall route aborts the retrieval instead of returning partial context.
+- `test_acceptance_route_plan_is_deduplicated_and_capped` - the route plan is deduplicated and capped before recall.
+- `test_acceptance_rerank_candidate_window_is_capped` - the candidate window sent to the reranker and the returned context are capped by the configured limits.
+- `test_acceptance_real_keyword_recall_reads_the_relational_store` - the unpatched `keyword_recall` returns only matching rows of the requested knowledge base, with the stored row identity and the real keyword scores in descending order.
+- `test_acceptance_real_keyword_recall_chunks_long_text_and_caps_results` - the unpatched `keyword_recall` splits long stored text at the real character offsets, drops chunks without a keyword hit, and caps the result at `top_k`.
+- `test_acceptance_retrieve_knowledge_uses_the_real_keyword_recall` - the real keyword chunk travels through fusion and rerank into the final context.
+
+### Goal 4 - Rerank and provider smoke (`tests/test_provider_smoke.py`, `scripts/smoke_providers.py`)
+
+Covers the provider clients the chain depends on - embedding, rerank, DeepSeek chat and
+the text fallback - for the success contract, failures, timeouts and malformed
+responses. Every error path must be visible: a logged error, a failed trace, or an
+explicit error event.
+
+- `test_embedding_request_contract_and_vectors` - URL, payload, authorization header, timeout, returned vectors and no warning on success.
+- `test_embedding_without_credentials_never_opens_a_connection` - missing credentials use the hash fallback without creating an HTTP client.
+- `test_embedding_timeout_raises_instead_of_falling_back` - a timeout raises `EmbeddingBackendError` and logs the failure, instead of falling back to hash vectors.
+- `test_embedding_malformed_response_raises_instead_of_falling_back[empty-data|empty-vector|count-mismatch|dimension-mismatch]` - malformed responses raise `EmbeddingBackendError` (missing vectors, extra vectors and wrong dimensions) and are logged.
+- `test_rerank_request_contract_clamps_and_sorts_scores` - rerank request contract, score clamping to `[0, 1]` and descending order.
+- `test_rerank_timeout_reports_failed_trace` - a rerank timeout produces a failed trace with the provider and error.
+- `test_rerank_malformed_response_reports_failed_trace[no-results|index-out-of-range|non-numeric-index]` - malformed rerank responses fail loudly instead of degrading to an empty success.
+- `test_rerank_without_api_key_reports_failed_trace` - a missing rerank key fails without sending a request.
+- `test_deepseek_model_configuration_contract` - DeepSeek client configuration: base URL normalization, model normalization, `timeout=60`, `max_retries=0`.
+- `test_deepseek_model_without_api_key_raises` / `test_text_fallback_model_without_api_key_raises` - missing credentials raise instead of degrading.
+- `test_answer_stream_reports_error_when_fallback_disabled` / `test_answer_stream_reports_error_when_fallback_unconfigured` - an unusable fallback emits an explicit error event.
+- `test_answer_stream_switches_to_text_fallback_model` - a failing DeepSeek stream switches to the text fallback model.
+- `test_smoke_script_runs_offline_and_reports_every_provider` - `scripts/smoke_providers.py` runs offline without credentials, reports every provider and exits 0.
+- `test_smoke_script_live_without_credentials_reports_skips_not_passes` - `--live` without credentials reports every provider as skipped and never claims a pass.
+
+Live connectivity for that last goal is intentionally out of the offline test net: run
+`python scripts/smoke_providers.py --live` in the target environment for it.
 
 ## Closure Decision
 
