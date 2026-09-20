@@ -141,6 +141,7 @@ def knowledge_file_save_error_message(exc: SQLAlchemyError) -> str:
 _CHINESE_NUMERAL = "一二三四五六七八九十百千万零〇两"
 _PDF_PAGE_HEADING_RE = re.compile(r"^第\s*\d+\s*页$")
 _MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+_CHAPTER_MARKER_RE = re.compile(rf"^第[{_CHINESE_NUMERAL}0-9]+\s*[章节条款篇部分卷编]")
 _CHAPTER_HEADING_RE = re.compile(
     rf"^第[{_CHINESE_NUMERAL}0-9]+\s*[章节条款篇部分卷编].*"
 )
@@ -149,6 +150,10 @@ _PAREN_ORDER_HEADING_RE = re.compile(rf"^[（(][{_CHINESE_NUMERAL}0-9]+[）)]\S+
 _DECIMAL_HEADING_RE = re.compile(r"^\d+(?:\.\d+)*[\.．、)]\s*\S+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？；;])")
 _CLAUSE_SPLIT_RE = re.compile(r"(?<=[，,、：:])")
+# 标题行不会是一整句话，出现句末标点说明标记后面跟的是正文。
+_SENTENCE_END_RE = re.compile(r"[。！？；;]")
+# 超过该长度的编号行即使没有句末标点也按正文处理，与小数编号的长度保护保持一致。
+_LONG_HEADING_MAX_LEN = 48
 
 
 def _normalize_line(text: str) -> str:
@@ -157,7 +162,27 @@ def _normalize_line(text: str) -> str:
 
 def _looks_like_long_list_item(line: str) -> bool:
     stripped = _normalize_line(line)
-    return len(stripped) > 48 and bool(_DECIMAL_HEADING_RE.match(stripped))
+    return len(stripped) > _LONG_HEADING_MAX_LEN and bool(_DECIMAL_HEADING_RE.match(stripped))
+
+
+def _clause_heading_tail(line: str) -> str:
+    """取「第X条」这类条款标记之后的剩余文本；为空说明是纯标题行。"""
+    marker = _CHAPTER_MARKER_RE.match(line)
+    return line[marker.end():].strip() if marker else ""
+
+
+def _looks_like_clause_heading_with_body(line: str) -> bool:
+    """「第N条 正文同行」排版：标记后跟着成句正文或整行过长时，不能整行当标题丢弃。
+
+    制度/法规类文档常把条款编号与正文写在同一行，这类行一旦被当成标题，
+    正文就永远进不了 current_body，最终整篇只剩兜底的最后一行标题。
+    """
+    tail = _clause_heading_tail(line)
+    if not tail:
+        return False
+    if len(line) > _LONG_HEADING_MAX_LEN:
+        return True
+    return bool(_SENTENCE_END_RE.search(tail))
 
 
 def _heading_level(line: str) -> int | None:
@@ -172,6 +197,8 @@ def _heading_level(line: str) -> int | None:
         return min(len(markdown_match.group(1)), 4)
 
     if _CHAPTER_HEADING_RE.match(stripped):
+        if _looks_like_clause_heading_with_body(stripped):
+            return None
         if re.match(rf"^第[{_CHINESE_NUMERAL}0-9]+\s*(?:章|篇|部|部分|卷|编)", stripped):
             return 1
         return 2
@@ -330,11 +357,12 @@ def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: i
         if not current_body:
             return
 
+        # 正文行必须逐条保留：同一句话在文档里重复出现（制度文档很常见）时去重，
+        # 会让入库文本合计远小于原文，属于静默丢正文。
+        # 这里不会重复标题：_heading_level 对同一字符串判定恒定，标题不会进入 current_body，
+        # _overlap_units 也会跳过标题行。
         heading_lines = _heading_lines(heading_path)
-        content_lines = []
-        for line in [*heading_lines, *pending_overlap, *current_body]:
-            if line and line not in content_lines:
-                content_lines.append(line)
+        content_lines = [line for line in [*heading_lines, *pending_overlap, *current_body] if line]
 
         chunk_text_value = "\n".join(content_lines).strip()
         if chunk_text_value:
@@ -369,4 +397,17 @@ def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: i
             chunks.append({"id": "0", "text": heading_text})
 
     return chunks
+
+
+# 入库文本合计低于原文该比例即视为异常：分块规则可能把正文整段丢掉了。
+KNOWLEDGE_INDEX_MIN_COVERAGE_RATIO = 0.5
+
+
+def chunk_coverage_ratio(text: str, chunks: list[dict]) -> float:
+    """分块结果相对原文的文本覆盖率，用于暴露「分块吞正文」这类静默丢失。"""
+    source = "" if text is None else str(text)
+    if not source:
+        return 1.0
+    covered = sum(len(chunk.get("text") or "") for chunk in chunks)
+    return covered / len(source)
 

@@ -8,7 +8,7 @@ import { marked } from 'marked'
 import { markedHighlight } from 'marked-highlight'
 import hljs from 'highlight.js'
 import 'highlight.js/styles/github.css'
-import { isSafeLinkUrl, isUrlAttribute } from '../utils/url.js'
+import { sanitizeHtml } from '../utils/sanitizeHtml.js'
 
 marked.use(
   markedHighlight({
@@ -35,30 +35,6 @@ const props = defineProps({
 })
 
 const rendered = computed(() => sanitizeHtml(marked.parse(props.content || '')))
-
-function sanitizeHtml(html) {
-  if (typeof document === 'undefined') return html
-
-  const template = document.createElement('template')
-  template.innerHTML = html
-
-  template.content.querySelectorAll('script, iframe, object, embed, style, link').forEach((node) => {
-    node.remove()
-  })
-
-  template.content.querySelectorAll('*').forEach((node) => {
-    for (const attr of [...node.attributes]) {
-      const name = attr.name.toLowerCase()
-      const isUnsafeUrl = isUrlAttribute(name) && !isSafeLinkUrl(attr.value)
-
-      if (name.startsWith('on') || isUnsafeUrl) {
-        node.removeAttribute(attr.name)
-      }
-    }
-  })
-
-  return template.innerHTML
-}
 </script>
 
 <style scoped>

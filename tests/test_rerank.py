@@ -167,3 +167,54 @@ def test_select_final_chunks_keeps_high_keyword_score_boost():
     selected = rerank.select_final_chunks(ranked, keyword)
 
     assert selected[0] == keyword[0]
+
+
+def test_select_final_chunks_refuses_keyword_candidate_that_missed_the_query():
+    """issue #56：绝对分值再高，没命中本次查询关键词的候选也不得插到首位。"""
+    ranked = [
+        {"file_id": 1, "chunk_id": f"r{index}", "content": f"报销流程第{index}条"}
+        for index in range(5)
+    ]
+    off_topic = {
+        "file_id": 2,
+        "chunk_id": "b",
+        "content": "迟到30分钟以内罚款50元",
+        "keyword_score": 30.0,
+        "keyword_hits": 0,
+    }
+
+    selected = rerank.select_final_chunks(ranked, [off_topic])
+
+    assert selected == ranked
+    assert off_topic not in selected
+
+
+def test_select_final_chunks_injects_keyword_candidate_that_hit_the_query():
+    ranked = [
+        {"file_id": 1, "chunk_id": f"r{index}", "content": f"报销流程第{index}条"}
+        for index in range(5)
+    ]
+    on_topic = {
+        "file_id": 2,
+        "chunk_id": "b",
+        "content": "报销申请需提交原始发票",
+        "keyword_score": 15.5,
+        "keyword_hits": 2,
+    }
+
+    selected = rerank.select_final_chunks(ranked, [on_topic])
+
+    assert selected[0] == on_topic
+    assert len(selected) == rerank.RETRIEVAL_RERANK_TOP_N
+
+
+def test_select_final_chunks_ignores_unparsable_keyword_hit_count():
+    """命中数字段不可解析时按「未命中」处理：拒绝注入而不是回退到只看分值。"""
+    ranked = [{"file_id": 1, "chunk_id": "a", "content": "ranked"}]
+    keyword = [
+        {"file_id": 2, "chunk_id": "b", "content": "keyword", "keyword_score": 12, "keyword_hits": "bad"}
+    ]
+
+    selected = rerank.select_final_chunks(ranked, keyword)
+
+    assert selected == ranked
