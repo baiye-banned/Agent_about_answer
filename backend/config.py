@@ -104,7 +104,7 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v4")
 EMBEDDING_DIM = _env_int("EMBEDDING_DIM", 1024)
 # Single embedding request timeout, in seconds. Retrieval issues up to 9 route
 # queries per round, so a 60s default can stall the whole round; keep it at
-# online-QA scale and let deployments raise it for bulk ingestion.
+# online-QA scale. Bulk ingestion has its own budget below and ignores this one.
 EMBEDDING_TIMEOUT_SECONDS = _env_int("EMBEDDING_TIMEOUT_SECONDS", 10)
 
 # Bulk ingestion splits a whole document into several embedding requests instead of
