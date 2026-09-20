@@ -174,7 +174,7 @@ def check_deepseek(live: bool) -> str:
         else:
             raise AssertionError("missing API key did not raise")
     finally:
-        llm.DEEPSEEK_API_KEY = original
+        llm.DEEPSEEK_API_KEY = original  # scan-secrets:allow restores the key blanked for the missing-key check, not a credential
     return f"model={model.model_name} base_url={expected_url} key_configured={key_configured}"
 
 
