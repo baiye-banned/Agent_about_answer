@@ -13,16 +13,36 @@
 #
 #   Patterns (case-sensitive, as written):
 #     - "sk-" followed by 20+ token characters (OpenAI-style keys)
+#     - "AKIA" followed by 16 uppercase letters/digits (AWS access key id)
+#     - "ghp_" followed by 20+ token characters (GitHub personal access token)
 #     - "-----BEGIN ... PRIVATE KEY-----" headers
 #     - API_KEY / SECRET / TOKEN / PASSWORD / ... followed by "=" or ":" and a
-#       value. Values that are empty, code expressions, pure numbers, or the
-#       documented placeholder words are configuration, not credentials, and
-#       are not reported.
+#       value. Values that are empty, code expressions, pure numbers, or one of
+#       the documented placeholder words (none, null, change-me, your-*,
+#       replace-*, placeholder*, example*, sample*, dummy*, fake*, testkey*,
+#       test-only*, xxxx*, ...) are configuration, not credentials, and are not
+#       reported.
 #   Deliberate limit: an assignment whose key name is lowercase (e.g.
 #   "password: hunter2" in a config file) is not matched here. Matching those
 #   case-insensitively was measured to flag plain code ("token = user.token",
 #   "password = self.password") and to cost a process per hit; the gitleaks
 #   layer below covers them with entropy-based rules instead.
+#
+#   False positives: a line that is reported only because of an assignment
+#   heuristic can carry the inline marker "# scan-secrets:allow <reason>"
+#   (whitespace plus a non-empty reason; a bare "scan-secrets:allow" does
+#   nothing). The marker suppresses the [credential assignment] finding of that
+#   line and nothing else: sk-/AKIA/ghp_ tokens and private key headers are
+#   matched by shape and can never be exempted, so no marker can hide a value in
+#   one of those unambiguous formats. Every exempted line is listed on stdout at
+#   the end of a run, so the exemptions in force show up in the CI log instead
+#   of being silent. Markers are added and reviewed in the same diff as the code
+#   they cover; see DEVELOPING.md for the conventions.
+#
+#   Comparison is not assignment: the separator pattern consumes one character,
+#   so "KEY == other" leaves a value starting with "=" - which is a comparison,
+#   not a value, and is not reported. "KEY := value" is still an assignment.
+#   (gitleaks below still checks literals on such lines by entropy.)
 #
 # Layer 2 - gitleaks, required by default:
 #   inside a repository: one pass over the commit history and one over the
@@ -101,14 +121,22 @@ fi
 GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
 
 RE_SK='sk-[A-Za-z0-9_-]{20,}'
+RE_AWS='AKIA[0-9A-Z]{16}'
+RE_GH='ghp_[A-Za-z0-9]{20,}'
 RE_PEM='-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----'
 RE_PREFIX='(API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|ACCESS_KEY|PRIVATE_KEY)[A-Za-z0-9_]*[[:space:]]*[:=][[:space:]]*'
+# Inline exemption for a false [credential assignment] hit: it has to be written
+# as a comment (# ...) and carry a non-empty reason, so a bare
+# "scan-secrets:allow" exempts nothing.
+RE_ALLOW='#.*scan-secrets:allow[[:space:]]+[^[:space:]]'
 
 TMP_SCAN="${TMPDIR:-/tmp}/scan_secrets.$$"
 mkdir -p "$TMP_SCAN" || exit 2
 FINDINGS_FILE="$TMP_SCAN/findings.txt"
+ALLOWED_FILE="$TMP_SCAN/allowed.txt"
 GITLEAKS_LOG="$TMP_SCAN/gitleaks.log"
 : > "$FINDINGS_FILE"
+: > "$ALLOWED_FILE"
 : > "$GITLEAKS_LOG"
 trap 'rm -rf "$TMP_SCAN"' EXIT
 
@@ -170,7 +198,7 @@ is_not_secret() {
   case "$lower" in
     none|null|nil|undefined|true|false|yes|no|on|off|password|passwd|secret|token|apikey|api_key|key|todo) return 0 ;;
     change-me*|change_me*|changeme*|change-this*|change_this*|your[-_]*|yourkey*|replace[-_]*|placehold*) return 0 ;;
-    example*|sample*|dummy*|fake*|testkey*|not[-_]set*|notset*|unset*|xxxx*|xxx*|'<'*|'$'*) return 0 ;;
+    example*|sample*|dummy*|fake*|testkey*|test[-_]only*|not[-_]set*|notset*|unset*|xxxx*|xxx*|'<'*|'$'*) return 0 ;;
     '***'*|'-'|'--'|'...') return 0 ;;
   esac
   return 1
@@ -180,17 +208,42 @@ is_not_secret() {
 # Scanning through every match keeps the value correct when a line names the
 # variable twice, e.g. SECRET_KEY = os.getenv("SECRET_KEY", "..."): the text
 # after the last match is the code expression, which is then not a finding.
+# The separator pattern consumes only one character, so what it actually matched
+# is read back from the match itself: "KEY == other" leaves a remainder that
+# starts with "=" (a comparison, skipped), while "KEY := value" is an assignment
+# whose ":=" separator leaves a leading "=" that belongs to the separator.
+# HAS_VALUE is 0 when nothing on the line was an assignment at all.
 line_value() {
-  local rest=$1 match pre
+  local rest=$1 match pre sep
   VALUE=""
+  HAS_VALUE=0
   while [[ $rest =~ $RE_PREFIX ]]; do
     match=${BASH_REMATCH[0]}
     [ -n "$match" ] || break
     pre=${rest%%"$match"*}
     rest=${rest:$(( ${#pre} + ${#match} ))}
+    sep=${match%"${match##*[![:space:]]}"}
+    sep=${sep#${sep%?}}
+    if [ "$sep" = "=" ]; then
+      case "$rest" in
+        =*) continue ;;
+      esac
+    elif [ "$sep" = ":" ]; then
+      # "KEY := value": the "=" belongs to the separator, and because the
+      # pattern could not consume the whitespace after ":=" the value still has
+      # to be trimmed of it before the first whitespace-delimited token is taken
+      # (an untrimmed " hunter2" would truncate to an empty, "not a secret"
+      # value and silently lose the finding).
+      rest=${rest#=}
+      rest=${rest#"${rest%%[![:space:]]*}"}
+    fi
     VALUE=$rest
+    HAS_VALUE=1
   done
-  VALUE=${VALUE%%[[:space:]]*}
+  if [ "$HAS_VALUE" -eq 1 ]; then
+    VALUE=${VALUE%%[[:space:]]*}
+  fi
+  return 0
 }
 
 scan_builtin() {
@@ -198,7 +251,7 @@ scan_builtin() {
   # -I skips binary files, -H always prefixes the file name (without it grep
   # omits the name when a single file is scanned, which would shift the
   # "file:line" parsing below).
-  hits=$(grep -HInE -e "$RE_SK" -e "$RE_PEM" -e "$RE_PREFIX" -- "$@" 2>/dev/null) || rc=$?
+  hits=$(grep -HInE -e "$RE_SK" -e "$RE_AWS" -e "$RE_GH" -e "$RE_PEM" -e "$RE_PREFIX" -- "$@" 2>/dev/null) || rc=$?
   # grep exits 0 for matches and 1 for none; 2+ means the scan itself failed
   # (unreadable file, broken grep). Swallowing that would print "clean" for a
   # scan that never ran, which is the one outcome this script must not have.
@@ -213,8 +266,16 @@ scan_builtin() {
     content=${hit#*:}
     lineno=${content%%:*}
     content=${content#*:}
+    # Shape-based patterns: an unambiguous key format, never exemptible by an
+    # inline marker.
     if [[ $content =~ $RE_SK ]]; then
       printf '%s:%s [sk- token]\n' "$file" "$lineno" >> "$FINDINGS_FILE"
+    fi
+    if [[ $content =~ $RE_AWS ]]; then
+      printf '%s:%s [aws access key id]\n' "$file" "$lineno" >> "$FINDINGS_FILE"
+    fi
+    if [[ $content =~ $RE_GH ]]; then
+      printf '%s:%s [github token]\n' "$file" "$lineno" >> "$FINDINGS_FILE"
     fi
     if [[ $content =~ $RE_PEM ]]; then
       printf '%s:%s [private key header]\n' "$file" "$lineno" >> "$FINDINGS_FILE"
@@ -222,8 +283,14 @@ scan_builtin() {
     if [[ $content =~ $RE_PREFIX ]]; then
       line_value "$content"
       value=$VALUE
-      if ! is_not_secret "$value"; then
-        printf '%s:%s [credential assignment]\n' "$file" "$lineno" >> "$FINDINGS_FILE"
+      if [ "$HAS_VALUE" -eq 1 ] && ! is_not_secret "$value"; then
+        if [[ $content =~ $RE_ALLOW ]]; then
+          # Reported as exempt instead of silenced: the line is listed by the
+          # caller, so a marker cannot hide a hit from the CI log.
+          printf '%s:%s [credential assignment]\n' "$file" "$lineno" >> "$ALLOWED_FILE"
+        else
+          printf '%s:%s [credential assignment]\n' "$file" "$lineno" >> "$FINDINGS_FILE"
+        fi
       fi
     fi
   done <<< "$hits"
@@ -258,6 +325,13 @@ if [ -s "$FINDINGS_FILE" ]; then
   } >&2
 else
   echo "scan_secrets: built-in pattern scan clean"
+fi
+
+# An exemption is part of the result, not a silence: print what was exempted on
+# every run so the CI log shows exactly which heuristic hits were allowed.
+if [ -s "$ALLOWED_FILE" ]; then
+  echo "scan_secrets: $(wc -l < "$ALLOWED_FILE" | tr -d '[:space:]') line(s) exempted by an inline '# scan-secrets:allow' marker (shape hits are never exempt):"
+  sort -u "$ALLOWED_FILE" | sed 's/^/  /'
 fi
 
 # Appends one gitleaks run to the shared log; the exit status is gitleaks'.
