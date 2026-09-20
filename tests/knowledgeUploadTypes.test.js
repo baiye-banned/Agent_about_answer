@@ -56,8 +56,9 @@ test('Knowledge.vue 的上传入口直接绑定这份白名单，不再自带第
   assert.match(source, /\{\{ KNOWLEDGE_UPLOAD_HINT \}\}/)
   // 页面里不得再留一份写死的扩展名列表（旧 acceptTypes 或直接写 .json 这类字面量）。
   assert.ok(!/\bacceptTypes\b/.test(source), 'Knowledge.vue 不应再声明 acceptTypes')
+  // 末尾的否定环视排掉 JS 成员调用（res.json()、console.log(...)），避免给页面加日志时假红。
   assert.ok(
-    !/\.(json|csv|yaml|yml|xml|log)\b/.test(source),
+    !/\.(json|csv|yaml|yml|xml|log)\b(?!\s*\()/.test(source),
     'Knowledge.vue 不应再出现白名单外的扩展名'
   )
 })
@@ -106,12 +107,21 @@ test('describeSkippedUploadFiles 点名被跳过的文件与支持的格式', ()
 test('describeUploadFailure 点名失败文件并说明同批其余文件的去向', () => {
   // 首败即止：失败文件之后还有文件 → 那些文件没有上传。
   assert.equal(
-    describeUploadFailure('b.json', 2, '仅支持 txt、md、docx、pdf 格式的文件'),
-    '「b.json」上传失败：仅支持 txt、md、docx、pdf 格式的文件；同批剩余 2 个文件未上传'
+    describeUploadFailure('b.pdf', 2, '文件不能超过 20MB'),
+    '「b.pdf」上传失败：文件不能超过 20MB；同批剩余 2 个文件未上传'
   )
   // 失败的是本批最后一个 → 其余文件都已上传。
   assert.equal(
     describeUploadFailure('c.pdf', 0, '文件不能超过 20MB'),
     '「c.pdf」上传失败：文件不能超过 20MB；同批其余文件均已上传'
+  )
+  // 本次选择里还有被跳过的不支持文件时，不能笼统说「其余均已上传」。
+  assert.equal(
+    describeUploadFailure('c.pdf', 0, '文件不能超过 20MB', 2),
+    '「c.pdf」上传失败：文件不能超过 20MB；同批其余文件均已上传（另有 2 个不支持的文件在选中阶段已跳过）'
+  )
+  assert.equal(
+    describeUploadFailure('c.pdf', 1, '文件不能超过 20MB', 1),
+    '「c.pdf」上传失败：文件不能超过 20MB；同批剩余 1 个文件未上传（另有 1 个不支持的文件在选中阶段已跳过）'
   )
 })

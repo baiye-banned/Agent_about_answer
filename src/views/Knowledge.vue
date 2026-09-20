@@ -564,9 +564,15 @@ async function handleUpload(files) {
     if (failedIndex < 0) {
       ElMessage.error(reason)
     } else {
-      // 首败即止：失败文件之后的同批文件都没有上传，提示里要说清楚。
+      // 首败即止：失败文件之后的同批文件都没有上传，提示里要说清楚；
+      // 选中阶段被跳过的文件同样没上传，一并如实交代。
       ElMessage.error(
-        describeUploadFailure(supported[failedIndex].name, supported.length - failedIndex - 1, reason)
+        describeUploadFailure(
+          supported[failedIndex].name,
+          supported.length - failedIndex - 1,
+          reason,
+          rejected.length
+        )
       )
     }
   } finally {

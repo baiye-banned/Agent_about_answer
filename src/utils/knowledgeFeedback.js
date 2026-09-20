@@ -66,10 +66,15 @@ export function describeSkippedUploadFiles(rejectedNames) {
 
 // 上传失败提示：点名失败文件，并如实说明同批其余文件的去向。
 // uploadFilesInOrder 首败即止，所以只有排在该文件之前的文件上传成功，其余都不上传。
-export function describeUploadFailure(fileName, remainingCount, reason) {
-  const tail = remainingCount > 0
+// skippedCount 是本次选择里在选中阶段就被跳过的文件数：它们同样没有上传，
+// 如果不提，末句「均已上传」会和事实打架（失败文件恰为本批最后一个受支持文件时）。
+export function describeUploadFailure(fileName, remainingCount, reason, skippedCount = 0) {
+  let tail = remainingCount > 0
     ? `同批剩余 ${remainingCount} 个文件未上传`
     : '同批其余文件均已上传'
+  if (skippedCount > 0) {
+    tail += `（另有 ${skippedCount} 个不支持的文件在选中阶段已跳过）`
+  }
   return `「${fileName}」上传失败：${reason}；${tail}`
 }
 
