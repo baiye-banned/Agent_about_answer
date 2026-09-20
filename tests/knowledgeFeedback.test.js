@@ -1,12 +1,20 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-// 覆盖 src/utils/knowledgeFeedback.js：Knowledge.vue 的 confirmBatchDelete（批量删除反馈）
-// 与 handleUpload（顺序上传 + 进度 + 成功文案）都走这几个函数，这里锁的是那两个视图分支的行为。
+// 覆盖 src/utils/knowledgeFeedback.js：Knowledge.vue 的三个删除入口
+// （deleteKnowledgeBase / confirmDelete / confirmBatchDelete，都经 runConfirmedDelete 收口）、
+// 批量删除反馈与 handleUpload（顺序上传 + 进度 + 成功文案）都走这几个函数，
+// 这里锁的是那几个视图分支的行为。
 import {
+  DELETE_CANCELLED,
+  DELETE_FAILED,
+  DELETE_SUCCEEDED,
   computeUploadPercent,
   describeBatchDeleteResult,
   describeUploadSuccess,
+  hasDeletedAnyFile,
+  isConfirmCancellation,
+  runConfirmedDelete,
   uploadFilesInOrder,
 } from '../src/utils/knowledgeFeedback.js'
 
@@ -111,4 +119,172 @@ test('uploadFilesInOrder stops the batch on the first failure and rethrows it', 
   // 当前语义：首个失败即中止整批，剩余文件不再上传；错误原样抛给视图去做提示与复位。
   assert.deepEqual(attempted, ['a.txt', 'b.txt'])
   assert.ok(!percents.includes(100))
+})
+
+// --- 删除入口的「确认 → 执行 → 反馈」编排（origin/develop 的三个删除入口都没有错误分支）---
+
+test('isConfirmCancellation only recognises the dismissal values element-plus rejects with', () => {
+  // element-plus 2.13.7 的 messageBox 以字符串拒绝（不是 Error）：未开
+  // distinguishCancelAndClose 时，取消按钮、ESC、点遮罩都归一成 'cancel'。
+  assert.equal(isConfirmCancellation('cancel'), true)
+  assert.equal(isConfirmCancellation('close'), true)
+
+  // 接口失败绝不能被当成"用户取消"，否则会静默吞掉真实错误。
+  assert.equal(isConfirmCancellation(new Error('cancel')), false)
+  assert.equal(isConfirmCancellation(undefined), false)
+  assert.equal(isConfirmCancellation(null), false)
+  assert.equal(isConfirmCancellation({ response: { status: 500 } }), false)
+})
+
+test('runConfirmedDelete stays silent and skips the delete when the user cancels', async () => {
+  const calls = []
+
+  const outcome = await runConfirmedDelete({
+    confirm: () => Promise.reject('cancel'),
+    remove: async () => calls.push('remove'),
+    notifyError: (message) => calls.push(`error:${message}`),
+  })
+
+  assert.equal(outcome.status, DELETE_CANCELLED)
+  // 取消既不是成功也不是失败：不删、不提示（成功提示由视图只在 succeeded 时给出）。
+  assert.deepEqual(calls, [])
+})
+
+test('runConfirmedDelete treats a close (ESC / overlay) as a cancellation too', async () => {
+  const calls = []
+
+  const outcome = await runConfirmedDelete({
+    confirm: () => Promise.reject('close'),
+    remove: async () => calls.push('remove'),
+    notifyError: (message) => calls.push(`error:${message}`),
+  })
+
+  assert.equal(outcome.status, DELETE_CANCELLED)
+  assert.deepEqual(calls, [])
+})
+
+test('runConfirmedDelete leaves no unhandled rejection at an event-handler call site', async () => {
+  // 模板上的三处调用点（:32 / :78 / :128）都是 @click 事件处理器直调，
+  // Vue 不会接管处理器返回的 Promise：这里按同样的方式调用并把返回的 Promise 丢掉，
+  // 模拟"点了取消"以后有没有拒绝逃逸到进程的 unhandledRejection。
+  const unhandled = []
+  const onUnhandled = (reason) => unhandled.push(reason)
+  process.on('unhandledRejection', onUnhandled)
+
+  try {
+    runConfirmedDelete({
+      confirm: () => Promise.reject('cancel'),
+      remove: async () => {},
+      notifyError: () => {},
+    })
+    runConfirmedDelete({
+      confirm: () => Promise.reject('close'),
+      remove: async () => {},
+      notifyError: () => {},
+    })
+    // 让微任务队列排空，给未捕获拒绝一个冒泡的机会。
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  } finally {
+    process.off('unhandledRejection', onUnhandled)
+  }
+
+  assert.deepEqual(unhandled, [])
+})
+
+test('runConfirmedDelete surfaces the API message and never reaches the success path on failure', async () => {
+  const notifications = []
+  const failure = {
+    response: { data: { detail: '知识库不存在' } },
+    message: 'Request failed with status code 404',
+  }
+
+  const outcome = await runConfirmedDelete({
+    confirm: async () => {},
+    remove: async () => {
+      throw failure
+    },
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(outcome.status, DELETE_FAILED)
+  assert.equal(outcome.error, failure)
+  // 文案优先取接口 detail，而不是 axios 的英文 message。
+  assert.deepEqual(notifications, ['知识库不存在'])
+})
+
+test('runConfirmedDelete falls back to the delete wording when the failure has no usable message', async () => {
+  const notifications = []
+
+  const outcome = await runConfirmedDelete({
+    confirm: async () => {},
+    remove: async () => {
+      throw new Error('')
+    },
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(outcome.status, DELETE_FAILED)
+  assert.deepEqual(notifications, ['删除失败，请稍后重试'])
+})
+
+test('runConfirmedDelete lets the caller override the failure wording', async () => {
+  const notifications = []
+
+  await runConfirmedDelete({
+    confirm: async () => {},
+    remove: async () => {
+      throw new Error('')
+    },
+    failureMessage: '删除资料失败，请稍后重试',
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.deepEqual(notifications, ['删除资料失败，请稍后重试'])
+})
+
+test('runConfirmedDelete reports an unexpected confirm failure instead of swallowing it', async () => {
+  const notifications = []
+  let removed = false
+
+  const outcome = await runConfirmedDelete({
+    confirm: async () => {
+      throw new TypeError('messageBox is not mounted')
+    },
+    remove: async () => {
+      removed = true
+    },
+    notifyError: (message) => notifications.push(message),
+  })
+
+  // 非取消的确认异常按失败处理：既不静默，也不逃逸成未捕获拒绝，更不会去调接口。
+  assert.equal(outcome.status, DELETE_FAILED)
+  assert.equal(removed, false)
+  // 文案沿用仓库统一的 getApiErrorMessage：有 message 就用它，没有才回落到兜底文案。
+  assert.deepEqual(notifications, ['messageBox is not mounted'])
+})
+
+test('runConfirmedDelete hands the API result back on success and notifies nothing', async () => {
+  const notifications = []
+
+  const outcome = await runConfirmedDelete({
+    confirm: async () => {},
+    remove: async () => ({ fallback_knowledge_base_id: 'kb-2' }),
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(outcome.status, DELETE_SUCCEEDED)
+  assert.deepEqual(outcome.result, { fallback_knowledge_base_id: 'kb-2' })
+  assert.deepEqual(notifications, [])
+})
+
+test('hasDeletedAnyFile keeps the selection when the batch deleted nothing', () => {
+  // batchDelete 用 allSettled 收敛，整批失败时回的是数据而不是拒绝。
+  assert.equal(hasDeletedAnyFile({ total: 2, succeeded: 0, failed: 2 }), false)
+  assert.equal(hasDeletedAnyFile({ total: 0, succeeded: 0, failed: 0 }), false)
+  assert.equal(hasDeletedAnyFile({}), false)
+  assert.equal(hasDeletedAnyFile(undefined), false)
+
+  assert.equal(hasDeletedAnyFile({ total: 2, succeeded: 2, failed: 0 }), true)
+  // 部分成功仍然清空选中并刷新（失败明细不在此函数语义内）。
+  assert.equal(hasDeletedAnyFile({ total: 3, succeeded: 1, failed: 2 }), true)
 })
