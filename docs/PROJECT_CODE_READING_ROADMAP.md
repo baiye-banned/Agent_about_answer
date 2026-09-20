@@ -323,7 +323,7 @@ flowchart LR
 | 发送图片 | `attachments` | `handleImageUpload()` |
 | 展示来源 | `activeSources` | `openSources()` |
 | 展示 Trace | `activeTrace` | `openTrace()` |
-| RAGAS 面板 | `ragasMetrics` | `formatScore()` / `ragasStatusText()` |
+| RAGAS 面板 | `message.ragas_status` / `message.ragas_scores`（指标名来自 `src/utils/ragasStatus.js` 的 `RAGAS_METRICS`） | `formatScore()` / `ragasStatusText()` |
 | 会话重命名 | `renaming` / `renameTitle` | `startRename()` / `confirmRename()` |
 
 Chat 的主线：
@@ -389,7 +389,7 @@ erDiagram
 | `Message` | 用户消息和 assistant 回答 |
 | `ChatTraceSession` | 一次问答流程的调试回放 |
 
-### 5.3 `database.py`
+### 5.3 `backend/database/session.py`
 
 重点看：
 
@@ -401,20 +401,20 @@ erDiagram
 | `_ensure_mysql_utf8mb4()` | 修复中文字符集 |
 | `_ensure_default_knowledge_base()` | 保证至少有一个知识库 |
 
-### 5.4 `main.py` 前半部分
+### 5.4 `main.py` 与它挂载的入口
 
-先不要读完 2000 行，先看它如何把路由挂到各个业务服务，再回头读 `chat_service.py / knowledge_service.py / vision_service.py`。
+`backend/main.py` 只有 82 行，只做启动（`lifespan`）、CORS、静态资源挂载和 `include_router`；`backend/router/*.py` 也只声明 `APIRouter()` 并接线。先看它如何把路由挂到各个业务服务，再回头读 `backend/service/*.py`、`backend/rag/*.py`。
 
 | 区域 | 你要看什么 |
 |---|---|
 | `lifespan()` | 启动时做什么 |
 | `app.include_router(...)` | 路由如何汇聚到聊天、知识库、用户、checkpointer |
 | `root()` / `health()` | 基础健康检查 |
-| `create_token()` / `get_current_user()` | 登录鉴权 |
-| `login()` / `logout()` | 登录退出 |
-| `list_conversations()` / `get_messages()` | 会话读取 |
-| `create_knowledge_base()` | 知识库创建 |
-| `upload_chat_attachment()` | 聊天图片上传 |
+| `create_token()` / `get_current_user()`（`backend/service/auth_service.py`） | 登录鉴权 |
+| `login()` / `logout()`（`backend/service/auth_service.py`） | 登录退出 |
+| `list_conversations()` / `get_messages()`（`backend/service/chat_service.py`） | 会话读取 |
+| `create_knowledge_base()`（`backend/service/knowledge_service.py`） | 知识库创建 |
+| `upload_chat_attachment()`（`backend/service/chat_service.py`） | 聊天图片上传 |
 | `chat_service.stream_chat()` | 聊天主入口 |
 
 ## 6. 第五轮：读知识库上传链路
@@ -428,7 +428,7 @@ sequenceDiagram
   participant F as Knowledge.vue
   participant A as knowledgeAPI.upload()
   participant B as upload_knowledge()
-  participant E as _extract_file_text()
+  participant E as extract_file_text()
   participant M as MySQL
   participant C as milvus_client.add_chunks()
 
@@ -515,14 +515,14 @@ sequenceDiagram
 8. `backend/rag/retrieval.py` 的 `decide_need_rag()`
 9. `backend/rag/retrieval.py` 的 `retrieve_knowledge()`
 10. `backend/rag/retrieval.py` 的 `build_query_plan()`
-12. `backend/rag/milvus_client.py` 的 `query_vectors()`
-13. `backend/rag/retrieval.py` 的 `keyword_recall()`
-14. `backend/rag/retrieval.py` 的 `rrf_fuse()`
-15. `backend/rag/rerank.py` 的 `rerank_chunks()`
-16. `backend/service/utils_service.py` 的 `_build_sources()`
-17. `backend/rag/llm.py` 的 `stream_answer_events()`
-18. assistant message 保存逻辑
-19. `schedule_ragas_evaluation()`
+11. `backend/rag/milvus_client.py` 的 `query_vectors()`
+12. `backend/rag/retrieval.py` 的 `keyword_recall()`
+13. `backend/rag/retrieval.py` 的 `rrf_fuse()`
+14. `backend/rag/rerank.py` 的 `rerank_chunks()`
+15. `backend/service/utils_service.py` 的 `_build_sources()`
+16. `backend/rag/llm.py` 的 `stream_answer_events()`
+17. assistant message 保存逻辑
+18. `schedule_ragas_evaluation()`
 
 最重要的变量：
 
