@@ -1,4 +1,6 @@
 import asyncio
+import threading
+import time
 
 import pytest
 from fastapi import HTTPException
@@ -239,3 +241,105 @@ def test_delete_knowledge_base_keeps_mysql_when_vector_cleanup_fails(monkeypatch
 
     assert exc_info.value.status_code == 500
     assert calls == [("vectors", 7)]
+
+
+def test_upload_knowledge_indexes_off_the_event_loop_thread_and_keeps_heartbeats(monkeypatch):
+    """入库期间事件循环仍在调度心跳协程，且同步入库确实跑在别的线程上。
+
+    修复前 add_chunks 是同步调用：整份文档向量化加写库期间事件循环被独占，
+    同一循环上的心跳协程一次都排不上（这里会是 0）。
+    """
+    calls = []
+    delay = 0.3
+    _patch_upload(monkeypatch, calls, RuntimeError("unused"))
+    # 成功路径要序列化返回体，桩 entry 必须带齐序列化用到的字段。
+    entry = type(
+        "Entry",
+        (),
+        {"id": 11, "name": "考勤制度.txt", "knowledge_base_id": 2, "size": 4, "created_at": None},
+    )()
+    monkeypatch.setattr(knowledge_service.crud_knowledge_file, "create_knowledge_file", lambda db, **kwargs: entry)
+
+    def slow_add_chunks(chunks, file_id, file_name, knowledge_base_id):
+        calls.append({"thread": threading.get_ident(), "chunk_count": len(chunks), "file_id": file_id})
+        time.sleep(delay)
+
+    monkeypatch.setattr(knowledge_service, "add_chunks", slow_add_chunks)
+
+    async def scenario():
+        heartbeats = []
+
+        async def ticker():
+            while True:
+                await asyncio.sleep(0.02)
+                heartbeats.append(time.perf_counter())
+
+        ticker_task = asyncio.create_task(ticker())
+        await asyncio.sleep(0.05)  # 先让心跳协程真正跑起来，再开始计时
+        started_at = time.perf_counter()
+        result = await knowledge_service.upload_knowledge(
+            request=_Request(),
+            file=_UploadFile("考勤制度.txt", b"text"),
+            knowledge_base_id=2,
+            user=_User(),
+            db=object(),
+        )
+        finished_at = time.perf_counter()
+        ticker_task.cancel()
+        during = [beat for beat in heartbeats if started_at < beat < finished_at]
+        return during, finished_at - started_at, result
+
+    heartbeats_during_upload, elapsed, result = asyncio.run(scenario())
+
+    assert result["id"] == 11
+    assert len(calls) == 1
+    assert calls[0]["file_id"] == 11
+    # 入库期间事件循环仍在调度心跳协程：修复前这里是 0（同步入库独占事件循环）。
+    assert heartbeats_during_upload
+    # 同步入库被移出了事件循环所在线程，且是被等待完成的（不是发出去就不管）。
+    assert calls[0]["thread"] != threading.get_ident()
+    assert elapsed >= delay
+
+
+def test_startup_rebuild_runs_off_the_event_loop(monkeypatch):
+    """启动重建同样不独占事件循环：lifespan 执行期间心跳协程仍被调度。"""
+    import main
+
+    calls = []
+    delay = 0.3
+
+    def slow_rebuild():
+        calls.append(threading.get_ident())
+        time.sleep(delay)
+
+    monkeypatch.setattr(main, "ensure_secret_key_configured", lambda: None)
+    monkeypatch.setattr(main, "init_db", lambda: None)
+    monkeypatch.setattr(main, "seed_default_users", lambda: None)
+    monkeypatch.setattr(main, "REBUILD_KNOWLEDGE_INDEX_ON_STARTUP", True)
+    monkeypatch.setattr(main, "rebuild_existing_knowledge_index", slow_rebuild)
+
+    async def scenario():
+        heartbeats = []
+
+        async def ticker():
+            while True:
+                await asyncio.sleep(0.02)
+                heartbeats.append(time.perf_counter())
+
+        ticker_task = asyncio.create_task(ticker())
+        await asyncio.sleep(0.05)
+        started_at = time.perf_counter()
+        async with main.lifespan(main.app):
+            pass
+        finished_at = time.perf_counter()
+        ticker_task.cancel()
+        during = [beat for beat in heartbeats if started_at < beat < finished_at]
+        return during, finished_at - started_at
+
+    heartbeats_during_rebuild, elapsed = asyncio.run(scenario())
+
+    # 重建期间事件循环仍在调度心跳协程：修复前这里是 0（同步重建独占事件循环）。
+    assert heartbeats_during_rebuild
+    assert calls
+    assert elapsed >= delay
+    assert calls[0] != threading.get_ident()

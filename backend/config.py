@@ -107,6 +107,20 @@ EMBEDDING_DIM = _env_int("EMBEDDING_DIM", 1024)
 # online-QA scale and let deployments raise it for bulk ingestion.
 EMBEDDING_TIMEOUT_SECONDS = _env_int("EMBEDDING_TIMEOUT_SECONDS", 10)
 
+# Bulk ingestion splits a whole document into several embedding requests instead of
+# sending every chunk at once. Two limits apply, whichever binds first: chunk count
+# and character count. chunk_text caps a chunk at ~1200 characters, so the character
+# limit usually binds first (60000 / 1200 = 50 chunks per request).
+EMBEDDING_INGEST_BATCH_SIZE = _env_int("EMBEDDING_INGEST_BATCH_SIZE", 64)
+EMBEDDING_INGEST_BATCH_MAX_CHARS = _env_int("EMBEDDING_INGEST_BATCH_MAX_CHARS", 60000)
+
+# Bulk ingestion keeps its own timeout instead of sharing the online-QA one above.
+# A batch carries up to 64 chunks / 60000 characters in a single round trip, so the
+# budget scales 6x from the single-query one, and ingestion now runs on a worker
+# thread -- a slow batch no longer freezes the event loop. Raising it further only
+# extends how long one stuck batch holds a thread-pool slot.
+EMBEDDING_INGEST_TIMEOUT_SECONDS = _env_int("EMBEDDING_INGEST_TIMEOUT_SECONDS", 60)
+
 # Dedicated reranker for retrieved chunks.
 RERANK_PROVIDER = os.getenv("RERANK_PROVIDER", "dashscope")
 RERANK_MODEL = os.getenv("RERANK_MODEL", "qwen3-rerank")

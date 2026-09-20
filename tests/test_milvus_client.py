@@ -480,3 +480,154 @@ def test_query_vectors_embedding_failure_raises_before_search(monkeypatch):
         milvus_client.query_vectors("迟到怎么处罚", knowledge_base_id=3)
 
     assert search_calls == []
+
+
+class _FakeCollection:
+    """只记录写入、不连真实 Milvus：分批用例只关心向量化调用的形态。"""
+
+    def __init__(self, inserted):
+        self._inserted = inserted
+
+    def has_collection(self, collection_name):
+        return True
+
+    def delete(self, collection_name, filter):
+        return None
+
+    def insert(self, collection_name, data):
+        self._inserted.append(data)
+        return {"insert_count": len(data)}
+
+
+def _patch_collection(monkeypatch, inserted):
+    monkeypatch.setattr(milvus_client, "_ensure_collection", lambda: _FakeCollection(inserted))
+
+
+def _recording_embedding(calls):
+    def embed(texts):
+        calls.append(list(texts))
+        return [[0.1, 0.2] for _ in texts]
+
+    return embed
+
+
+def test_add_chunks_splits_embedding_requests_by_configured_batch_size(monkeypatch):
+    """整份文档不再压进一次向量化请求：调用次数与单次条数都受配置约束。"""
+    batch_size = 4
+    chunk_count = 21
+    calls = []
+    inserted = []
+    monkeypatch.setattr(milvus_client, "EMBEDDING_INGEST_BATCH_SIZE", batch_size)
+    monkeypatch.setattr(milvus_client, "EMBEDDING_INGEST_BATCH_MAX_CHARS", 10**9)
+    monkeypatch.setattr(milvus_client, "_embedding_fn", _recording_embedding(calls))
+    _patch_collection(monkeypatch, inserted)
+
+    milvus_client.add_chunks(
+        [{"id": str(index), "text": "条款"} for index in range(chunk_count)],
+        file_id=21,
+        file_name="制度.txt",
+        knowledge_base_id=3,
+    )
+
+    assert len(calls) >= -(-chunk_count // batch_size)
+    assert max(len(call) for call in calls) <= batch_size
+    # 分批不得丢切片或改变顺序：向量与切片仍按 zip(strict=True) 对齐。
+    assert [text for call in calls for text in call] == ["条款"] * chunk_count
+    assert len(inserted) == 1
+    assert len(inserted[0]) == chunk_count
+
+
+def test_add_chunks_splits_embedding_requests_by_configured_char_limit(monkeypatch):
+    """条数没超也要按字符数切：单次请求体大小同样有上限。"""
+    max_chars = 100
+    text = "条" * 30
+    calls = []
+    inserted = []
+    monkeypatch.setattr(milvus_client, "EMBEDDING_INGEST_BATCH_SIZE", 10**9)
+    monkeypatch.setattr(milvus_client, "EMBEDDING_INGEST_BATCH_MAX_CHARS", max_chars)
+    monkeypatch.setattr(milvus_client, "_embedding_fn", _recording_embedding(calls))
+    _patch_collection(monkeypatch, inserted)
+
+    milvus_client.add_chunks(
+        [{"id": str(index), "text": text} for index in range(10)],
+        file_id=22,
+        file_name="制度.txt",
+        knowledge_base_id=3,
+    )
+
+    assert sum(len(call) for call in calls) == 10
+    assert all(sum(len(item) for item in call) <= max_chars for call in calls)
+    # 每批 3 条（90 字符），第 4 条会越限，故 10 条切成 4 批。
+    assert [len(call) for call in calls] == [3, 3, 3, 1]
+
+
+def test_add_chunks_gives_an_oversized_chunk_its_own_batch(monkeypatch):
+    """单条切片自身超过字符上限时独占一批：切片是检索最小单位，不再二次切分。"""
+    oversized = "长" * 500
+    calls = []
+    monkeypatch.setattr(milvus_client, "EMBEDDING_INGEST_BATCH_SIZE", 10**9)
+    monkeypatch.setattr(milvus_client, "EMBEDDING_INGEST_BATCH_MAX_CHARS", 50)
+    monkeypatch.setattr(milvus_client, "_embedding_fn", _recording_embedding(calls))
+    _patch_collection(monkeypatch, [])
+
+    milvus_client.add_chunks(
+        [{"id": "0", "text": "短"}, {"id": "1", "text": oversized}, {"id": "2", "text": "短"}],
+        file_id=23,
+        file_name="制度.txt",
+        knowledge_base_id=3,
+    )
+
+    assert [len(call) for call in calls] == [1, 1, 1]
+    assert calls[1] == [oversized]
+
+
+class _EmbeddingResponse:
+    def __init__(self, count):
+        self._count = count
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"data": [{"index": index, "embedding": [0.5] * milvus_client.EMBEDDING_DIM} for index in range(self._count)]}
+
+
+def test_ingest_timeout_is_separate_from_retrieval_timeout(monkeypatch):
+    """入库按批用入库预算，检索仍用在线问答预算，且入库覆盖不残留到之后的调用。"""
+    timeouts = []
+
+    class CapturingClient:
+        def __init__(self, *args, **kwargs):
+            timeouts.append(kwargs.get("timeout"))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def post(self, url, json, headers):
+            return _EmbeddingResponse(len(json["input"]))
+
+    monkeypatch.setattr(milvus_client, "EMBEDDING_BASE_URL", "https://embedding.example/v1")
+    monkeypatch.setattr(milvus_client, "EMBEDDING_API_KEY", "test-key")
+    monkeypatch.setattr(milvus_client.httpx, "Client", CapturingClient)
+    monkeypatch.setattr(milvus_client, "EMBEDDING_TIMEOUT_SECONDS", 7)
+    monkeypatch.setattr(milvus_client, "EMBEDDING_INGEST_TIMEOUT_SECONDS", 41)
+    monkeypatch.setattr(milvus_client, "EMBEDDING_INGEST_BATCH_SIZE", 1)
+    monkeypatch.setattr(milvus_client, "EMBEDDING_INGEST_BATCH_MAX_CHARS", 10**9)
+    _patch_collection(monkeypatch, [])
+
+    milvus_client.add_chunks(
+        [{"id": "0", "text": "第一段"}, {"id": "1", "text": "第二段"}],
+        file_id=24,
+        file_name="制度.txt",
+        knowledge_base_id=3,
+    )
+
+    assert timeouts == [41, 41]
+
+    # 同一个可调用对象在检索路径上仍读在线问答预算，说明覆盖只活在入库调用域内。
+    milvus_client._embedding_fn(["迟到怎么处罚"])
+
+    assert timeouts == [41, 41, 7]
