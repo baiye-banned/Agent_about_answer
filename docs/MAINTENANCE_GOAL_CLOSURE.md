@@ -15,10 +15,10 @@ Snapshot baseline:
 
 ## Current Worktree Shape
 
-- `git status --short` still shows a large dirty tree: backend, frontend, docs, config, and a fully untracked `tests/` directory.
+- `git status --short` showed a large dirty tree at the snapshot: backend, frontend, docs, and config.
 - `git diff --stat` reports `45 files changed`, with `1296 insertions` and `2874 deletions` in tracked files.
 - Major deletion/replacement areas include old Chroma files and old learning-center trace replay files.
-- Major additions are currently untracked, including Milvus, rerank, JSON helper, frontend utility modules, and automated tests.
+- Major additions in that snapshot were still untracked, including Milvus, rerank, JSON helper, frontend utility modules, and automated tests. These paths, including `tests/`, are tracked now.
 
 ## Completed Work Themes
 
@@ -47,13 +47,13 @@ Snapshot baseline:
 
 ## Verification Evidence
 
-Commands run from `D:\code\AIcoding\RAG`:
+Commands run from the repository root:
 
 | Command | Result |
 | --- | --- |
-| `npm test` | Passed: `30` Node tests; script now discovers `tests/**/*.test.js` |
+| `npm test` | Passed: `80` Node tests; script discovers `tests/**/*.test.js` |
 | `npm run build` | Passed: Vite build completed; retained existing `Chat` chunk > 500 kB warning |
-| `python -m pytest -q tests` | Passed: `97` Python tests; discovery now fixed by `pytest.ini` |
+| `python -m pytest -q tests` | `206` passed, `1` failed of `207` collected; discovery fixed by `pytest.ini`. The failure (`test_env_example_parity.py::test_every_env_var_read_by_config_is_documented`) comes from upstream commit `483a070`: `backend/config.py` reads `EMBEDDING_TIMEOUT_SECONDS`, but `.env.example` does not document it |
 | `git status --short` | Dirty tree remains; see current worktree shape above |
 | `git diff --stat` | `45 files changed`, `1296 insertions`, `2874 deletions` |
 | `git diff --check -- src backend package.json tests` | No whitespace errors reported; Git printed LF-to-CRLF working-copy warnings |
@@ -61,19 +61,17 @@ Commands run from `D:\code\AIcoding\RAG`:
 
 ## Residual Risks
 
-- The `tests/` directory is untracked. It needs review before staging so cache files or design-only notes do not become part of the baseline accidentally.
 - Node and Python test discovery have been made explicit in `package.json` and `pytest.ini`; future nested Node tests and Python `test_*.py` files under `tests/` should stay inside the baseline.
 - Milvus migration is the largest backend risk. Existing Chroma data is not automatically migrated, and the upload/query/delete loop still deserves a focused runtime acceptance pass.
 - Several external providers are mocked in tests. DeepSeek, DashScope embedding, DashScope rerank, OSS, and RAGAS runtime behavior still need real-environment smoke checks.
 - Some terminal output showed mojibake for Chinese strings. Prior tests passed, but the final UI text should be checked in a browser or by reading files with confirmed UTF-8 handling.
 - `Knowledge.vue` batch delete/upload feedback and `chat store` RAGAS polling/message merge are now covered by narrow behavior-level Node tests (`tests/knowledgeFeedback.test.js`, `tests/chatStore.test.js`). The view-side logic was extracted into `src/utils/knowledgeFeedback.js` to make it testable in plain Node, so the Vue SFC glue itself (which helper it calls, the toast level, `uploading`/`uploadPercent` reset) is still only verified by reading, not executed by tests.
-- Documentation and older project context disagree on some ports. Final operational docs should be checked against the actual running backend/frontend commands.
 
 ## Follow-Up Small Goals
 
 Immediate next step:
 
-1. Review and stage the intended Python/Node test baseline, using `tests/README.md` and `.gitignore` to exclude caches and design-only notes.
+1. Done: the Python/Node test baseline was reviewed and staged, using `tests/README.md` and `.gitignore` to exclude caches and design-only notes.
 
 Next batch:
 
@@ -84,7 +82,7 @@ Next batch:
 4. Rerank and provider goal: smoke-test DashScope rerank, LLM fallback, embedding, and DeepSeek connectivity in the target environment.
    - Acceptance tests: `tests/test_provider_smoke.py` plus the offline smoke entry point `scripts/smoke_providers.py` (`--live` for the real endpoints); see [Acceptance Test Index](#acceptance-test-index).
 5. Frontend behavior goal: partially done. Narrow tests for knowledge batch delete/upload feedback and chat RAGAS polling/message merge behavior were added (`tests/knowledgeFeedback.test.js`, `tests/chatStore.test.js`). Still open: no test covers the Vue view glue, and the delete paths take no error branch when the user cancels the confirm dialog or `knowledgeAPI.delete` rejects.
-6. Documentation alignment goal: reconcile ports, startup commands, and environment variables across README, docs, and project instructions.
+6. Documentation alignment goal: keep startup commands and environment variables consistent across README, docs, and project instructions.
 
 ## Acceptance Test Index
 
