@@ -3,9 +3,12 @@
 两个复现现象各固化成一个用例：
 
 1. 断开 → 会话关闭、trace 落到终态。
-   读若干帧后 `aclose()` body_iterator —— 这正是 ASGI 服务器在客户端断连时终结生成器的方式。
+   读若干帧后 `aclose()` body_iterator —— 生成器在挂起的 yield 处收到 `GeneratorExit`。
    修复前 `db.close()` 写在生成器函数体末尾的最后一个 yield 之前，断开后不会执行，
    `chat_trace_sessions.status` 也永远停在 `running`。
+   `test_starlette_disconnect_cancellation_closes_session` 另按**真实**的 Starlette 语义复现：
+   `StreamingResponse` 收到 `http.disconnect` 后取消正在跑流的任务，把 `CancelledError`
+   抛进挂起的 yield（Starlette 0.38 不调用 `aclose()`）。两者都继承自 `BaseException`。
 2. 断开 → 连接归还连接池，后续请求不再超时。
    真实的 `QueuePool(pool_size=1, max_overflow=0)`：借出的连接不归还时池立刻耗尽，
    后续请求抛 `QueuePool limit of size 1 overflow 0 reached ... connection timed out`。
@@ -17,6 +20,7 @@
 
 import asyncio
 
+import anyio
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.dialects.mysql import LONGTEXT
@@ -110,6 +114,77 @@ def test_disconnect_closes_db_session_and_ends_trace(monkeypatch, fake_db, trace
     trace = trace_recorder_cls.instances[-1]
     assert fake_db.closed is True, "客户端断开后 db.close() 没有执行，连接会一直挂在池外"
     assert trace.status != "running", "断开后 chat_trace_sessions.status 停在 running，没有落终态"
+    assert trace.status == "failed"
+
+
+def test_starlette_disconnect_cancellation_closes_session(monkeypatch, fake_db, trace_recorder_cls):
+    """按真实 Starlette 语义复现：http.disconnect → 取消任务 → CancelledError 抛进挂起的 yield。
+
+    上一条用例用 `aclose()`（GeneratorExit）；Starlette 0.38 的 `StreamingResponse` 走的是
+    `listen_for_disconnect` + task group 取消，抛进去的是 `CancelledError`。两者都是 BaseException，
+    都必须走同一个 finally 收尾——本用例驱动真实的 `StreamingResponse.__call__` 来锁住这一点。
+    """
+    _patch_boundaries(monkeypatch, fake_db, trace_recorder_cls)
+
+    async def slow_stream(model, messages):
+        """真实模型分片之间有网络等待；留出挂起点，取消才落在流的中途而不是跑完之后。"""
+        for piece in ["根据《员工手册》", "迟到30分钟以内罚款50元。"]:
+            yield piece
+            await anyio.sleep(0.05)
+
+    monkeypatch.setattr(llm, "_stream_model_chunks", slow_stream)
+
+    async def _run():
+        response = await chat_service.stream_chat(
+            ChatRequest(question="迟到30分钟以内怎么罚款？"), authorization="Bearer token"
+        )
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/chat/stream",
+            "raw_path": b"/chat/stream",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [],
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+        }
+        sent = []
+        first_receive = True
+
+        async def receive():
+            nonlocal first_receive
+            if first_receive:
+                first_receive = False
+                return {"type": "http.request", "body": b"", "more_body": False}
+            # 让流先真的产出几帧再报告断开（真实客户端也是先收几帧再断）；
+            # 轮询有上界，避免流异常短时把用例挂死。
+            for _ in range(200):
+                if len(sent) >= 3:
+                    break
+                await anyio.sleep(0.01)
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            sent.append(message)
+
+        await response(scope, receive, send)
+        return sent
+
+    sent = asyncio.run(_run())
+
+    # 前提断言：断开必须落在流的中途（没有收到 more_body=False 的终止帧），
+    # 否则本用例跑的其实是正常完成路径，覆盖不到取消语义。
+    assert len(sent) >= 3, f"流还没产出就结束了，本用例没覆盖到取消路径：{sent}"
+    assert sent[-1]["type"] == "http.response.body" and sent[-1]["more_body"] is True, (
+        f"断开没有落在流的中途：{sent[-1]}"
+    )
+
+    trace = trace_recorder_cls.instances[-1]
+    assert fake_db.closed is True, "Starlette 取消路径下 db.close() 没有执行"
     assert trace.status == "failed"
 
 

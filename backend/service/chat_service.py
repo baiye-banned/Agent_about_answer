@@ -712,8 +712,9 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                         yield payload
                 yield "data: [DONE]\n\n"
             finally:
-                # 客户端断开时，ASGI 服务器会把 GeneratorExit 抛进挂起的 yield 终结生成器；
-                # GeneratorExit 与 CancelledError 都继承自 BaseException，外层 `except Exception`
+                # 客户端断开时，Starlette 的 StreamingResponse 会取消正在跑流的任务，把
+                # CancelledError 抛进挂起的 yield（其它 ASGI 实现也可能用 aclose() → GeneratorExit）；
+                # CancelledError 与 GeneratorExit 都继承自 BaseException，外层 `except Exception`
                 # 兜不住，原先写在函数体末尾的收尾逻辑不会执行。只有放进 finally 才能保证
                 # 断连路径同样关闭会话、把 trace 落到终态。finally 中不得再 yield。
                 try:
