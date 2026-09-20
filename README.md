@@ -166,7 +166,7 @@ SSE 事件主要包含：
 
 建议环境：
 
-- Node.js 18+
+- Node.js 22.15+（`npm test` 用到该版本起才提供的 `module.registerHooks`，见 [tests/README.md](tests/README.md)）
 - Python 3.10+
 - MySQL 8+
 - Milvus Lite 本地文件或远程 Milvus 服务
