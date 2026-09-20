@@ -1,4 +1,5 @@
 
+import asyncio
 import logging
 
 from fastapi import Depends, File, Form, HTTPException, Request, UploadFile
@@ -219,11 +220,13 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
     chunks = crud_knowledge_file.chunk_text(text, entry.id)
     _warn_on_low_chunk_coverage(entry, text, chunks, scope="Knowledge file upload")
     try:
-        add_chunks(chunks, entry.id, entry.name, knowledge_base.id)
+        # 向量化外呼与 Milvus 写入都是同步的，放进线程池执行：否则整份文档入库期间
+        # 事件循环被独占，同进程的其它请求（含健康检查）全部停摆。
+        await asyncio.to_thread(add_chunks, chunks, entry.id, entry.name, knowledge_base.id)
     except Exception as exc:
         logger.warning("Knowledge file indexing failed: file_id=%s error=%s", entry.id, exc, exc_info=True)
         try:
-            delete_file_chunks(entry.id)
+            await asyncio.to_thread(delete_file_chunks, entry.id)
         except Exception as cleanup_exc:
             logger.warning("Failed to clean partially indexed chunks: file_id=%s error=%s", entry.id, cleanup_exc, exc_info=True)
         try:

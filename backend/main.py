@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -31,7 +32,9 @@ async def lifespan(_app: FastAPI):
     init_db()
     seed_default_users()
     if REBUILD_KNOWLEDGE_INDEX_ON_STARTUP:
-        rebuild_existing_knowledge_index()
+        # 重建对每个历史文件同步向量化并写库，跑在线程池上；启动顺序不变（重建完成才接流量），
+        # 但重建期间事件循环仍可调度其它协程。
+        await asyncio.to_thread(rebuild_existing_knowledge_index)
     yield
 
 
