@@ -237,13 +237,16 @@ import { confirmCenteredDelete } from '@/utils/confirm'
 import { copyText } from '@/utils/clipboard'
 import { getApiErrorMessage } from '@/utils/httpError'
 import {
+  DELETE_SUCCEEDED,
   KNOWLEDGE_UPLOAD_ACCEPT,
   KNOWLEDGE_UPLOAD_HINT,
   describeBatchDeleteResult,
   describeSkippedUploadFiles,
   describeUploadFailure,
   describeUploadSuccess,
+  hasDeletedAnyFile,
   partitionUploadFiles,
+  runConfirmedDelete,
   uploadFilesInOrder,
 } from '@/utils/knowledgeFeedback'
 import { formatDateTime, formatFileSize } from '@/utils'
@@ -481,16 +484,32 @@ function resetKnowledgeBaseDialog() {
   knowledgeBaseFormRef.value?.resetFields?.()
 }
 
+// 三个删除入口的错误提示统一走这里，与上传路径的 ElMessage.error 保持同一形态。
+function notifyDeleteError(message) {
+  ElMessage.error(message)
+}
+
 async function deleteKnowledgeBase() {
   const current = knowledgeBases.value.find((item) => item.id === currentKnowledgeBaseId.value)
   if (!current) return
-  const response = await confirmCenteredDelete(
-    `确定删除知识库「${current.name}」吗？该知识库下的资料会一并删除，已有对话将切换到其他知识库。`,
-    '删除知识库'
-  ).then(() => knowledgeAPI.deleteBase(current.id))
+
+  const { status, result } = await runConfirmedDelete({
+    confirm: () =>
+      confirmCenteredDelete(
+        `确定删除知识库「${current.name}」吗？该知识库下的资料会一并删除，已有对话将切换到其他知识库。`,
+        '删除知识库'
+      ),
+    // 与上传路径一致地用 silent 抑制拦截器提示，错误文案由本视图统一给出，避免弹两次。
+    remove: () => knowledgeAPI.deleteBase(current.id, { silent: true }),
+    notifyError: notifyDeleteError,
+  })
+  // 取消或失败都不参与成功分支：不提示成功、不切换当前知识库、不刷新。
+  // 失败时服务端状态未变，列表仍是真实的，用户可直接重试。
+  if (status !== DELETE_SUCCEEDED) return
+
   ElMessage.success('知识库已删除')
   await fetchKnowledgeBases()
-  currentKnowledgeBaseId.value = response.fallback_knowledge_base_id || knowledgeBases.value[0]?.id || null
+  currentKnowledgeBaseId.value = result.fallback_knowledge_base_id || knowledgeBases.value[0]?.id || null
   await fetchFiles()
 }
 
@@ -587,18 +606,37 @@ function openUploadDialog() {
 }
 
 async function confirmDelete(file) {
-  await confirmCenteredDelete(`确定删除「${file.name}」吗？删除后不可恢复。`, '删除文件')
-  await knowledgeAPI.delete(file.id)
+  const { status } = await runConfirmedDelete({
+    confirm: () => confirmCenteredDelete(`确定删除「${file.name}」吗？删除后不可恢复。`, '删除文件'),
+    remove: () => knowledgeAPI.delete(file.id, { silent: true }),
+    notifyError: notifyDeleteError,
+  })
+  if (status !== DELETE_SUCCEEDED) return
+
   ElMessage.success('删除成功')
   await refreshKnowledgeBaseAndFiles()
 }
 
 async function confirmBatchDelete() {
   if (!selectedFiles.value.length) return
-  await confirmCenteredDelete(`确定删除选中的 ${selectedFiles.value.length} 个资料吗？删除后不可恢复。`, '批量删除资料')
-  const result = await knowledgeAPI.batchDelete(selectedFiles.value.map((file) => file.id), { silent: true })
+
+  const { status, result } = await runConfirmedDelete({
+    confirm: () =>
+      confirmCenteredDelete(
+        `确定删除选中的 ${selectedFiles.value.length} 个资料吗？删除后不可恢复。`,
+        '批量删除资料'
+      ),
+    remove: () => knowledgeAPI.batchDelete(selectedFiles.value.map((file) => file.id), { silent: true }),
+    notifyError: notifyDeleteError,
+  })
+  if (status !== DELETE_SUCCEEDED) return
+
   const feedback = describeBatchDeleteResult(result)
   ElMessage[feedback.type](feedback.message)
+
+  // 整批失败时也要保留选中状态：此时删掉 0 个，服务端没有变化，用户可直接重试。
+  if (!hasDeletedAnyFile(result)) return
+
   selectedFiles.value = []
   await refreshKnowledgeBaseAndFiles()
 }

@@ -13,8 +13,8 @@ export const knowledgeAPI = {
   renameBase(id, name, config = {}) {
     return request.put(`/knowledge-bases/${id}`, { name }, config)
   },
-  deleteBase(id) {
-    return request.delete(`/knowledge-bases/${id}`)
+  deleteBase(id, config = {}) {
+    return request.delete(`/knowledge-bases/${id}`, config)
   },
   getDetail(id) {
     return request.get(`/knowledge/${id}`)
