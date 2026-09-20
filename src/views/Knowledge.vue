@@ -38,7 +38,7 @@
             ref="uploadInputRef"
             type="file"
             class="hidden"
-            :accept="acceptTypes"
+            :accept="KNOWLEDGE_UPLOAD_ACCEPT"
             multiple
             @change="handleUploadInputChange"
           />
@@ -89,7 +89,7 @@
         >
           <el-icon :size="44" class="mb-3 text-brand-600"><Upload /></el-icon>
           <div class="text-base font-medium text-slate-700">点击上传知识文件</div>
-          <div class="mt-1 text-sm">支持 txt、md、json、csv、yaml、xml、log、pdf、docx，支持多选批量上传</div>
+          <div class="mt-1 text-sm">{{ KNOWLEDGE_UPLOAD_HINT }}</div>
         </div>
 
         <el-table
@@ -238,9 +238,14 @@ import { copyText } from '@/utils/clipboard'
 import { getApiErrorMessage } from '@/utils/httpError'
 import {
   DELETE_SUCCEEDED,
+  KNOWLEDGE_UPLOAD_ACCEPT,
+  KNOWLEDGE_UPLOAD_HINT,
   describeBatchDeleteResult,
+  describeSkippedUploadFiles,
+  describeUploadFailure,
   describeUploadSuccess,
   hasDeletedAnyFile,
+  partitionUploadFiles,
   runConfirmedDelete,
   uploadFilesInOrder,
 } from '@/utils/knowledgeFeedback'
@@ -274,7 +279,6 @@ const knowledgeBaseForm = reactive({
 const knowledgeStore = useKnowledgeStore()
 const knowledgeBases = computed(() => knowledgeStore.knowledgeBases)
 
-const acceptTypes = '.txt,.md,.json,.csv,.yaml,.yml,.xml,.log,.pdf,.docx'
 const PICTURE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'])
 const ARCHIVE_EXTENSIONS = new Set(['zip', 'rar', '7z'])
 const knowledgeBaseRules = {
@@ -540,23 +544,56 @@ async function handleUpload(files) {
   const validFiles = uploadFiles.filter(Boolean)
   if (!validFiles.length || !currentKnowledgeBaseId.value || uploading.value) return
 
+  // 白名单外的文件在选中阶段就跳过并点名，避免提交后被后端 400 拒绝、连带跳过同批合法文件。
+  const { supported, rejected } = partitionUploadFiles(validFiles)
+  if (rejected.length) {
+    ElMessage.warning(describeSkippedUploadFiles(rejected))
+  }
+  if (!supported.length) return
+
+  let failedIndex = -1
+  let attempted = 0
   uploading.value = true
   uploadPercent.value = 0
 
   try {
     await uploadFilesInOrder(
-      validFiles,
-      (file, onProgress) =>
-        knowledgeAPI.upload(file, currentKnowledgeBaseId.value, onProgress, { silent: true }),
+      supported,
+      async (file, onProgress) => {
+        const index = attempted
+        attempted += 1
+        try {
+          return await knowledgeAPI.upload(file, currentKnowledgeBaseId.value, onProgress, {
+            silent: true,
+          })
+        } catch (error) {
+          failedIndex = index
+          throw error
+        }
+      },
       (percent) => {
         uploadPercent.value = percent
       }
     )
 
-    ElMessage.success(describeUploadSuccess(validFiles.length))
+    ElMessage.success(describeUploadSuccess(supported.length))
     await refreshKnowledgeBaseAndFiles()
   } catch (error) {
-    ElMessage.error(getApiErrorMessage(error, '上传失败，请稍后重试'))
+    const reason = getApiErrorMessage(error, '上传失败，请稍后重试')
+    if (failedIndex < 0) {
+      ElMessage.error(reason)
+    } else {
+      // 首败即止：失败文件之后的同批文件都没有上传，提示里要说清楚；
+      // 选中阶段被跳过的文件同样没上传，一并如实交代。
+      ElMessage.error(
+        describeUploadFailure(
+          supported[failedIndex].name,
+          supported.length - failedIndex - 1,
+          reason,
+          rejected.length
+        )
+      )
+    }
   } finally {
     uploading.value = false
     uploadPercent.value = 0
