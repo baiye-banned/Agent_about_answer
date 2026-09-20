@@ -2,9 +2,11 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.exc import IntegrityError
 
 from config import REBUILD_KNOWLEDGE_INDEX_ON_STARTUP, ensure_secret_key_configured
 from database.session import init_db
@@ -19,6 +21,8 @@ from service.user_service import seed_default_users
 
 
 logger = logging.getLogger(__name__)
+
+INTEGRITY_CONFLICT_MESSAGE = "数据冲突：本次操作与当前数据状态不一致，请重试。"
 
 
 @asynccontextmanager
@@ -40,6 +44,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+
+
+@app.exception_handler(IntegrityError)
+async def integrity_error_handler(request: Request, exc: IntegrityError):
+    """写路径未单独处理的唯一/外键冲突兜底成 409，不再冒成 500（issue #60 验收标准第 4 条）。
+
+    用户可见的知识库重名竞态已在 service 层翻译成带具体文案的 400，这里只兜住漏网者
+    （例如并发删除后仍被引用的写入），保证响应是可读的 4xx 而不是 Starlette 默认的 500。
+    """
+    logger.warning("Unhandled integrity error: %s %s", request.method, request.url.path, exc_info=exc)
+    return JSONResponse(status_code=409, content={"detail": INTEGRITY_CONFLICT_MESSAGE})
 
 
 @app.get("/")

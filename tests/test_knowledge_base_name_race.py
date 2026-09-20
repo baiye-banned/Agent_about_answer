@@ -7,6 +7,9 @@ uq_knowledge_bases_user_name 只允许一方提交成功。败方的 IntegrityEr
 
 用例用真实 SQLite 引擎 + 每个 Session 一条独立连接，在预检查与写入之间插入对手请求的
 真实提交，复现的是同一个交错时序，不依赖线程调度的运气。
+
+另外覆盖验收标准第 4 条：写路径没有单独处理的约束冲突由 `main` 上注册的全局兜底翻译成 4xx，
+不再冒成 500。
 """
 
 from types import SimpleNamespace
@@ -16,10 +19,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.dialects.mysql import LONGTEXT
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
+import main as main_module
 from crud import knowledge_base as crud_knowledge_base
 from database import session as db_session
 from database.session import Base
@@ -174,3 +179,27 @@ def test_serial_duplicate_name_keeps_the_same_400_message(api):
     assert response.status_code == 400, response.text
     assert response.json()["detail"] == DUPLICATE_NAME_DETAIL
     assert _stored_names(api) == ["制度库"]
+
+
+def test_global_handler_translates_unhandled_integrity_error_to_4xx():
+    """验收标准第 4 条：未被写路径单独处理的约束冲突不再冒成 500。
+
+    真实应用上必须注册全局兜底；再用一个临时探针路由触发未捕获的 IntegrityError，
+    断言拿到的是 409 + 可读文案，而不是 Starlette 默认的 500。
+    """
+    handler = main_module.app.exception_handlers.get(IntegrityError)
+    assert handler is not None, "应用未注册全局 IntegrityError 兜底处理器"
+
+    async def raise_integrity_error():
+        raise IntegrityError(
+            "INSERT INTO probe (id) VALUES (1)", {}, Exception("UNIQUE constraint failed: probe.id")
+        )
+
+    probe_app = FastAPI()
+    probe_app.add_exception_handler(IntegrityError, handler)
+    probe_app.add_api_route("/probe", raise_integrity_error, methods=["POST"])
+
+    response = TestClient(probe_app, raise_server_exceptions=False).post("/probe")
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == main_module.INTEGRITY_CONFLICT_MESSAGE

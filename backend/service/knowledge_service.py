@@ -122,6 +122,7 @@ def create_knowledge_base(body: KnowledgeBaseRequest, user: User = Depends(get_c
         # 预检查与写入之间被并发请求抢先提交了同名知识库，唯一约束兜底：
         # 先回滚失败事务再翻译成与串行一致的 400，避免该 Session 残留失败事务状态。
         db.rollback()
+        logger.warning("Knowledge base create conflict: name=%s user_id=%s", name, user.id, exc_info=True)
         raise HTTPException(400, "知识库名称已存在")
     return crud_knowledge_base.serialize_knowledge_base(entry)
 
@@ -140,6 +141,7 @@ def rename_knowledge_base(kid: int, body: KnowledgeBaseRequest, user: User = Dep
     except IntegrityError:
         # 两个知识库同时被改成同一个名字时同样只有一方能提交成功，后到者按同名处理。
         db.rollback()
+        logger.warning("Knowledge base rename conflict: kid=%s name=%s user_id=%s", kid, name, user.id, exc_info=True)
         raise HTTPException(400, "知识库名称已存在")
     return crud_knowledge_base.serialize_knowledge_base(entry)
 
