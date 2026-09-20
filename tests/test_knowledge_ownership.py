@@ -27,9 +27,9 @@ from service import auth_service, knowledge_service
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ALICE_PASSWORD = "alice-pass"
-BOB_PASSWORD = "bob-pass"
-SECRET = "alice 的私有资料：2026 年报价单，bob 不应该看到。"
+ALICE_PASSWORD = "alice-pass"  # scan-secrets:allow in-memory test fixture password
+BOB_PASSWORD = "bob-pass"  # scan-secrets:allow in-memory test fixture password
+SECRET = "alice 的私有资料：2026 年报价单，bob 不应该看到。"  # scan-secrets:allow test corpus text, not a credential
 ALICE_PASSWORD_HASH = auth_service.pwd_context.hash(ALICE_PASSWORD)
 BOB_PASSWORD_HASH = auth_service.pwd_context.hash(BOB_PASSWORD)
 
