@@ -3,6 +3,7 @@ import threading
 import time
 
 import pytest
+from sqlalchemy.sql import operators
 
 from rag import retrieval
 
@@ -428,3 +429,133 @@ def test_rrf_fuse_skips_non_dict_chunks():
 
     assert len(fused) == 1
     assert fused[0]["chunk_id"] == "a"
+
+
+class _FakeFileQuery:
+    """只实现 keyword_recall 用到的那部分查询：列投影、filter/order_by/limit 和 all()。
+
+    issue #59 之后取数层改成「按主键游标分批 + 带 LIMIT」，条件里既有等值也有 ``id >``，
+    所以这里真的按条件过滤并切片，避免 fake 比真实查询宽松（宽松会让分页死循环）。
+    """
+
+    def __init__(self, files, columns):
+        self._files = list(files)
+        self._columns = columns or (retrieval.KnowledgeFile.id, retrieval.KnowledgeFile.name, retrieval.KnowledgeFile.content)
+        self._criteria = []
+        self._limit = None
+
+    def filter(self, *criteria):
+        self._criteria.extend(criteria)
+        return self
+
+    def order_by(self, *columns):
+        keys = [column.key for column in columns]
+        self._files.sort(key=lambda item: tuple(getattr(item, key) for key in keys))
+        return self
+
+    def limit(self, count):
+        self._limit = count
+        return self
+
+    def all(self):
+        rows = [item for item in self._files if all(_matches_file(item, criterion) for criterion in self._criteria)]
+        if self._limit is not None:
+            rows = rows[: self._limit]
+        return [tuple(getattr(item, column.key) for column in self._columns) for item in rows]
+
+
+def _matches_file(file, criterion):
+    """只判定 ``列 == 值`` / ``列 > 值``（分页游标必须生效，否则会一直取到同一批）。
+
+    LIKE 预筛等表达式在这里按「一律通过」处理：这个 fake 只关心「给一批文件，召回结果
+    是什么」；SQL 谓词本身（预筛、知识库归属、LIMIT）由 tests/test_retrieval_acceptance.py
+    的真实 SQLite 数据库和 test_keyword_recall_memory_59.py 的语句断言覆盖。
+    """
+    left = getattr(criterion, "left", None)
+    if left is None or not hasattr(left, "key"):
+        return True
+    value = getattr(file, left.key)
+    expected = getattr(criterion.right, "value", criterion.right)
+    if criterion.operator is operators.eq:
+        return value == expected
+    if criterion.operator is operators.gt:
+        return value > expected
+    return True
+
+
+class _FakeFileDb:
+    """keyword_recall 只需要 db.query(KnowledgeFile.id, .name, .content) + 分批查询。"""
+
+    def __init__(self, files):
+        self.files = files
+
+    def query(self, *columns):
+        return _FakeFileQuery(self.files, columns)
+
+
+class _FakeKnowledgeFile:
+    def __init__(self, file_id, name, content, knowledge_base_id=1):
+        self.id = file_id
+        self.name = name
+        self.content = content
+        self.knowledge_base_id = knowledge_base_id
+
+
+def test_keyword_recall_drops_window_that_misses_the_query(monkeypatch):
+    """issue #56：文件级命中不代表每个窗口都相关，跑题窗口不得进入关键字候选。"""
+    filler = "本制度由行政部负责解释。" * 85
+    document = (
+        "报销申请需提交原始发票，由财务部在五个工作日内完成审核并付款。"
+        + filler
+        + "迟到30分钟以内罚款50元，早退按同等标准处理，由人事部按月汇总。"
+        + "员工如有疑问可向人事部咨询。" * 20
+    )
+    keywords = retrieval._expand_keywords(["报销", "发票", "财务"])
+
+    hits = retrieval.keyword_recall(
+        _FakeFileDb([_FakeKnowledgeFile(7, "员工手册.md", document)]), 1, keywords, 8
+    )
+
+    assert hits
+    # 第 1 位必须是真正命中本次查询关键词的窗口，而不是另一段考勤条款。
+    assert any(keyword in hits[0]["content"] for keyword in keywords)
+    assert "迟到" not in hits[0]["content"]
+    assert all(hit["keyword_hits"] > 0 for hit in hits)
+    assert all(
+        any(keyword in hit["content"] for keyword in keywords) for hit in hits
+    )
+
+
+def test_keyword_recall_drops_off_topic_window_that_only_hits_hardcoded_phrases():
+    """非考勤语料同样成立：只命中写死场景短语（30分钟以内）的窗口必须落选。"""
+    filler = "本制度由行政部负责解释。" * 80
+    document = (
+        "报销申请需提交原始发票，由财务部审核。"
+        + filler
+        + "付款审批将在30分钟以内完成，超时自动升级。"
+    )
+    keywords = retrieval._expand_keywords(["报销", "发票", "财务"])
+
+    hits = retrieval.keyword_recall(
+        _FakeFileDb([_FakeKnowledgeFile(7, "财务制度.md", document)]), 1, keywords, 8
+    )
+
+    assert hits
+    assert all("30分钟以内" not in hit["content"] for hit in hits)
+    assert all(
+        any(keyword in hit["content"] for keyword in keywords) for hit in hits
+    )
+
+
+def test_keyword_score_ignores_scenario_phrases_absent_from_the_query():
+    """issue #56：内容自身的场景特征词不再加分，零命中内容必须得 0 分。"""
+    keywords = retrieval._expand_keywords(["报销", "发票", "财务"])
+    on_topic = "报销申请需提交原始发票，由财务部在五个工作日内完成审核并付款。"
+
+    for off_topic in (
+        "迟到30分钟以内罚款50元，早退按同等标准处理，由人事部按月汇总。",
+        "员工须按时上下班，考勤记录由人事部按月汇总，罚款200元。",
+        "付款审批将在30分钟以内完成，超时自动升级。",
+    ):
+        assert retrieval._keyword_score(off_topic, keywords) == 0.0
+        assert retrieval._keyword_score(off_topic, keywords) < retrieval._keyword_score(on_topic, keywords)

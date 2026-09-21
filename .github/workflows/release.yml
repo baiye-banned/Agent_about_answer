@@ -58,7 +58,7 @@ jobs:
           echo "版本号校验通过：$VERSION"
 
       - name: Checkout the source ref
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
           # 需要与 origin/main 做比较来生成变更分类，浅克隆取不到共同祖先。
@@ -66,7 +66,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 

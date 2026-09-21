@@ -1,1 +1,16 @@
+# RAGAS 是可选的评测依赖，不在 CI 安装，只有显式启用评测时才需要（见 .env.example）。
+#
+# 关于 CVE-2026-6587（GHSA-95ww-475f-pr4f，SSRF，low）：
+#   受影响范围 >= 0.2.3, <= 0.4.3 覆盖了 0.4.2 当前所在的整个区间，
+#   上游尚未发布修复版本（Dependabot 的 first_patched_version 为 null），
+#   因此这里不设版本目标，按「接受风险」豁免，不以放宽版本区间的方式假装收敛。
+#
+# 依据（issue #98）：
+#   1. 漏洞位于 Multi-Modal Faithfulness Collections 模块。本仓库对 multimodal /
+#      collections 相关模块零引用，backend/rag/ragas_eval.py 只用到 Faithfulness、
+#      LLMContextPrecisionWithoutReference、ResponseRelevancy 三个文本指标，
+#      对应的出网目标由 config 里的 LLM/Embedding 基址固定，不由评测样本决定。
+#   2. ragas 在 ragas_eval.py 里是函数内延迟导入，且 RAGAS_ENABLED 默认为 False，
+#      未显式开启时评测链路根本不会加载该库。
+# 后续：上游发布包含修复的版本后，把这一行改为该版本下限，并同步更新本说明。
 ragas==0.4.2

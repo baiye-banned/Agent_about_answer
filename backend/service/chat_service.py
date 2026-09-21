@@ -2,9 +2,10 @@
 import json
 import logging
 from datetime import datetime
+from typing import Annotated
 from uuid import uuid4
 
-from fastapi import Depends, File, Header, HTTPException, UploadFile
+from fastapi import Depends, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -23,6 +24,7 @@ from service.utils_service import (
     CHAT_ATTACHMENT_MAX_BYTES,
     _build_sources,
     _check_answer_grounding,
+    _internal_error_detail,
     resolve_image_upload_type,
 )
 from service.knowledge_service import resolve_knowledge_base
@@ -33,12 +35,19 @@ from rag.memory_service import (
     _schedule_memory_summary_update,
 )
 from rag.vision_service import _build_effective_question
-from rag.milvus_client import embedding_backend_status
+from rag.milvus_client import embedding_backend_status, embedding_trace_status
 from rag.chains import stream_rag_answer
 from rag.retrieval import decide_need_rag, retrieve_knowledge
 
 
 logger = logging.getLogger(__name__)
+
+# 失败分支回给用户的固定文案：异常原文（驱动报错、路径、上游地址）只进 logger，不进 SSE 帧
+# 或 HTTP detail。学习轨迹事件同时带上 trace_id，用户报错时可直接与日志里的 trace 对上。
+ASSISTANT_SAVE_FAILED_MESSAGE = "保存回答失败"
+RAGAS_SCHEDULE_FAILED_MESSAGE = "RAGAS 评估调度失败"
+MEMORY_SUMMARY_SCHEDULE_FAILED_MESSAGE = "长期记忆压缩调度失败"
+OSS_UPLOAD_FAILED_MESSAGE = "图片上传失败，请稍后重试"
 
 
 def _serialize_conversation(conv: Conversation, user_id: int) -> dict:
@@ -64,12 +73,40 @@ def list_conversations(user: User = Depends(get_current_user),
     return [_serialize_conversation(c, user.id) for c in rows]
 
 
-def get_messages(cid: str, user: User = Depends(get_current_user),
+def resolve_message_limit(limit: int | None) -> int:
+    """页大小兜底校验。
+
+    HTTP 请求已由 Query(ge/le) 拦截，这里是为了让直接调用 service 的路径（脚本、内部调用）
+    也拿不到超过上限的页大小，避免绕过接口层把整段历史一次读出。
+    """
+    if limit is None:
+        return crud_chat.CHAT_MESSAGE_DEFAULT_LIMIT
+    if limit < 1 or limit > crud_chat.CHAT_MESSAGE_MAX_LIMIT:
+        raise HTTPException(422, f"limit 必须在 1 到 {crud_chat.CHAT_MESSAGE_MAX_LIMIT} 之间")
+    return limit
+
+
+def get_messages(cid: str,
+                 limit: Annotated[int, Query(ge=1, le=crud_chat.CHAT_MESSAGE_MAX_LIMIT)] = crud_chat.CHAT_MESSAGE_DEFAULT_LIMIT,
+                 before_id: Annotated[int | None, Query(ge=1)] = None,
+                 user: User = Depends(get_current_user),
                  db: Session = Depends(get_db)):
-    conv = crud_chat.get_conversation(db, cid, user.id)
-    if not conv:
+    """会话消息历史，按页返回。
+
+    before_id 是游标：只取 id 小于它的消息（更早的一页）。不传时返回最新一页，
+    页大小默认 CHAT_MESSAGE_DEFAULT_LIMIT，保证单次响应体有上限。
+    """
+    # 归属校验在 list_messages 里随分页查询一起做，这里不再单独查一次会话，避免重复查询。
+    rows = crud_chat.list_messages(
+        db,
+        cid,
+        user.id,
+        limit=resolve_message_limit(limit),
+        before_id=before_id,
+    )
+    if rows is None:
         raise HTTPException(404, "对话不存在")
-    return [crud_chat.serialize_message(m) for m in conv.messages]
+    return [crud_chat.serialize_message(m) for m in rows]
 
 
 def delete_conversation(cid: str, user: User = Depends(get_current_user),
@@ -140,7 +177,7 @@ async def upload_chat_attachment(file: UploadFile = File(...),
     try:
         await _put_oss_object(object_key, content, content_type)
     except Exception as exc:
-        raise HTTPException(500, f"OSS 上传失败：{exc}")
+        raise HTTPException(500, _internal_error_detail(OSS_UPLOAD_FAILED_MESSAGE, "oss_upload", exc))
 
     return {
         "name": file.filename or f"image{ext}",
@@ -361,7 +398,9 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
         retrieved_contexts = []
         knowledge_chunks = []
         retrieval_trace = {
-            "embedding": embedding_backend_status(),
+            # 同一份状态会随 retrieval_trace 落库并回查给用户：last_error 原文（上游地址 +
+            # 原始异常）只留服务端，轨迹里给固定文案。
+            "embedding": embedding_trace_status(embedding_backend_status()),
             "query_plan": {},
             "routes": [],
             "rrf": [],
@@ -452,265 +491,283 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             )
 
         async def event_stream():
-            full = ""
-            failed = False
-            first_chunk_seen = False
-            conversation_data = json.dumps({
-                "type": "conversation",
-                "conversation": {
-                    "id": cid,
-                    "title": conv.title,
-                    "knowledge_base_id": knowledge_base.id,
-                    "knowledge_base_name": knowledge_base.name,
-                },
-            }, ensure_ascii=False)
-            if body.attachments:
-                analysis_data = json.dumps(
-                    {
-                        "type": "image_analysis",
-                        "analysis": image_analysis,
+            try:
+                full = ""
+                failed = False
+                first_chunk_seen = False
+                conversation_data = json.dumps({
+                    "type": "conversation",
+                    "conversation": {
+                        "id": cid,
+                        "title": conv.title,
+                        "knowledge_base_id": knowledge_base.id,
+                        "knowledge_base_name": knowledge_base.name,
                     },
-                    ensure_ascii=False,
-                )
+                }, ensure_ascii=False)
+                if body.attachments:
+                    analysis_data = json.dumps(
+                        {
+                            "type": "image_analysis",
+                            "analysis": image_analysis,
+                        },
+                        ensure_ascii=False,
+                    )
+                    for payload in _trace_sse_payloads(trace):
+                        yield payload
+                    yield f"data: {analysis_data}\n\n"
                 for payload in _trace_sse_payloads(trace):
                     yield payload
-                yield f"data: {analysis_data}\n\n"
-            for payload in _trace_sse_payloads(trace):
-                yield payload
-            yield f"data: {conversation_data}\n\n"
-            if need_rag and sources:
-                data = json.dumps({"type": "sources", "sources": sources}, ensure_ascii=False)
-                yield f"data: {data}\n\n"
-            trace.add(
-                "generation_started",
-                "stream_rag_answer",
-                params={
-                    "question": effective_question,
-                    "memory_context": memory_context,
-                    "context": context,
-                    "mode": generation_mode,
-                },
-                note=(
-                    "开始调用文本模型。"
-                    if need_rag
-                    else "开始调用文本模型。当前问题被判定为直答，不进入知识库检索，只结合问题与会话记忆回答。"
-                ),
-            )
-            for payload in _trace_sse_payloads(trace):
-                yield payload
-            async for event in stream_rag_answer(
-                effective_question,
-                context,
-                memory_context,
-                trace,
-                use_rag=need_rag,
-            ):
-                for payload in _trace_sse_payloads(trace):
-                    yield payload
-                if isinstance(event, dict):
-                    if event.get("type") == "error":
-                        failed = True
-                        trace.add(
-                            "generation_failed",
-                            "_stream_deepseek_response",
-                            result={"message": event.get("message") or event.get("content") or "DeepSeek 网络请求失败"},
-                            note="模型生成阶段失败，系统会返回错误事件，并且不会保存失败 assistant 消息。",
-                        )
-                        for payload in _trace_sse_payloads(trace):
-                            yield payload
-                        data = json.dumps(
-                            {
-                                "type": "error",
-                                "message": event.get("message") or event.get("content") or "DeepSeek 网络请求失败",
-                            },
-                            ensure_ascii=False,
-                        )
-                        yield f"data: {data}\n\n"
-                        break
-                    if event.get("type") == "reset":
-                        # 后备模型从头重新生成整段回答：先作废已下发的增量，
-                        # 落库文本也从零重新累积，绝不与重置前的内容拼接。
-                        full = ""
-                        first_chunk_seen = False
-                        trace.add(
-                            "stream_reset",
-                            "_stream_openai_chat_chunks",
-                            params={"reason": event.get("reason") or ""},
-                            note="已下发 reset 事件作废此前流式内容，本轮回答改为只保留重置后重新生成的部分。",
-                        )
-                        for payload in _trace_sse_payloads(trace):
-                            yield payload
-                        data = json.dumps(
-                            {
-                                "type": "reset",
-                                "reason": event.get("reason") or "",
-                                "message": event.get("message") or "",
-                            },
-                            ensure_ascii=False,
-                        )
-                        yield f"data: {data}\n\n"
-                        continue
-                    chunk = event.get("content", "")
-                else:
-                    chunk = event
-                data = json.dumps({"content": chunk}, ensure_ascii=False)
-                yield f"data: {data}\n\n"
-                if not failed:
-                    if chunk and not first_chunk_seen:
-                        first_chunk_seen = True
-                        trace.add(
-                            "first_content_chunk",
-                            "_stream_openai_chat_chunks",
-                            result={"chunk": chunk},
-                            note="大模型开始返回第一段流式内容，前端会逐步拼接为正在生成的回答。",
-                        )
-                        for payload in _trace_sse_payloads(trace):
-                            yield payload
-                    full += chunk
-
-            # save assistant message
-            if full and not failed:
-                _safe_trace_add(
-                    trace,
-                    "assistant_ready_to_save",
-                    "Message",
-                    uses={
-                        "full_answer": full,
-                        "sources_count": len(sources),
-                        "need_rag": need_rag,
+                yield f"data: {conversation_data}\n\n"
+                if need_rag and sources:
+                    data = json.dumps({"type": "sources", "sources": sources}, ensure_ascii=False)
+                    yield f"data: {data}\n\n"
+                trace.add(
+                    "generation_started",
+                    "stream_rag_answer",
+                    params={
+                        "question": effective_question,
+                        "memory_context": memory_context,
+                        "context": context,
+                        "mode": generation_mode,
                     },
                     note=(
-                        "模型完整回答成功，系统准备保存 assistant 消息，并启动摘要判断。"
-                        if not need_rag
-                        else "模型完整回答成功，系统准备保存 assistant 消息，并启动 RAGAS 和摘要判断。"
+                        "开始调用文本模型。"
+                        if need_rag
+                        else "开始调用文本模型。当前问题被判定为直答，不进入知识库检索，只结合问题与会话记忆回答。"
                     ),
                 )
-                _attach_grounding_trace(
-                    retrieval_trace,
+                for payload in _trace_sse_payloads(trace):
+                    yield payload
+                async for event in stream_rag_answer(
+                    effective_question,
+                    context,
+                    memory_context,
                     trace,
-                    answer=full,
-                    retrieved_contexts=retrieved_contexts,
-                    need_rag=need_rag,
-                )
-                retrieval_trace["learning_trace"] = compact_trace_reference(trace.snapshot())
-                assistant_message = None
-                try:
-                    assistant_message = Message(
-                        conversation_id=cid,
-                        role="assistant",
-                        content=full,
-                        sources=json.dumps(sources, ensure_ascii=False),
-                        ragas_status="pending" if need_rag else "",
-                        retrieval_trace=json.dumps(retrieval_trace, ensure_ascii=False),
-                    )
-                    db.add(assistant_message)
-                    db.commit()
-                    db.refresh(assistant_message)
-                except Exception as exc:
-                    db.rollback()
-                    logger.warning("Assistant message save failed after stream finished: %s", exc, exc_info=True)
-                    _safe_trace_add(
-                        trace,
-                        "assistant_save_failed",
-                        "Message",
-                        result={"error": str(exc)},
-                        note="模型回答已经生成完毕，但保存 assistant 消息失败。系统仍会结束流，避免前端误报 network error。",
-                    )
-
-                if assistant_message:
-                    _safe_trace_attach(trace, conversation_id=cid, message_id=assistant_message.id)
-                    _safe_trace_add(
-                        trace,
-                        "assistant_message_saved",
-                        "Message",
-                        creates={"assistant_message_id": assistant_message.id},
-                        result={"ragas_status": "pending" if need_rag else ""},
-                        note="assistant 消息保存成功，历史会话刷新后仍可从这条消息打开流程。",
-                    )
-                    if need_rag:
-                        try:
-                            schedule_ragas_evaluation(
-                                assistant_message.id,
-                                effective_question,
-                                full,
-                                retrieved_contexts,
-                                trace.trace_id,
+                    use_rag=need_rag,
+                ):
+                    for payload in _trace_sse_payloads(trace):
+                        yield payload
+                    if isinstance(event, dict):
+                        if event.get("type") == "error":
+                            failed = True
+                            trace.add(
+                                "generation_failed",
+                                "_stream_deepseek_response",
+                                result={"message": event.get("message") or event.get("content") or "DeepSeek 网络请求失败"},
+                                note="模型生成阶段失败，系统会返回错误事件，并且不会保存失败 assistant 消息。",
                             )
-                            _safe_trace_add(
-                                trace,
-                                "ragas_scheduled",
-                                "schedule_ragas_evaluation",
-                                params={
-                                    "message_id": assistant_message.id,
-                                    "question": effective_question,
-                                    "answer_chars": len(full),
-                                    "contexts_count": len(retrieved_contexts),
+                            for payload in _trace_sse_payloads(trace):
+                                yield payload
+                            data = json.dumps(
+                                {
+                                    "type": "error",
+                                    "message": event.get("message") or event.get("content") or "DeepSeek 网络请求失败",
                                 },
-                                note="RAGAS 在 assistant 保存后异步启动，不阻塞用户看到答案。",
+                                ensure_ascii=False,
                             )
-                        except Exception as exc:
-                            logger.warning("RAGAS schedule failed after stream finished: %s", exc, exc_info=True)
-                            _safe_trace_add(
-                                trace,
-                                "ragas_schedule_failed",
-                                "schedule_ragas_evaluation",
-                                result={"error": str(exc)},
-                                note="RAGAS 调度失败，但不影响主回答完成。",
+                            yield f"data: {data}\n\n"
+                            break
+                        if event.get("type") == "reset":
+                            # 后备模型从头重新生成整段回答：先作废已下发的增量，
+                            # 落库文本也从零重新累积，绝不与重置前的内容拼接。
+                            full = ""
+                            first_chunk_seen = False
+                            trace.add(
+                                "stream_reset",
+                                "_stream_openai_chat_chunks",
+                                params={"reason": event.get("reason") or ""},
+                                note="已下发 reset 事件作废此前流式内容，本轮回答改为只保留重置后重新生成的部分。",
                             )
+                            for payload in _trace_sse_payloads(trace):
+                                yield payload
+                            data = json.dumps(
+                                {
+                                    "type": "reset",
+                                    "reason": event.get("reason") or "",
+                                    "message": event.get("message") or "",
+                                },
+                                ensure_ascii=False,
+                            )
+                            yield f"data: {data}\n\n"
+                            continue
+                        chunk = event.get("content", "")
                     else:
-                        _safe_trace_add(
-                            trace,
-                            "ragas_skipped",
-                            "schedule_ragas_evaluation",
-                            result={"need_rag": False, "reason": rag_gate.get("reason", "")},
-                            note="当前问题被路由为直答，因此不启动 RAGAS。",
-                        )
+                        chunk = event
+                    data = json.dumps({"content": chunk}, ensure_ascii=False)
+                    yield f"data: {data}\n\n"
+                    if not failed:
+                        if chunk and not first_chunk_seen:
+                            first_chunk_seen = True
+                            trace.add(
+                                "first_content_chunk",
+                                "_stream_openai_chat_chunks",
+                                result={"chunk": chunk},
+                                note="大模型开始返回第一段流式内容，前端会逐步拼接为正在生成的回答。",
+                            )
+                            for payload in _trace_sse_payloads(trace):
+                                yield payload
+                        full += chunk
+
+                # save assistant message
+                if full and not failed:
+                    _safe_trace_add(
+                        trace,
+                        "assistant_ready_to_save",
+                        "Message",
+                        uses={
+                            "full_answer": full,
+                            "sources_count": len(sources),
+                            "need_rag": need_rag,
+                        },
+                        note=(
+                            "模型完整回答成功，系统准备保存 assistant 消息，并启动摘要判断。"
+                            if not need_rag
+                            else "模型完整回答成功，系统准备保存 assistant 消息，并启动 RAGAS 和摘要判断。"
+                        ),
+                    )
+                    _attach_grounding_trace(
+                        retrieval_trace,
+                        trace,
+                        answer=full,
+                        retrieved_contexts=retrieved_contexts,
+                        need_rag=need_rag,
+                    )
+                    retrieval_trace["learning_trace"] = compact_trace_reference(trace.snapshot())
+                    assistant_message = None
                     try:
-                        _schedule_memory_summary_update(cid, trace.trace_id)
-                        _safe_trace_add(
-                            trace,
-                            "memory_summary_update_scheduled",
-                            "_schedule_memory_summary_update",
-                            params={"conversation_id": cid},
-                            note="系统异步检查长期记忆是否超过上限，若超过则进行二次摘要。",
+                        assistant_message = Message(
+                            conversation_id=cid,
+                            role="assistant",
+                            content=full,
+                            sources=json.dumps(sources, ensure_ascii=False),
+                            ragas_status="pending" if need_rag else "",
+                            retrieval_trace=json.dumps(retrieval_trace, ensure_ascii=False),
                         )
-                    except Exception as exc:
-                        logger.warning("Memory summary schedule failed after stream finished: %s", exc, exc_info=True)
-                        _safe_trace_add(
-                            trace,
-                            "memory_summary_update_schedule_failed",
-                            "_schedule_memory_summary_update",
-                            result={"error": str(exc)},
-                            note="长期记忆压缩调度失败，但不影响主回答完成。",
-                        )
-                    try:
-                        retrieval_trace["learning_trace"] = compact_trace_reference(trace.snapshot())
-                        assistant_message.retrieval_trace = json.dumps(retrieval_trace, ensure_ascii=False)
+                        db.add(assistant_message)
                         db.commit()
+                        db.refresh(assistant_message)
                     except Exception as exc:
                         db.rollback()
-                        logger.warning("Assistant trace reference update failed: %s", exc, exc_info=True)
-                _safe_trace_finish(
-                    trace,
-                    "done" if assistant_message else "partial",
-                    conversation_id=cid,
-                    message_id=assistant_message.id if assistant_message else None,
-                )
-                for payload in _trace_sse_payloads(trace):
-                    yield payload
-            elif failed:
-                _safe_trace_add(
-                    trace,
-                    "assistant_not_saved",
-                    "Message",
-                    result={"saved": False},
-                    note="回答生成失败，遵循项目规则：不把失败内容保存为正式 assistant 消息。",
-                )
-                _safe_trace_finish(trace, "failed", conversation_id=cid)
-                for payload in _trace_sse_payloads(trace):
-                    yield payload
-            db.close()
-            yield "data: [DONE]\n\n"
+                        logger.warning("Assistant message save failed after stream finished [trace_id=%s]: %s",
+                                       trace.trace_id, exc, exc_info=True)
+                        _safe_trace_add(
+                            trace,
+                            "assistant_save_failed",
+                            "Message",
+                            result={"error": ASSISTANT_SAVE_FAILED_MESSAGE, "trace_id": trace.trace_id},
+                            note="模型回答已经生成完毕，但保存 assistant 消息失败。系统仍会结束流，避免前端误报 network error。",
+                        )
+
+                    if assistant_message:
+                        _safe_trace_attach(trace, conversation_id=cid, message_id=assistant_message.id)
+                        _safe_trace_add(
+                            trace,
+                            "assistant_message_saved",
+                            "Message",
+                            creates={"assistant_message_id": assistant_message.id},
+                            result={"ragas_status": "pending" if need_rag else ""},
+                            note="assistant 消息保存成功，历史会话刷新后仍可从这条消息打开流程。",
+                        )
+                        if need_rag:
+                            try:
+                                schedule_ragas_evaluation(
+                                    assistant_message.id,
+                                    effective_question,
+                                    full,
+                                    retrieved_contexts,
+                                    trace.trace_id,
+                                )
+                                _safe_trace_add(
+                                    trace,
+                                    "ragas_scheduled",
+                                    "schedule_ragas_evaluation",
+                                    params={
+                                        "message_id": assistant_message.id,
+                                        "question": effective_question,
+                                        "answer_chars": len(full),
+                                        "contexts_count": len(retrieved_contexts),
+                                    },
+                                    note="RAGAS 在 assistant 保存后异步启动，不阻塞用户看到答案。",
+                                )
+                            except Exception as exc:
+                                logger.warning("RAGAS schedule failed after stream finished [trace_id=%s]: %s",
+                                               trace.trace_id, exc, exc_info=True)
+                                _safe_trace_add(
+                                    trace,
+                                    "ragas_schedule_failed",
+                                    "schedule_ragas_evaluation",
+                                    result={"error": RAGAS_SCHEDULE_FAILED_MESSAGE, "trace_id": trace.trace_id},
+                                    note="RAGAS 调度失败，但不影响主回答完成。",
+                                )
+                        else:
+                            _safe_trace_add(
+                                trace,
+                                "ragas_skipped",
+                                "schedule_ragas_evaluation",
+                                result={"need_rag": False, "reason": rag_gate.get("reason", "")},
+                                note="当前问题被路由为直答，因此不启动 RAGAS。",
+                            )
+                        try:
+                            _schedule_memory_summary_update(cid, trace.trace_id)
+                            _safe_trace_add(
+                                trace,
+                                "memory_summary_update_scheduled",
+                                "_schedule_memory_summary_update",
+                                params={"conversation_id": cid},
+                                note="系统异步检查长期记忆是否超过上限，若超过则进行二次摘要。",
+                            )
+                        except Exception as exc:
+                            logger.warning("Memory summary schedule failed after stream finished [trace_id=%s]: %s",
+                                           trace.trace_id, exc, exc_info=True)
+                            _safe_trace_add(
+                                trace,
+                                "memory_summary_update_schedule_failed",
+                                "_schedule_memory_summary_update",
+                                result={"error": MEMORY_SUMMARY_SCHEDULE_FAILED_MESSAGE, "trace_id": trace.trace_id},
+                                note="长期记忆压缩调度失败，但不影响主回答完成。",
+                            )
+                        try:
+                            retrieval_trace["learning_trace"] = compact_trace_reference(trace.snapshot())
+                            assistant_message.retrieval_trace = json.dumps(retrieval_trace, ensure_ascii=False)
+                            db.commit()
+                        except Exception as exc:
+                            db.rollback()
+                            logger.warning("Assistant trace reference update failed: %s", exc, exc_info=True)
+                    _safe_trace_finish(
+                        trace,
+                        "done" if assistant_message else "partial",
+                        conversation_id=cid,
+                        message_id=assistant_message.id if assistant_message else None,
+                    )
+                    for payload in _trace_sse_payloads(trace):
+                        yield payload
+                elif failed:
+                    _safe_trace_add(
+                        trace,
+                        "assistant_not_saved",
+                        "Message",
+                        result={"saved": False},
+                        note="回答生成失败，遵循项目规则：不把失败内容保存为正式 assistant 消息。",
+                    )
+                    _safe_trace_finish(trace, "failed", conversation_id=cid)
+                    for payload in _trace_sse_payloads(trace):
+                        yield payload
+                yield "data: [DONE]\n\n"
+            finally:
+                # 客户端断开时，Starlette 的 StreamingResponse 会取消正在跑流的任务，把
+                # CancelledError 抛进挂起的 yield（其它 ASGI 实现也可能用 aclose() → GeneratorExit）；
+                # CancelledError 与 GeneratorExit 都继承自 BaseException，外层 `except Exception`
+                # 兜不住，原先写在函数体末尾的收尾逻辑不会执行。只有放进 finally 才能保证
+                # 断连路径同样关闭会话、把 trace 落到终态。finally 中不得再 yield。
+                try:
+                    # 正常路径已把 status 写成 done/partial/failed，这里只兜断开等异常收尾。
+                    # 用 getattr：trace 是尽力而为的旁路记录，不能因为它缺字段而漏掉 db.close()。
+                    if getattr(trace, "status", None) == "running":
+                        _safe_trace_finish(trace, "failed", conversation_id=cid)
+                except Exception as exc:
+                    logger.warning("Learning trace teardown failed: %s", exc, exc_info=True)
+                finally:
+                    db.close()
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
     except Exception:

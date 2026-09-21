@@ -23,12 +23,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # npm 缓存命中会在日志里显示 "Cache restored from key: ..."。
       # package-lock.json 是 npm ci 的输入，缓存键跟着它走。
       - name: 安装 Node 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm

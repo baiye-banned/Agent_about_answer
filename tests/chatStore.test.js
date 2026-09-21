@@ -8,12 +8,14 @@ const stubSource = [
   'const conversationResolvers = []',
   'export const streams = []',
   'export const getMessagesCalls = []',
+  'export const getMessagesParams = []',
   'export const chatAPI = {',
   '  getConversations: () => new Promise((resolve) => conversationResolvers.push(resolve)),',
-  '  getMessages: (id) => new Promise((resolve, reject) => {',
+  '  getMessages: (id, params) => new Promise((resolve, reject) => {',
   '    getMessagesCalls.push(id)',
+  '    getMessagesParams.push(params)',
   '    const queue = pending.get(id) || []',
-  '    queue.push({ resolve, reject })',
+  '    queue.push({ resolve, reject, params })',
   '    pending.set(id, queue)',
   '  }),',
   '  deleteConversation: async () => {},',
@@ -22,11 +24,28 @@ const stubSource = [
   'export function respondConversations(list) {',
   '  conversationResolvers.splice(0).forEach((resolve) => resolve(list))',
   '}',
+  // 按后端语义切片：messages 传该会话的完整消息（id 升序），
+  // 这里按 limit / before_id 取「游标之前最新的 limit 条」，与真实接口一致，
+  // 才能验证前端发出的游标与页大小是否真的对得上。
+  'function resolveWithWindow(entry, messages) {',
+  '  const params = entry.params || {}',
+  '  const limit = params.limit == null ? 50 : params.limit',
+  '  let rows = messages',
+  '  if (params.before_id != null) rows = rows.filter((item) => item.id < params.before_id)',
+  '  entry.resolve(rows.slice(-limit))',
+  '}',
   'export function respond(id, messages) {',
   '  const queue = pending.get(id) || []',
   '  const entry = queue.shift()',
   '  pending.set(id, queue)',
-  '  if (entry) entry.resolve(messages)',
+  '  if (entry) resolveWithWindow(entry, messages)',
+  '}',
+  // 乱序返回用：解析该会话最后一个在途请求，模拟「先发出的请求后返回」。
+  'export function respondLatest(id, messages) {',
+  '  const queue = pending.get(id) || []',
+  '  const entry = queue.pop()',
+  '  pending.set(id, queue)',
+  '  if (entry) resolveWithWindow(entry, messages)',
   '}',
   'export function respondError(id, error) {',
   '  const queue = pending.get(id) || []',
@@ -81,7 +100,7 @@ globalThis.window = {
 
 const { createPinia, setActivePinia } = await import('pinia')
 const { useChatStore } = await import('../src/stores/chat.js')
-const { respond, respondError, respondConversations, resetStub, streams, getMessagesCalls } =
+const { respond, respondLatest, respondError, respondConversations, resetStub, streams, getMessagesCalls, getMessagesParams } =
   await import(chatApiStub)
 
 const conversation = (id, knowledgeBaseId = null) => ({
@@ -114,6 +133,7 @@ function createStore(conversations) {
   resetStub()
   streams.length = 0
   getMessagesCalls.length = 0
+  getMessagesParams.length = 0
   pollingStarts.length = 0
   pollingDelays.length = 0
   pollingStops.length = 0
@@ -804,4 +824,182 @@ test('消息合并：会话已切走时只返回合并结果，不写当前视�
 
   assert.equal(merged.length, 2) // 合并结果照常返回
   assert.deepEqual(contents(store), ['A 的问题']) // 但不改写已切走会话的视图
+})
+
+
+// ---- 会话消息分页（issue #61）：后端默认只返回一页，前端按需向前翻 ----
+// 桩里的 respond(id, messages) 传的是该会话的完整消息，按后端 limit/before_id 语义切片，
+// 因此这里的断言能真正约束「游标对不对、页大小对不对」，而不是只断言调用了接口。
+
+const PAGE = 50
+const FETCH = PAGE + 1 // 前端多取一条用于判断还有没有更早的消息
+
+const history = (count) =>
+  Array.from({ length: count }, (_, index) => message(index + 1, `第 ${index + 1} 条`))
+const ids = (store) => store.messages.map((item) => item.id)
+
+test('selectConversation 只请求最新一页并标记还有更早消息', async () => {
+  const store = createStore([conversation('a')])
+
+  const request = store.selectConversation('a')
+  respond('a', history(120))
+  await request
+
+  assert.deepEqual(getMessagesParams, [{ limit: FETCH }])
+  assert.deepEqual(ids(store), ids(store).slice(0, PAGE))
+  assert.equal(store.messages.length, PAGE)
+  assert.deepEqual(ids(store)[0], 71) // 最新一页：71..120
+  assert.equal(store.hasMoreMessages, true)
+})
+
+test('消息刚好等于一页时不再提示还有更早消息', async () => {
+  const store = createStore([conversation('a')])
+
+  const request = store.selectConversation('a')
+  respond('a', history(PAGE))
+  await request
+
+  assert.equal(store.messages.length, PAGE)
+  assert.equal(store.hasMoreMessages, false) // 51 条才说明还有更早的
+})
+
+test('loadOlderMessages 以最旧一条为游标向前翻页，翻完不重复不遗漏', async () => {
+  const store = createStore([conversation('a')])
+  const all = history(120)
+  const open = store.selectConversation('a')
+  respond('a', all)
+  await open
+
+  const first = store.loadOlderMessages()
+  respond('a', all)
+  await first
+
+  assert.deepEqual(getMessagesParams.at(-1), { limit: FETCH, before_id: 71 })
+  assert.deepEqual(ids(store), Array.from({ length: 100 }, (_, index) => index + 21))
+
+  const second = store.loadOlderMessages()
+  respond('a', all)
+  await second
+
+  assert.deepEqual(getMessagesParams.at(-1), { limit: FETCH, before_id: 21 })
+  assert.deepEqual(ids(store), Array.from({ length: 120 }, (_, index) => index + 1)) // 1..120 各一次
+  assert.equal(store.hasMoreMessages, false)
+})
+
+test('loadOlderMessages 取满一页时仍可继续向前翻', async () => {
+  const store = createStore([conversation('a')])
+  const all = history(200)
+  const open = store.selectConversation('a')
+  respond('a', all)
+  await open
+
+  const loading = store.loadOlderMessages()
+  respond('a', all)
+  await loading
+
+  assert.equal(store.messages.length, 100)
+  assert.equal(store.hasMoreMessages, true)
+})
+
+test('refreshMessages 不截断已翻出的更早历史，也不凭空点亮「还有更早」', async () => {
+  const store = createStore([conversation('a')])
+  const all = history(120)
+  const open = store.selectConversation('a')
+  respond('a', all)
+  await open
+  const loading = store.loadOlderMessages()
+  respond('a', all)
+  await loading
+  assert.deepEqual(ids(store), Array.from({ length: 100 }, (_, index) => index + 21))
+
+  const refreshing = store.refreshMessages('a')
+  respond('a', all)
+  await refreshing
+
+  assert.deepEqual(getMessagesParams.at(-1), { limit: FETCH })
+  assert.deepEqual(ids(store), Array.from({ length: 100 }, (_, index) => index + 21))
+  assert.equal(store.hasMoreMessages, true) // 仍停在第 21 条之前，可以继续往前翻
+})
+
+test('整段历史都已加载后，刷新不会重新点亮「加载更早的消息」', async () => {
+  const store = createStore([conversation('a')])
+  const all = history(120)
+  const open = store.selectConversation('a')
+  respond('a', all)
+  await open
+  for (const _ of [1, 2, 3]) {
+    const loading = store.loadOlderMessages()
+    respond('a', all)
+    await loading
+  }
+  assert.deepEqual(ids(store), Array.from({ length: 120 }, (_, index) => index + 1))
+  assert.equal(store.hasMoreMessages, false)
+
+  const refreshing = store.refreshMessages('a')
+  respond('a', all)
+  await refreshing
+
+  assert.equal(store.messages.length, 120)
+  assert.equal(store.hasMoreMessages, false) // 没有更早的消息了，按钮不该再出现
+})
+
+test('重新生成截断视图后，刷新重建窗口而不是在中间留空洞', async () => {
+  const store = createStore([conversation('a')])
+  const all = history(120)
+  const open = store.selectConversation('a')
+  respond('a', all)
+  await open
+  for (let round = 0; round < 2; round += 1) {
+    const loading = store.loadOlderMessages()
+    respond('a', all)
+    await loading
+  }
+  assert.deepEqual(ids(store), Array.from({ length: 120 }, (_, index) => index + 1))
+
+  // 重新生成：砍掉后半段，只留第 1 条（Chat.vue 的 regenerate 就是这么调用的）
+  store.replaceMessages(store.messages.slice(0, 1))
+  assert.deepEqual(ids(store), [1])
+
+  const refreshing = store.refreshMessages('a')
+  respond('a', all)
+  await refreshing
+
+  // 窗口重建为「最新一页」，而不是「[1] + 最新一页」这种中间断档、翻不回去的拼接
+  assert.deepEqual(ids(store), Array.from({ length: 50 }, (_, index) => index + 71))
+  assert.equal(store.hasMoreMessages, true)
+
+  // 从这个窗口继续往前翻，整段历史依然一条不少地可达
+  for (let round = 0; round < 2; round += 1) {
+    const loading = store.loadOlderMessages()
+    respond('a', all)
+    await loading
+  }
+  assert.deepEqual(ids(store), Array.from({ length: 120 }, (_, index) => index + 1))
+})
+
+test('请求期间切走又切回，迟到的刷新不截断新加载的历史', async () => {
+  const store = createStore([conversation('a'), conversation('b')])
+  const all = history(120)
+  const openA = store.selectConversation('a')
+  respond('a', all)
+  await openA
+  const firstPage = store.loadOlderMessages()
+  respond('a', all)
+  await firstPage
+  assert.deepEqual(ids(store), Array.from({ length: 100 }, (_, index) => index + 21))
+
+  // 会话 A 的收尾刷新在用户已经切走时发出（例如切走后旧流才收尾）
+  store.setCurrentId('b')
+  const refreshing = store.refreshMessages('a')
+  // 用户切回 A 并继续向前翻页
+  store.setCurrentId('a')
+  const loading = store.loadOlderMessages()
+  respondLatest('a', all) // 后发的翻页先返回
+  await loading
+  assert.deepEqual(ids(store), Array.from({ length: 120 }, (_, index) => index + 1))
+
+  respond('a', all) // 迟到的刷新这才返回
+  await refreshing
+
+  assert.deepEqual(ids(store), Array.from({ length: 120 }, (_, index) => index + 1))
 })

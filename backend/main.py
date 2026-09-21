@@ -2,9 +2,11 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.exc import IntegrityError
 
 from config import REBUILD_KNOWLEDGE_INDEX_ON_STARTUP, ensure_secret_key_configured
 from database.session import init_db
@@ -14,11 +16,13 @@ from router.chat import router as chat_router
 from router.checkpointer import router as checkpointer_router
 from router.knowledge import router as knowledge_router
 from router.user import router as user_router
-from service.knowledge_service import rebuild_existing_knowledge_index
+from service.knowledge_service import rebuild_existing_knowledge_index, run_ingest_step
 from service.user_service import seed_default_users
 
 
 logger = logging.getLogger(__name__)
+
+INTEGRITY_CONFLICT_MESSAGE = "数据冲突：本次操作与当前数据状态不一致，请重试。"
 
 
 @asynccontextmanager
@@ -27,7 +31,11 @@ async def lifespan(_app: FastAPI):
     init_db()
     seed_default_users()
     if REBUILD_KNOWLEDGE_INDEX_ON_STARTUP:
-        rebuild_existing_knowledge_index()
+        # 重建对每个历史文件同步向量化并写库，跑在**入库专用**线程池上；启动顺序不变
+        # （重建完成才接流量），但重建期间事件循环仍可调度其它协程。不设总时限：
+        # 重建按文件数逐个跑，没有「一份文档」的预算语义，逐文件的失败隔离已由
+        # rebuild_existing_knowledge_index 自己保证。
+        await run_ingest_step(rebuild_existing_knowledge_index)
     yield
 
 
@@ -40,6 +48,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+
+
+@app.exception_handler(IntegrityError)
+async def integrity_error_handler(request: Request, exc: IntegrityError):
+    """写路径未单独处理的唯一/外键冲突兜底成 409，不再冒成 500（issue #60 验收标准第 4 条）。
+
+    用户可见的知识库重名竞态已在 service 层翻译成带具体文案的 400，这里只兜住漏网者
+    （例如并发删除后仍被引用的写入），保证响应是可读的 4xx 而不是 Starlette 默认的 500。
+    """
+    logger.warning("Unhandled integrity error: %s %s", request.method, request.url.path, exc_info=exc)
+    return JSONResponse(status_code=409, content={"detail": INTEGRITY_CONFLICT_MESSAGE})
 
 
 @app.get("/")

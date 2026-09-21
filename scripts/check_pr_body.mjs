@@ -5,7 +5,9 @@
 
 import { readFileSync } from 'node:fs';
 
-// 去掉 HTML 注释与空白后，小节正文至少要有这么多字符，避免「无」「-」蒙混过关。
+import { countSubstantive, stripComments } from './lib/markdown_sanitize.mjs';
+
+// 去掉 HTML 注释与空白后，小节正文至少要有这么多个实质字符（汉字/字母/数字），避免「无」「-」蒙混过关。
 const MIN_LENGTH = 3;
 // _no response_ 是 GitHub issue 表单对空字段自动写入的占位文本，必须当作空。
 const EMPTY_VALUES = [
@@ -27,8 +29,6 @@ const stripPunctuation = (text) => text.replace(PUNCTUATION, '').toLowerCase();
 const PLACEHOLDER_WORDS = EMPTY_VALUES.map(stripPunctuation)
   .filter((word) => word.length > 0)
   .sort((a, b) => b.length - a.length);
-// 实质字符：汉字、字母、数字。emoji 与纯符号不算，避免「🐛✨📝」凑够长度。
-const SUBSTANTIVE = /[\p{L}\p{N}]/u;
 
 // 反复抠掉给定的词，直到没有可抠的为止；长词优先，避免被短词先切走。
 function removeWords(text, words) {
@@ -89,7 +89,7 @@ function declaresNoIssueWithReason(content) {
     removeWords(stripPunctuation(stripped), PLACEHOLDER_WORDS),
     REASON_FILLER_WORDS
   );
-  if (!SUBSTANTIVE.test(reason)) return false;
+  if (countSubstantive(reason) === 0) return false;
   return [...reason].length >= REASON_MIN_LENGTH;
 }
 
@@ -107,11 +107,9 @@ function usage(message) {
   process.exit(2);
 }
 
-// 去掉 HTML 注释，避免用 <!-- --> 占位当内容。
-function stripComments(markdown) {
-  return markdown.replace(/<!--[\s\S]*?-->/g, '');
-}
-
+// 注释消毒与字符计数都在 scripts/lib/markdown_sanitize.mjs：消毒只删「渲染时真的看不见」
+// 的注释，其余起始符只拔掉标记本身，长度也只数实质字符——两个方向都不会被构造文本
+// 糊弄（issue #97）。
 const normalizeTitle = (text) =>
   text
     .toLowerCase()
@@ -191,14 +189,13 @@ function cleanContent(content) {
 }
 
 // 占位内容即使写成列表项（`- 无`、`1. 无`）、多行（`- 无` + `- 待补充`）或带标点（`暂无。`）也算空；
-// 长度按码点算，避免两个字符的 emoji 凑够 UTF-16 长度蒙混过关。
+// 长度只数实质字符（汉字/字母/数字），纯符号、emoji、注释残留都凑不出长度。
 function isFilled(content) {
   const cleaned = cleanContent(content)
     .replace(/^\s*(?:[-*+]|\d+[.)])\s+/gm, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  if ([...cleaned].length < MIN_LENGTH) return false;
-  if (!SUBSTANTIVE.test(cleaned)) return false;
+  if (countSubstantive(cleaned) < MIN_LENGTH) return false;
   const normalized = stripPunctuation(cleaned);
   if (normalized.length === 0) return false;
   return !isOnlyPlaceholders(normalized);
@@ -247,7 +244,7 @@ for (const required of REQUIRED_SECTIONS) {
   }
   if (!isFilled(section.content)) {
     problems.push(
-      `「${required.label}」节内容过短或只有占位内容（至少 ${MIN_LENGTH} 个字符，且不能是「无」这类占位文本）。`
+      `「${required.label}」节内容过短或只有占位内容（至少 ${MIN_LENGTH} 个汉字/字母/数字，且不能是「无」这类占位文本）。`
     );
   }
 }

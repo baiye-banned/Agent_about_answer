@@ -38,7 +38,7 @@
             ref="uploadInputRef"
             type="file"
             class="hidden"
-            :accept="acceptTypes"
+            :accept="KNOWLEDGE_UPLOAD_ACCEPT"
             multiple
             @change="handleUploadInputChange"
           />
@@ -89,7 +89,7 @@
         >
           <el-icon :size="44" class="mb-3 text-brand-600"><Upload /></el-icon>
           <div class="text-base font-medium text-slate-700">点击上传知识文件</div>
-          <div class="mt-1 text-sm">支持 txt、md、json、csv、yaml、xml、log、pdf、docx，支持多选批量上传</div>
+          <div class="mt-1 text-sm">{{ KNOWLEDGE_UPLOAD_HINT }}</div>
         </div>
 
         <el-table
@@ -188,27 +188,29 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="detailVisible" :title="detailFile?.name || '文件详情'" width="760px" top="6vh">
-      <div v-if="detailFile" class="space-y-4">
+    <el-dialog v-model="detail.visible" :title="detail.file?.name || '文件详情'" width="760px" top="6vh">
+      <div v-if="detail.file" class="space-y-4">
         <div class="grid grid-cols-1 gap-3 text-sm md:grid-cols-2">
-          <div><span class="text-slate-500">文件名：</span>{{ detailFile.name }}</div>
-          <div><span class="text-slate-500">大小：</span>{{ formatSize(detailFile.size) }}</div>
-          <div><span class="text-slate-500">上传时间：</span>{{ formatTime(detailFile.created_at) }}</div>
-          <div><span class="text-slate-500">类型：</span>{{ getFileExt(detailFile.name) }}</div>
+          <div><span class="text-slate-500">文件名：</span>{{ detail.file.name }}</div>
+          <div><span class="text-slate-500">大小：</span>{{ formatSize(detail.file.size) }}</div>
+          <div><span class="text-slate-500">上传时间：</span>{{ formatTime(detail.file.created_at) }}</div>
+          <div><span class="text-slate-500">类型：</span>{{ getFileExt(detail.file.name) }}</div>
         </div>
 
         <el-divider />
 
         <div class="flex items-center justify-between">
           <span class="text-sm font-medium text-slate-700">内容预览</span>
-          <el-button size="small" :icon="CopyDocument" :disabled="!detailContent" @click="copyContent">
+          <el-button size="small" :icon="CopyDocument" :disabled="!detail.content" @click="copyContent">
             复制内容
           </el-button>
         </div>
 
         <div class="max-h-[420px] overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-4">
-          <el-skeleton v-if="contentLoading" :rows="6" animated />
-          <pre v-else class="m-0 whitespace-pre-wrap font-sans text-sm leading-6 text-slate-700">{{ detailContent || '暂无可预览内容' }}</pre>
+          <el-skeleton v-if="detail.loading" :rows="6" animated />
+          <!-- 读取失败与「真的没有内容」分开呈现：空态文案不能拿来解释一次失败的读取。 -->
+          <pre v-else-if="detail.error" class="m-0 whitespace-pre-wrap font-sans text-sm leading-6 text-red-600">{{ detail.error }}</pre>
+          <pre v-else class="m-0 whitespace-pre-wrap font-sans text-sm leading-6 text-slate-700">{{ detail.content || DETAIL_PREVIEW_EMPTY_TEXT }}</pre>
         </div>
       </div>
     </el-dialog>
@@ -216,7 +218,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   CopyDocument,
   Delete,
@@ -235,10 +237,25 @@ import { knowledgeAPI } from '@/api/knowledge'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import { confirmCenteredDelete } from '@/utils/confirm'
 import { copyText } from '@/utils/clipboard'
+import {
+  DETAIL_PREVIEW_EMPTY_TEXT,
+  createDetailPreview,
+  createDetailPreviewState,
+} from '@/utils/detailPreview'
+import { createFileListRequest } from '@/utils/fileListRequest'
 import { getApiErrorMessage } from '@/utils/httpError'
 import {
+  DELETE_SUCCEEDED,
+  KNOWLEDGE_UPLOAD_ACCEPT,
+  KNOWLEDGE_UPLOAD_HINT,
   describeBatchDeleteResult,
+  describeSkippedUploadFiles,
+  describeUploadFailure,
   describeUploadSuccess,
+  hasDeletedAnyFile,
+  partitionUploadFiles,
+  refreshAfterDelete,
+  runConfirmedDelete,
   uploadFilesInOrder,
 } from '@/utils/knowledgeFeedback'
 import { formatDateTime, formatFileSize } from '@/utils'
@@ -256,10 +273,6 @@ const uploadPercent = ref(0)
 const uploadInputRef = ref(null)
 const selectedFiles = ref([])
 
-const detailVisible = ref(false)
-const detailFile = ref(null)
-const detailContent = ref('')
-const contentLoading = ref(false)
 const knowledgeBaseDialogVisible = ref(false)
 const knowledgeBaseSubmitting = ref(false)
 const knowledgeBaseDialogMode = ref('create')
@@ -268,10 +281,32 @@ const knowledgeBaseInputRef = ref(null)
 const knowledgeBaseForm = reactive({
   name: '',
 })
+
+// 详情预览的状态放响应式容器，请求时序保护在 createDetailPreview 里：
+// 标题是同步切换的、正文来自异步响应，迟到的旧响应必须被丢弃（#63）。
+const detail = reactive(createDetailPreviewState())
+const { open: showDetail, close: closeDetail } = createDetailPreview({
+  state: detail,
+  // silent：详情读取失败只在预览区给出红字（模板里的 detail.error），
+  // 不再叠加 request.js 拦截器的顶部 toast。错误只提示一次（issue #83 第 9 项）。
+  fetchContent: (id) => knowledgeAPI.getContent(id, { silent: true }),
+})
+
+// 关闭弹窗（点 X / 按 ESC / 点遮罩，或任何把 visible 置回 false 的路径）都要作废在飞请求：
+// 关闭后到达的响应不得再写回正文。
+watch(
+  () => detail.visible,
+  (visible) => {
+    if (!visible) closeDetail()
+  }
+)
+
+// 卸载时同样要作废：离开页面后在飞的响应不得再写进已经卸载组件的状态对象（issue #83 第 9 项）。
+onBeforeUnmount(() => closeDetail())
+
 const knowledgeStore = useKnowledgeStore()
 const knowledgeBases = computed(() => knowledgeStore.knowledgeBases)
 
-const acceptTypes = '.txt,.md,.json,.csv,.yaml,.yml,.xml,.log,.pdf,.docx'
 const PICTURE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'])
 const ARCHIVE_EXTENSIONS = new Set(['zip', 'rar', '7z'])
 const knowledgeBaseRules = {
@@ -338,18 +373,24 @@ watch([filteredFiles, pageSize], () => {
   }
 })
 
+// 列表取数带请求时序守卫：切库时先发出、后返回的旧库响应不得覆盖当前库的列表
+// （issue #83 第 8 项）。守卫本体在 utils/fileListRequest.js，这里只负责接线。
+const fileList = createFileListRequest({
+  getKnowledgeBaseId: () => currentKnowledgeBaseId.value,
+  fetchList: (params) => knowledgeAPI.getList(params),
+  applyFiles: (files) => {
+    allFiles.value = files
+  },
+  applyLoading: (value) => {
+    loading.value = value
+  },
+})
+
+// 卸载时作废在飞的列表请求：响应不得再写进已卸载组件的状态对象（issue #83 第 9 项同款口径）。
+onBeforeUnmount(() => fileList.invalidate())
+
 async function fetchFiles() {
-  if (!currentKnowledgeBaseId.value) {
-    allFiles.value = []
-    return
-  }
-  loading.value = true
-  try {
-    const response = await knowledgeAPI.getList({ knowledge_base_id: currentKnowledgeBaseId.value })
-    allFiles.value = Array.isArray(response) ? response : []
-  } finally {
-    loading.value = false
-  }
+  return fileList.load()
 }
 
 async function initializeKnowledgeBases() {
@@ -477,17 +518,47 @@ function resetKnowledgeBaseDialog() {
   knowledgeBaseFormRef.value?.resetFields?.()
 }
 
+// 三个删除入口的错误提示统一走这里，与上传路径的 ElMessage.error 保持同一形态。
+function notifyDeleteError(message) {
+  ElMessage.error(message)
+}
+
 async function deleteKnowledgeBase() {
   const current = knowledgeBases.value.find((item) => item.id === currentKnowledgeBaseId.value)
   if (!current) return
-  const response = await confirmCenteredDelete(
-    `确定删除知识库「${current.name}」吗？该知识库下的资料会一并删除，已有对话将切换到其他知识库。`,
-    '删除知识库'
-  ).then(() => knowledgeAPI.deleteBase(current.id))
+
+  const { status, result } = await runConfirmedDelete({
+    confirm: () =>
+      confirmCenteredDelete(
+        `确定删除知识库「${current.name}」吗？该知识库下的资料会一并删除，已有对话将切换到其他知识库。`,
+        '删除知识库'
+      ),
+    // 与上传路径一致地用 silent 抑制拦截器提示，错误文案由本视图统一给出，避免弹两次。
+    remove: () => knowledgeAPI.deleteBase(current.id, { silent: true }),
+    notifyError: notifyDeleteError,
+  })
+  // 取消或失败都不参与成功分支：不提示成功、不切换当前知识库、不刷新。
+  // 失败时服务端状态未变，列表仍是真实的，用户可直接重试。
+  if (status !== DELETE_SUCCEEDED) return
+
   ElMessage.success('知识库已删除')
-  await fetchKnowledgeBases()
-  currentKnowledgeBaseId.value = response.fallback_knowledge_base_id || knowledgeBases.value[0]?.id || null
-  await fetchFiles()
+  // 刷新失败不能逃逸成未捕获拒绝，也不能让用户以为删除没成功。
+  await refreshAfterDelete({
+    refresh: async () => {
+      // 选中先落到删除响应给的 fallback 知识库，再刷侧栏列表（返工轮 minor-2）。
+      // 这个 id 来自**已成功的删除响应**（后端 delete_knowledge_base 必带 target.id），
+      // 不依赖这次刷新；放在 fetchKnowledgeBases() 之后就是整段等它——侧栏一失败，
+      // 选中仍停在刚被删掉的知识库上，后续上传/删除都会 404，提示却只说「请手动刷新页面」。
+      // 候选列表先剔掉刚删的那个：刷新没成功时手里的还是旧列表，不去掉就可能又选回它。
+      currentKnowledgeBaseId.value = resolveKnowledgeBaseId(
+        result.fallback_knowledge_base_id,
+        knowledgeBases.value.filter((item) => item.id !== current.id)
+      )
+      await fetchKnowledgeBases()
+      await fetchFiles()
+    },
+    notifyError: notifyDeleteError,
+  })
 }
 
 function handleSearch() {
@@ -521,23 +592,56 @@ async function handleUpload(files) {
   const validFiles = uploadFiles.filter(Boolean)
   if (!validFiles.length || !currentKnowledgeBaseId.value || uploading.value) return
 
+  // 白名单外的文件在选中阶段就跳过并点名，避免提交后被后端 400 拒绝、连带跳过同批合法文件。
+  const { supported, rejected } = partitionUploadFiles(validFiles)
+  if (rejected.length) {
+    ElMessage.warning(describeSkippedUploadFiles(rejected))
+  }
+  if (!supported.length) return
+
+  let failedIndex = -1
+  let attempted = 0
   uploading.value = true
   uploadPercent.value = 0
 
   try {
     await uploadFilesInOrder(
-      validFiles,
-      (file, onProgress) =>
-        knowledgeAPI.upload(file, currentKnowledgeBaseId.value, onProgress, { silent: true }),
+      supported,
+      async (file, onProgress) => {
+        const index = attempted
+        attempted += 1
+        try {
+          return await knowledgeAPI.upload(file, currentKnowledgeBaseId.value, onProgress, {
+            silent: true,
+          })
+        } catch (error) {
+          failedIndex = index
+          throw error
+        }
+      },
       (percent) => {
         uploadPercent.value = percent
       }
     )
 
-    ElMessage.success(describeUploadSuccess(validFiles.length))
+    ElMessage.success(describeUploadSuccess(supported.length))
     await refreshKnowledgeBaseAndFiles()
   } catch (error) {
-    ElMessage.error(getApiErrorMessage(error, '上传失败，请稍后重试'))
+    const reason = getApiErrorMessage(error, '上传失败，请稍后重试')
+    if (failedIndex < 0) {
+      ElMessage.error(reason)
+    } else {
+      // 首败即止：失败文件之后的同批文件都没有上传，提示里要说清楚；
+      // 选中阶段被跳过的文件同样没上传，一并如实交代。
+      ElMessage.error(
+        describeUploadFailure(
+          supported[failedIndex].name,
+          supported.length - failedIndex - 1,
+          reason,
+          rejected.length
+        )
+      )
+    }
   } finally {
     uploading.value = false
     uploadPercent.value = 0
@@ -550,20 +654,45 @@ function openUploadDialog() {
 }
 
 async function confirmDelete(file) {
-  await confirmCenteredDelete(`确定删除「${file.name}」吗？删除后不可恢复。`, '删除文件')
-  await knowledgeAPI.delete(file.id)
+  const { status } = await runConfirmedDelete({
+    confirm: () => confirmCenteredDelete(`确定删除「${file.name}」吗？删除后不可恢复。`, '删除文件'),
+    remove: () => knowledgeAPI.delete(file.id, { silent: true }),
+    notifyError: notifyDeleteError,
+  })
+  if (status !== DELETE_SUCCEEDED) return
+
   ElMessage.success('删除成功')
-  await refreshKnowledgeBaseAndFiles()
+  await refreshAfterDelete({
+    refresh: refreshKnowledgeBaseAndFiles,
+    notifyError: notifyDeleteError,
+  })
 }
 
 async function confirmBatchDelete() {
   if (!selectedFiles.value.length) return
-  await confirmCenteredDelete(`确定删除选中的 ${selectedFiles.value.length} 个资料吗？删除后不可恢复。`, '批量删除资料')
-  const result = await knowledgeAPI.batchDelete(selectedFiles.value.map((file) => file.id), { silent: true })
+
+  const { status, result } = await runConfirmedDelete({
+    confirm: () =>
+      confirmCenteredDelete(
+        `确定删除选中的 ${selectedFiles.value.length} 个资料吗？删除后不可恢复。`,
+        '批量删除资料'
+      ),
+    remove: () => knowledgeAPI.batchDelete(selectedFiles.value.map((file) => file.id), { silent: true }),
+    notifyError: notifyDeleteError,
+  })
+  if (status !== DELETE_SUCCEEDED) return
+
   const feedback = describeBatchDeleteResult(result)
   ElMessage[feedback.type](feedback.message)
+
+  // 整批失败时也要保留选中状态：此时删掉 0 个，服务端没有变化，用户可直接重试。
+  if (!hasDeletedAnyFile(result)) return
+
   selectedFiles.value = []
-  await refreshKnowledgeBaseAndFiles()
+  await refreshAfterDelete({
+    refresh: refreshKnowledgeBaseAndFiles,
+    notifyError: notifyDeleteError,
+  })
 }
 
 async function refreshKnowledgeBaseAndFiles() {
@@ -571,22 +700,8 @@ async function refreshKnowledgeBaseAndFiles() {
   await fetchFiles()
 }
 
-async function showDetail(file) {
-  detailFile.value = file
-  detailContent.value = ''
-  detailVisible.value = true
-  contentLoading.value = true
-
-  try {
-    const response = await knowledgeAPI.getContent(file.id)
-    detailContent.value = response.content || ''
-  } finally {
-    contentLoading.value = false
-  }
-}
-
 async function copyContent() {
-  await copyText(detailContent.value, {
+  await copyText(detail.content, {
     successMessage: '已复制到剪贴板',
     failureMessage: '复制失败，请手动选择内容',
   })

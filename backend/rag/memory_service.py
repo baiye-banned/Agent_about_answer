@@ -19,6 +19,10 @@ from service.utils_service import _clip_text
 
 logger = logging.getLogger(__name__)
 
+# 轨迹事件会经 get_chat_trace/get_message_trace 回查给用户，因此只放固定文案；
+# 异常原文由上面的 logger.warning(..., exc_info=True) 留在服务端。
+MEMORY_SUMMARY_UPDATE_FAILED_MESSAGE = "长期记忆更新失败"
+
 
 async def _build_recent_memory_text(
     db: Session,
@@ -239,7 +243,7 @@ async def _update_memory_summary_from_sliding_window(conversation_id: str, trace
             trace_id,
             "memory_summary_update_failed",
             "_update_memory_summary_from_sliding_window",
-            result={"error": str(exc)},
+            result={"error": MEMORY_SUMMARY_UPDATE_FAILED_MESSAGE},
             note="滑出窗口长期记忆更新失败，但不会影响主回答完成。",
         )
     finally:

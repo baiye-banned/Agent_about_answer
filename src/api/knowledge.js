@@ -13,14 +13,16 @@ export const knowledgeAPI = {
   renameBase(id, name, config = {}) {
     return request.put(`/knowledge-bases/${id}`, { name }, config)
   },
-  deleteBase(id) {
-    return request.delete(`/knowledge-bases/${id}`)
+  deleteBase(id, config = {}) {
+    return request.delete(`/knowledge-bases/${id}`, config)
   },
   getDetail(id) {
     return request.get(`/knowledge/${id}`)
   },
-  getContent(id) {
-    return request.get(`/knowledge/${id}/content`)
+  getContent(id, config = {}) {
+    // config 透传：详情预览用 { silent: true } 抑制拦截器的顶部提示，
+    // 失败文案只由预览区给出，避免同一次失败提示两遍。
+    return request.get(`/knowledge/${id}/content`, config)
   },
   upload(file, knowledgeBaseId, onProgress, config = {}) {
     const formData = new FormData()

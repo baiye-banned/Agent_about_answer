@@ -104,8 +104,36 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v4")
 EMBEDDING_DIM = _env_int("EMBEDDING_DIM", 1024)
 # Single embedding request timeout, in seconds. Retrieval issues up to 9 route
 # queries per round, so a 60s default can stall the whole round; keep it at
-# online-QA scale and let deployments raise it for bulk ingestion.
+# online-QA scale. Bulk ingestion has its own budget below and ignores this one.
 EMBEDDING_TIMEOUT_SECONDS = _env_int("EMBEDDING_TIMEOUT_SECONDS", 10)
+
+# Bulk ingestion splits a whole document into several embedding requests instead of
+# sending every chunk at once. Two limits apply, whichever binds first: chunk count
+# and character count. chunk_text caps a chunk at ~1200 characters, so the character
+# limit usually binds first (60000 / 1200 = 50 chunks per request).
+EMBEDDING_INGEST_BATCH_SIZE = _env_int("EMBEDDING_INGEST_BATCH_SIZE", 64)
+EMBEDDING_INGEST_BATCH_MAX_CHARS = _env_int("EMBEDDING_INGEST_BATCH_MAX_CHARS", 60000)
+
+# Bulk ingestion keeps its own timeout instead of sharing the online-QA one above.
+# A batch carries up to 64 chunks / 60000 characters in a single round trip, so the
+# budget scales 6x from the single-query one, and ingestion now runs on a worker
+# thread -- a slow batch no longer freezes the event loop. Raising it further only
+# extends how long one stuck batch holds a thread-pool slot.
+EMBEDDING_INGEST_TIMEOUT_SECONDS = _env_int("EMBEDDING_INGEST_TIMEOUT_SECONDS", 60)
+
+# Ingestion runs on a thread pool of its own rather than the asyncio default
+# executor that retrieval shares. A round of retrieval fans out up to nine
+# concurrent recalls through asyncio.to_thread; without the split, uploads that
+# fill the default pool queue every recall behind them. Keep this pool small --
+# it bounds how many uploads can hold an embedding connection at once.
+KNOWLEDGE_INDEX_MAX_WORKERS = _env_int("KNOWLEDGE_INDEX_MAX_WORKERS", 4)
+
+# Whole-document budget for one upload's ingest. EMBEDDING_INGEST_TIMEOUT_SECONDS
+# above only caps a single batch; a document is split into several batches, so
+# without a total budget one upload can hold an ingest slot indefinitely. The
+# budget is measured from the start of the upload and shared by every step of
+# that document (parse, chunk, embed), not restarted per step.
+KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS = _env_int("KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS", 300)
 
 # Dedicated reranker for retrieved chunks.
 RERANK_PROVIDER = os.getenv("RERANK_PROVIDER", "dashscope")

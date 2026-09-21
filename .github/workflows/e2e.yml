@@ -83,18 +83,18 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Python 版本来源：仓库根目录 runtime.txt（与 python-tests.yml 保持一致）。
       - name: 安装 Python 3.10
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.10"
           cache: pip
           cache-dependency-path: backend/requirements.txt
 
       - name: 安装 Node 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -111,9 +111,15 @@ jobs:
 
       # 每次运行现场生成签名密钥：SECRET_KEY 留空或仍是仓库里的公开占位值时后端拒绝启动
       # （backend/config.py），而把它写进 workflow 等于往公开仓库里提交一个可用密钥。
-      # 生成的值只进本次运行的进程环境，不落盘、不打进日志。
+      # 写入环境之前必须先注册 ::add-mask::：写进 $GITHUB_ENV 的值会被 runner 当作后续
+      # 每个步骤 env 块的一部分回显到运行日志里，原始写法等于把密钥明文打进公开日志。
+      # 掩码后日志中显示为 ***，后续步骤读到的仍是真实值，后端启动不受影响。
       - name: 生成一次性 SECRET_KEY
-        run: echo "SECRET_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+        run: |
+          set -euo pipefail
+          key="$(openssl rand -hex 32)"
+          echo "::add-mask::$key"
+          echo "SECRET_KEY=$key" >> "$GITHUB_ENV"
 
       # 分片间隔刻意放大（1200ms × 8 字符）：用例要能稳定观察到「生成中」这一帧，
       # 并断言此时答案尚未完整 —— 太快的话前端已经渲染完，这条断言就失去意义。
@@ -199,7 +205,7 @@ jobs:
 
       - name: 上传 e2e 产物
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-artifacts
           path: tests/e2e/artifacts/

@@ -1,8 +1,10 @@
 import hashlib
 import logging
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Iterator, Optional
 
 import httpx
 import numpy as np
@@ -11,6 +13,9 @@ from config import (
     EMBEDDING_API_KEY,
     EMBEDDING_BASE_URL,
     EMBEDDING_DIM,
+    EMBEDDING_INGEST_BATCH_MAX_CHARS,
+    EMBEDDING_INGEST_BATCH_SIZE,
+    EMBEDDING_INGEST_TIMEOUT_SECONDS,
     EMBEDDING_MODEL,
     EMBEDDING_TIMEOUT_SECONDS,
     MILVUS_COLLECTION_NAME,
@@ -69,6 +74,12 @@ class EmbeddingBackendError(RuntimeError):
     """
 
 
+# 用户可见轨迹里的向量化失败文案：`_embedding_failure` 拼出的原文含上游 embedding 服务
+# 地址与原始异常，进 `retrieval_trace` 后随消息历史响应体到达用户，因此只在写入轨迹的
+# 副本上收敛；「当前是否可用」由 `mode` 字段如实表达，排障靠服务端日志。
+EMBEDDING_UNAVAILABLE_MESSAGE = "向量化服务暂时不可用，本次未使用语义向量召回。"
+
+
 class _HashEmbeddingFunction:
     """Local development embedding used only when no embedding API is configured."""
 
@@ -120,6 +131,27 @@ def _embedding_failure(message: str) -> EmbeddingBackendError:
     return EmbeddingBackendError(message)
 
 
+# 入库与检索的超时预算分开：检索保持在线问答量级，入库按批放大。
+# 覆盖值放在 ContextVar 而不是模块全局：并发上传各自跑在 to_thread 工作线程里，
+# asyncio.to_thread 会把调用方的上下文复制进工作线程，覆盖因此只跟随当前入库调用，
+# 不会串到同一进程里并发的检索请求上。
+_ingest_timeout_override: ContextVar[Optional[int]] = ContextVar("_embedding_ingest_timeout", default=None)
+
+
+@contextmanager
+def _ingest_embedding_timeout():
+    token = _ingest_timeout_override.set(EMBEDDING_INGEST_TIMEOUT_SECONDS)
+    try:
+        yield
+    finally:
+        _ingest_timeout_override.reset(token)
+
+
+def _embedding_timeout_seconds() -> int:
+    override = _ingest_timeout_override.get()
+    return EMBEDDING_TIMEOUT_SECONDS if override is None else override
+
+
 class _OpenAICompatibleEmbeddingFunction:
     def __call__(self, texts: list[str]) -> list[list[float]]:
         if not _embedding_configured():
@@ -139,7 +171,7 @@ class _OpenAICompatibleEmbeddingFunction:
             "dimensions": EMBEDDING_DIM,
         }
         try:
-            with httpx.Client(timeout=EMBEDDING_TIMEOUT_SECONDS) as client:
+            with httpx.Client(timeout=_embedding_timeout_seconds()) as client:
                 response = client.post(url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
@@ -247,6 +279,62 @@ def embedding_backend_status() -> dict:
     }
 
 
+def embedding_trace_status(status: dict) -> dict:
+    """把 `embedding_backend_status()` 的结果收敛成可进用户可见轨迹的副本。
+
+    `last_error` 是 `_embedding_failure()` 拼的原文（上游 embedding 地址 + 原始异常），
+    它会经 `retrieval_trace`（`retrieval.py` 与 `chat_service.py` 两处写入）落到 assistant
+    消息，再由 `GET /api/chat/conversations/{cid}` 原样返回给用户；`_embedding_state` 是
+    进程级状态，未命中该次失败的用户也会拿到它。这里只改副本，`embedding_backend_status()`
+    的返回值保持原文不变——那是状态接口的诊断面，且由 `tests/test_milvus_client.py` 锁定。
+    """
+    masked = dict(status)
+    if masked.get("last_error"):
+        masked["last_error"] = EMBEDDING_UNAVAILABLE_MESSAGE
+    return masked
+
+
+def _embedding_batches(texts: list[str]) -> Iterator[list[str]]:
+    """按条数与字符数双上限切分待向量化文本，先到者生效。
+
+    单条文本自身超过字符上限时独占一批：切片是检索的最小单位，再切会改变检索语义。
+    """
+    batch_size = max(1, EMBEDDING_INGEST_BATCH_SIZE)
+    max_chars = max(1, EMBEDDING_INGEST_BATCH_MAX_CHARS)
+    batch: list[str] = []
+    batch_chars = 0
+    for text in texts:
+        if batch and (len(batch) >= batch_size or batch_chars + len(text) > max_chars):
+            yield batch
+            batch, batch_chars = [], 0
+        batch.append(text)
+        batch_chars += len(text)
+    if batch:
+        yield batch
+
+
+def _embed_documents(documents: list[str]) -> list[list[float]]:
+    """整份文档分批向量化：每批一次请求，共用入库超时预算。
+
+    任一批失败即抛出 EmbeddingBackendError，已算出的向量不会写库，
+    调用方据此回滚——旧索引保持原样，不会留下「删了旧的、没写新的」的空洞。
+    """
+    embeddings: list[list[float]] = []
+    batches = 0
+    with _ingest_embedding_timeout():
+        for batch in _embedding_batches(documents):
+            embeddings.extend(_embedding_fn(batch))
+            batches += 1
+    logger.info(
+        "Ingest embedding completed: chunks_count=%s batches=%s batch_size_limit=%s batch_chars_limit=%s",
+        len(documents),
+        batches,
+        EMBEDDING_INGEST_BATCH_SIZE,
+        EMBEDDING_INGEST_BATCH_MAX_CHARS,
+    )
+    return embeddings
+
+
 def add_chunks(chunks: list[dict], file_id: int, file_name: str, knowledge_base_id: int):
     client = _ensure_collection()
     if not chunks:
@@ -255,7 +343,7 @@ def add_chunks(chunks: list[dict], file_id: int, file_name: str, knowledge_base_
         return
     documents = [chunk["text"] for chunk in chunks]
     # 先取向量再删旧数据：向量化失败时抛错，旧索引保持原样，由调用方回滚。
-    embeddings = _embedding_fn(documents)
+    embeddings = _embed_documents(documents)
     _delete_file_chunks(client, file_id)
     rows = [
         {
