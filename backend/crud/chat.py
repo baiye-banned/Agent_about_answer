@@ -58,10 +58,14 @@ def list_messages(
 
     游标用自增主键而不是 created_at：created_at 是秒级 DATETIME，同一秒内的消息按它排序
     不稳定，翻页会重复或漏行。先倒序取下 limit 条再反转，取到的就是 cursor 之前最新的那页。
+
+    页大小在这里兜底夹取（而不是只依赖服务层的 422 校验）：CRUD 是更底层的入口，脚本或内部
+    调用可能绕开接口层，负值在 SQLite 上等价于「不设上限」，会把整段历史一次读出来。
     """
     conversation = get_conversation(db, cid, user_id)
     if not conversation:
         return None
+    limit = CHAT_MESSAGE_DEFAULT_LIMIT if limit is None else max(1, min(limit, CHAT_MESSAGE_MAX_LIMIT))
     query = db.query(Message).filter(Message.conversation_id == cid)
     if before_id is not None:
         query = query.filter(Message.id < before_id)
