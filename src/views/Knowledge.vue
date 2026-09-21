@@ -386,6 +386,9 @@ const fileList = createFileListRequest({
   },
 })
 
+// 卸载时作废在飞的列表请求：响应不得再写进已卸载组件的状态对象（issue #83 第 9 项同款口径）。
+onBeforeUnmount(() => fileList.invalidate())
+
 async function fetchFiles() {
   return fileList.load()
 }

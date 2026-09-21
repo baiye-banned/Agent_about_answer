@@ -52,6 +52,10 @@ test('文件列表取数接在带时序守卫的 loader 上（第 8 项）', () 
   assert.ok(VIEW.includes('return fileList.load()'))
   // 修复前 fetchFiles 直接写 allFiles，没有任何时序标识。
   assert.ok(!VIEW.includes('allFiles.value = Array.isArray(response) ? response : []'))
+  // 守卫里的 invalidate() 必须真的有调用方：卸载时作废在飞的列表请求，
+  // 否则它只是「写了没人用」的装饰（对抗评审指出的静态漏接）。
+  assert.equal((VIEW.match(/fileList\.invalidate\(\)/g) || []).length, 1)
+  assert.ok(VIEW.includes('onBeforeUnmount(() => fileList.invalidate())'))
 })
 
 test('详情预览：卸载作废在飞请求，失败只提示一次（第 9 项）', () => {
