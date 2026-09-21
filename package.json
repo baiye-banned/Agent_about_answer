@@ -27,7 +27,7 @@
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.9",
     "vite": "^6.4.3",
-    "tailwindcss": "^3.4.0",
+    "tailwindcss": "^4.3.3",
     "postcss": "^8.5.23",
     "autoprefixer": "^10.6.1",
     "unplugin-auto-import": "^21.1.0",
