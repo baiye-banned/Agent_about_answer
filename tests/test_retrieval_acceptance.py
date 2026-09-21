@@ -12,7 +12,10 @@ provider boundary stubbed:
   end of this file by driving the unpatched implementation against a real SQLAlchemy
   database holding real ``KnowledgeFile`` rows;
 * the rerank HTTP call is replaced by an in-process transport, while the real
-  ``rerank_chunks`` / ``select_final_chunks`` logic under test stays untouched.
+  ``rerank_chunks`` / ``select_final_chunks`` logic under test stays untouched;
+* in the query-planning cases below, only the planner's model call (``call_chat_json``) is
+  replaced, so ``build_query_plan`` normalization, the deterministic keyword fallback and
+  the keyword terms handed to the keyword route all run for real.
 
 No network access is required.
 """
@@ -413,6 +416,107 @@ def test_acceptance_rerank_candidate_window_is_capped(monkeypatch):
     assert captured[0]["json"]["top_n"] == RETRIEVAL_RERANK_TOP_N
     assert [item["chunk_id"] for item in trace["rrf"]] == [f"m{index}" for index in range(10)]
     assert [item["chunk_id"] for item in final] == [f"m{index}" for index in range(RETRIEVAL_RERANK_TOP_N)]
+
+
+# ---------------------------------------------------------------------------
+# Query planning: plan production, and the keyword terms it feeds the chain
+#
+# The cases above hand ``retrieve_knowledge`` a ready-made plan, so the planner itself is
+# never invoked there. These cases drive ``build_query_plan`` against the planner's model
+# boundary (``call_chat_json``) only, and then check that the keyword terms derived from a
+# plan are the ones the keyword route actually searches for.
+# ---------------------------------------------------------------------------
+
+
+def test_acceptance_query_plan_normalizes_and_caps_the_planner_output(monkeypatch):
+    seen = {}
+
+    async def fake_call_chat_json(system_prompt, user_prompt, **kwargs):
+        seen["user"] = user_prompt
+        return {
+            "hyde_document": "  员工迟到超过30分钟按旷工处理。  ",
+            "rewrites": ["迟到扣多少钱", "   ", "迟到处罚标准", "迟到申诉流程", "多余的改写应被截断"],
+            "keywords": ["迟到", "   ", "旷工", "迟到"],
+        }
+
+    monkeypatch.setattr(retrieval, "call_chat_json", fake_call_chat_json)
+
+    plan = asyncio.run(retrieval.build_query_plan("迟到扣钱"))
+
+    assert "迟到扣钱" in seen["user"]
+    assert plan["error"] == ""
+    # The hypothesis document is stripped, and the rewrite list is cleaned (blank entries
+    # dropped) before the three-rewrite cap applies.
+    assert plan["hyde_document"] == "员工迟到超过30分钟按旷工处理。"
+    assert plan["rewrites"] == ["迟到扣多少钱", "迟到处罚标准", "迟到申诉流程"]
+    # Plan keywords keep their order and lose the blanks and duplicates, then the
+    # deterministic keywords of the question are merged in behind them.
+    assert plan["keywords"] == ["迟到", "旷工", "迟到扣钱", "到扣", "扣钱"]
+
+    # The merged keyword list is capped, and the cap keeps the earliest terms.
+    async def many_keywords(*_args, **_kwargs):
+        return {"keywords": [f"关键词{index}" for index in range(30)]}
+
+    monkeypatch.setattr(retrieval, "call_chat_json", many_keywords)
+
+    capped = asyncio.run(retrieval.build_query_plan("迟到扣钱"))
+
+    assert capped["keywords"] == [f"关键词{index}" for index in range(24)]
+
+
+def test_acceptance_query_plan_failure_still_yields_usable_keywords(monkeypatch):
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError("planner unreachable")
+
+    monkeypatch.setattr(retrieval, "call_chat_json", boom)
+
+    plan = asyncio.run(retrieval.build_query_plan("迟到扣钱"))
+
+    assert plan["hyde_document"] == ""
+    assert plan["rewrites"] == []
+    assert plan["error"]
+    # A failed plan must not take the keyword route down with it: the deterministic
+    # extractor still produces query terms for the question.
+    assert plan["keywords"] == ["迟到", "迟到扣钱", "到扣", "扣钱"]
+
+
+def test_acceptance_fallback_keywords_extract_numeric_phrases_and_terms():
+    keywords = retrieval._fallback_keywords("迟到30分钟以内罚款50元怎么处理")
+
+    # Numeric policy phrases are matched as whole phrases, ahead of the single terms.
+    assert keywords[:2] == ["30分钟以内", "50元"]
+    assert "迟到" in keywords
+    assert "罚款" in keywords
+
+
+def test_acceptance_fallback_keywords_expand_short_chinese_tokens():
+    keywords = retrieval._fallback_keywords("迟到扣钱")
+
+    # A whole-token hit alone would miss the sub-phrases a user actually types, so short
+    # Chinese tokens also contribute their adjacent bigrams.
+    assert keywords == ["迟到", "迟到扣钱", "到扣", "扣钱"]
+
+
+def test_acceptance_plan_keywords_reach_the_keyword_route(monkeypatch):
+    calls = _install_recall(monkeypatch, {})
+    _install_rerank_transport(monkeypatch, _score_by_content({}))
+    plan = {
+        "original_question": "迟到扣钱",
+        "simplified_question": "迟到扣钱",
+        "keywords": ["旷工"],
+        "required_evidence": ["罚款"],
+    }
+
+    _retrieve(question="迟到扣钱", plan=plan)
+
+    keyword_call = next(call for call in calls if call["route"] == "keyword")
+    # The plan's keywords come first, then the deterministic keywords of the raw question
+    # (merged in while the plan is normalized), then the plan's required evidence.
+    # Duplicates collapse in place, which is why the question's terms are not repeated
+    # when the chain merges them a second time.
+    assert keyword_call["query"] == ["旷工", "迟到", "迟到扣钱", "到扣", "扣钱", "罚款"]
+    assert keyword_call["knowledge_base_id"] == 7
+    assert keyword_call["top_k"] == RETRIEVAL_ROUTE_TOP_K
 
 
 # ---------------------------------------------------------------------------
