@@ -425,10 +425,18 @@ def _missing_line_occurrences(source: str, chunks: list[dict]) -> int:
 
     按出现次数而不是「这一行在不在库里」计：制度文档大量重复同一句话，
     只要有一行进过库，按存在性判会显示「没丢」，掩盖掉其余几十行。
+
+    比较前先去掉所有空白：_semantic_units 会把相邻的正文行用空格并成一个单元
+    （`" ".join(body_buffer)`），行是被重新折行、不是被丢；按原样逐行比会把
+    「折过行」误判成「丢了行」。去空白后这层差异消失，而一整行正文的去空白文本
+    足够长且互不相同，不会退化成随便就能命中的子串。
     """
-    joined = "\n".join(chunk["text"] for chunk in chunks)
+    def squeeze(value: str) -> str:
+        return "".join(value.split())
+
+    emitted = squeeze("\n".join(chunk["text"] for chunk in chunks))
     lines = [line for line in source.split("\n") if line.strip()]
-    return sum(max(0, lines.count(line) - joined.count(line)) for line in set(lines))
+    return sum(max(0, lines.count(line) - emitted.count(squeeze(line))) for line in set(lines))
 
 
 # 返工轮 major-1 的四种混合形状。编号短语正文行都只占少数（丢字不到一半），
