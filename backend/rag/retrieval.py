@@ -371,7 +371,9 @@ def _sql_case_foldable(keyword: str) -> bool:
 
 
 def _escape_like_char(char: str) -> str:
-    if char == LIKE_ESCAPE or char in {"%", "_"}:
+    # 反斜杠一并转义：MySQL 的习惯是把 \ 当默认转义符，`\%` 会被当成字面百分号，
+    # 正好会把我插入的通配符吃掉（预筛变窄、可能漏召回）。
+    if char == LIKE_ESCAPE or char in {"%", "_", "\\"}:
         return LIKE_ESCAPE + char
     return char
 

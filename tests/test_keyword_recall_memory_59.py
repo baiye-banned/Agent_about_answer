@@ -355,6 +355,23 @@ def test_keyword_recall_matches_keyword_split_by_whitespace(tmp_path):
     assert {chunk["file_name"] for chunk in chunks} == {"跨空格.txt", "跨换行.txt", "跨全角空格.txt"}
 
 
+def test_keyword_recall_handles_like_metacharacters_in_keywords(tmp_path):
+    """关键词里的 ``%``/``_``/``!``/``\\`` 不能改变预筛语义（转义后仍是必要条件）。"""
+    _, db = _new_db(tmp_path)
+    _add_files(
+        db,
+        [
+            ("百分号.txt", "报销比例 100% 以内的部分由公司承担。"),
+            ("下划线.txt", "字段 kb_id 与 kbXid 都要登记。"),
+            ("反斜杠.txt", "路径 C:\\制度\\考勤 下的文件需要归档。"),
+            ("感叹号.txt", "注意！迟到要扣钱。"),
+            ("无关.txt", "发票需要在30天内提交。"),
+        ],
+    )
+    for keywords in [["100%"], ["kb_id"], ["kbXid"], ["C:\\制度"], ["！迟到"], ["%"], ["_"], ["\\"]]:
+        _assert_matches_legacy(db, keywords, 8)
+
+
 def test_keyword_recall_does_not_leak_other_knowledge_bases(tmp_path):
     _, db = _new_db(tmp_path)
     _add_files(db, [("本库.txt", ATTENDANCE)], knowledge_base_id=KB)
