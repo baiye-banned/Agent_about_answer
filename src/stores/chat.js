@@ -6,11 +6,30 @@ import { RAGAS_STATUS, isPendingRagasStatus } from '@/utils/ragasStatus'
 const EVALUATION_POLL_INTERVAL_MS = 3000
 const EVALUATION_POLL_TIMEOUT_MS = 190000
 
+// 会话消息分页：与后端 CHAT_MESSAGE_DEFAULT_LIMIT / CHAT_MESSAGE_MAX_LIMIT 保持一致。
+// 后端一次最多返回 MESSAGE_PAGE_SIZE 条，UI 先展示最新一页，再按需向前翻。
+const MESSAGE_PAGE_SIZE = 50
+// 取页时多要一条：用「是否多出来」判断还有没有更早的消息。
+// 只取一页时无法区分「正好取满」和「已经取完」，会给出一个点了没反应的按钮。
+const MESSAGE_FETCH_LIMIT = MESSAGE_PAGE_SIZE + 1
+
+// 把「最新 N+1 条」切成「页面」与「还有更早」：后端按旧 -> 新返回，
+// 多出来的那条是最旧的一条，丢掉它，剩下正好一页。
+function splitPage(rows) {
+  const hasMore = rows.length > MESSAGE_PAGE_SIZE
+  return {
+    page: hasMore ? rows.slice(rows.length - MESSAGE_PAGE_SIZE) : rows,
+    hasMore,
+  }
+}
+
 export const useChatStore = defineStore('chat', () => {
   const conversations = ref([])
   const currentId = ref(null)
   const messages = ref([])
   const loading = ref(false)
+  const hasMoreMessages = ref(false)
+  const loadingOlderMessages = ref(false)
   const historyManageMode = ref(false)
   const selectedConversationIds = ref([])
 
@@ -31,6 +50,8 @@ export const useChatStore = defineStore('chat', () => {
   // 避免陈旧响应覆盖当前会话。
   let loadSeq = 0
   let streamSeq = 0
+  // 消息窗口是否被截断过（replaceMessages 砍掉后半段），见 refreshMessages 的重建分支。
+  let windowTruncated = false
   // 视图世代：用户显式清空会话视图（新建对话 / 删除会话）时递增。在途流据此放弃「认领新建会话」，
   // 否则用户已经开了新对话，旧流收尾还会把他拽回原会话。
   let viewEpoch = 0
@@ -78,9 +99,14 @@ export const useChatStore = defineStore('chat', () => {
     currentId.value = id
     loading.value = true
     try {
-      const response = await chatAPI.getMessages(id)
+      // 只取最新一页：历史由 loadOlderMessages 按需向前翻，避免一次拉回整段会话。
+      const response = await chatAPI.getMessages(id, { limit: MESSAGE_FETCH_LIMIT })
       if (!isLatestLoad(seq, id)) return
-      messages.value = Array.isArray(response) ? response.map(normalizeMessage) : []
+      const rows = Array.isArray(response) ? response.map(normalizeMessage) : []
+      const { page, hasMore } = splitPage(rows)
+      messages.value = page
+      hasMoreMessages.value = hasMore
+      windowTruncated = false
       const conversation = conversations.value.find((item) => item.id === id)
       if (conversation?.knowledge_base_id) {
         selectedKnowledgeBaseId.value = conversation.knowledge_base_id
@@ -95,12 +121,41 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  // 向前翻页：以当前最旧一条的 id 作游标，把更早的一页拼到列表头部。
+  // 后端按 id 游标返回，翻页不会重复也不会漏；取不满一页即说明已经到最早一条。
+  async function loadOlderMessages() {
+    const id = currentId.value
+    const oldest = messages.value.find((message) => message.id != null)
+    if (!id || !oldest || !hasMoreMessages.value || loadingOlderMessages.value) return
+    loadingOlderMessages.value = true
+    try {
+      const response = await chatAPI.getMessages(id, {
+        limit: MESSAGE_FETCH_LIMIT,
+        before_id: oldest.id,
+      })
+      if (currentId.value !== id) return
+      const rows = Array.isArray(response) ? response.map(normalizeMessage) : []
+      const { page, hasMore } = splitPage(rows)
+      const known = new Set(messages.value.map((message) => message.id))
+      const fresh = page.filter((message) => message.id == null || !known.has(message.id))
+      if (fresh.length) {
+        messages.value = [...fresh, ...messages.value]
+      }
+      hasMoreMessages.value = hasMore
+    } finally {
+      loadingOlderMessages.value = false
+    }
+  }
+
   function addMessage(message) {
     messages.value.push(normalizeMessage(message))
   }
 
   function replaceMessages(nextMessages) {
     messages.value = nextMessages.map(normalizeMessage)
+    // 视图被截断（重新生成会砍掉后半段）后，它和后续取回的最新一页之间可能断档。
+    // 记下来，下一次刷新改为重建窗口，避免在中间留下取不到的空洞。
+    windowTruncated = true
   }
 
   function setCurrentId(id) {
@@ -391,12 +446,22 @@ export const useChatStore = defineStore('chat', () => {
   async function refreshMessages(id = currentId.value, options = {}) {
     const { shouldWrite = null } = options
     if (!id) return []
-    const response = await chatAPI.getMessages(id)
-    const nextMessages = Array.isArray(response) ? response : []
+    // 刷新只取最新一页：已翻出的更早历史按 id 拼回列表头部，否则轮询刷新会把用户
+    // 翻过的历史截断。取页大小固定为一页，避免每次轮询都把已加载的整段历史搬回来。
+    const response = await chatAPI.getMessages(id, { limit: MESSAGE_FETCH_LIMIT })
+    const rows = (Array.isArray(response) ? response : []).map(normalizeMessage)
+    const { page } = splitPage(rows)
+    // isCurrent 要在 await 之后再读一次：请求期间用户可能切换会话又切回来，
+    // 那时窗口里已经是新加载的内容，按请求发起时的判断合并会把它们截掉。
+    const isCurrent = id === currentId.value
+    const oldestPageId = page.length ? page[0].id : null
+    const loadedOlder = isCurrent && !windowTruncated && oldestPageId != null
+      ? messages.value.filter((message) => message.id != null && message.id < oldestPageId)
+      : []
     const localAssistantMessages = messages.value.filter(
       (message) => message.role === 'assistant' && message.isLocal
     )
-    const mergedMessages = nextMessages.map(normalizeMessage)
+    const mergedMessages = [...loadedOlder, ...page]
     const latestBackendAssistant = [...mergedMessages].reverse().find(
       (message) => message.role === 'assistant'
     )
@@ -419,6 +484,13 @@ export const useChatStore = defineStore('chat', () => {
     }
     if (currentId.value === id && (!shouldWrite || shouldWrite())) {
       messages.value = mergedMessages
+      if (isCurrent && windowTruncated) {
+        // 窗口刚被重建（视图之前被截断过），从这一页重新开始向前翻。
+        hasMoreMessages.value = rows.length > MESSAGE_PAGE_SIZE
+      }
+      // 其余情况不动 hasMoreMessages：刷新只取固定的一页，判断不出「还有没有更早的」，
+      // 这个标记交给 selectConversation / loadOlderMessages 维护。
+      windowTruncated = false
     }
     return mergedMessages
   }
@@ -487,6 +559,7 @@ export const useChatStore = defineStore('chat', () => {
     viewEpoch += 1
     currentId.value = null
     messages.value = []
+    hasMoreMessages.value = false
     stopEvaluationPolling()
   }
 
@@ -525,6 +598,8 @@ export const useChatStore = defineStore('chat', () => {
     currentId,
     messages,
     loading,
+    hasMoreMessages,
+    loadingOlderMessages,
     historyManageMode,
     selectedConversationIds,
     streaming,
@@ -538,6 +613,7 @@ export const useChatStore = defineStore('chat', () => {
     currentConversation,
     fetchConversations,
     selectConversation,
+    loadOlderMessages,
     addMessage,
     replaceMessages,
     refreshMessages,

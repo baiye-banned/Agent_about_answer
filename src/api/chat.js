@@ -8,8 +8,9 @@ export const chatAPI = {
   getConversations() {
     return request.get('/chat/conversations')
   },
-  getMessages(conversationId) {
-    return request.get(`/chat/conversations/${conversationId}`)
+  // params 支持 { limit, before_id }：不传时后端只返回最新一页
+  getMessages(conversationId, params) {
+    return request.get(`/chat/conversations/${conversationId}`, { params })
   },
   deleteConversation(id) {
     return request.delete(`/chat/conversations/${id}`)

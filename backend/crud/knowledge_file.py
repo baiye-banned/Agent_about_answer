@@ -3,7 +3,7 @@ import re
 
 from fastapi import HTTPException
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from model.models import KnowledgeFile
 from service.utils_service import KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE
@@ -20,8 +20,17 @@ def serialize_knowledge_file(file_entry: KnowledgeFile) -> dict:
 
 
 def list_knowledge_files(db: Session, knowledge_base_id: int, user_id: int) -> list[KnowledgeFile]:
+    # 列表只渲染元数据，显式排除 content（LONGTEXT）：否则每列一个文件就把正文整列读进内存。
+    # 调用方若再访问 file_entry.content，SQLAlchemy 会按行补查，本函数的返回值禁止用于正文读取。
     return (
         db.query(KnowledgeFile)
+        .options(load_only(
+            KnowledgeFile.id,
+            KnowledgeFile.knowledge_base_id,
+            KnowledgeFile.name,
+            KnowledgeFile.size,
+            KnowledgeFile.created_at,
+        ))
         .filter_by(knowledge_base_id=knowledge_base_id, user_id=user_id)
         .order_by(KnowledgeFile.created_at.desc())
         .all()

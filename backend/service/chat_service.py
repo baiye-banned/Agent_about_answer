@@ -2,9 +2,10 @@
 import json
 import logging
 from datetime import datetime
+from typing import Annotated
 from uuid import uuid4
 
-from fastapi import Depends, File, Header, HTTPException, UploadFile
+from fastapi import Depends, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -64,12 +65,40 @@ def list_conversations(user: User = Depends(get_current_user),
     return [_serialize_conversation(c, user.id) for c in rows]
 
 
-def get_messages(cid: str, user: User = Depends(get_current_user),
+def resolve_message_limit(limit: int | None) -> int:
+    """页大小兜底校验。
+
+    HTTP 请求已由 Query(ge/le) 拦截，这里是为了让直接调用 service 的路径（脚本、内部调用）
+    也拿不到超过上限的页大小，避免绕过接口层把整段历史一次读出。
+    """
+    if limit is None:
+        return crud_chat.CHAT_MESSAGE_DEFAULT_LIMIT
+    if limit < 1 or limit > crud_chat.CHAT_MESSAGE_MAX_LIMIT:
+        raise HTTPException(422, f"limit 必须在 1 到 {crud_chat.CHAT_MESSAGE_MAX_LIMIT} 之间")
+    return limit
+
+
+def get_messages(cid: str,
+                 limit: Annotated[int, Query(ge=1, le=crud_chat.CHAT_MESSAGE_MAX_LIMIT)] = crud_chat.CHAT_MESSAGE_DEFAULT_LIMIT,
+                 before_id: Annotated[int | None, Query(ge=1)] = None,
+                 user: User = Depends(get_current_user),
                  db: Session = Depends(get_db)):
-    conv = crud_chat.get_conversation(db, cid, user.id)
-    if not conv:
+    """会话消息历史，按页返回。
+
+    before_id 是游标：只取 id 小于它的消息（更早的一页）。不传时返回最新一页，
+    页大小默认 CHAT_MESSAGE_DEFAULT_LIMIT，保证单次响应体有上限。
+    """
+    # 归属校验在 list_messages 里随分页查询一起做，这里不再单独查一次会话，避免重复查询。
+    rows = crud_chat.list_messages(
+        db,
+        cid,
+        user.id,
+        limit=resolve_message_limit(limit),
+        before_id=before_id,
+    )
+    if rows is None:
         raise HTTPException(404, "对话不存在")
-    return [crud_chat.serialize_message(m) for m in conv.messages]
+    return [crud_chat.serialize_message(m) for m in rows]
 
 
 def delete_conversation(cid: str, user: User = Depends(get_current_user),
