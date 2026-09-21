@@ -591,3 +591,118 @@ def test_memory_summary_update_failure_trace_hides_internal_error(monkeypatch, c
     _assert_no_leak(str(kwargs.get("result")), "memory_summary_update_failed result")
     assert kwargs["result"]["error"] == memory_service.MEMORY_SUMMARY_UPDATE_FAILED_MESSAGE
     assert INTERNAL_ERROR_TEXT in caplog.text
+
+
+# --- RAGAS 后台评测：Message.ragas_error（前端原样渲染） ---------------------
+#
+# `_friendly_error` 的结果经 `_mark_message` 写进 `Message.ragas_error`，由
+# `src/views/Chat.vue:157` 原样渲染，同时进 `ragas_*` 轨迹事件供用户回查——与 SSE 帧、
+# HTTP detail 是同一个判据下的用户可见面。它此前有四条返回路径直接拼 `str(exc)`。
+
+
+def test_friendly_error_never_embeds_exception_text(caplog):
+    """四条返回路径都不得把异常原文拼进返回值；原文只落日志。"""
+    import rag.ragas_eval as ragas_eval
+
+    cases = [
+        RuntimeError(INTERNAL_ERROR_TEXT),
+        PermissionError(13, "Permission denied", "/srv/app/uploads/考勤.pdf"),
+        RuntimeError(f"Embedding 调用失败: {INTERNAL_ERROR_TEXT}"),
+        RuntimeError(f"Connection error: {INTERNAL_ERROR_TEXT}"),
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        rendered = [ragas_eval._friendly_error(exc) for exc in cases]
+
+    for exc, text in zip(cases, rendered):
+        # 原文与文件路径（issue 点名的一类文本）都不得出现在返回值里。
+        _assert_no_leak(text, f"_friendly_error({type(exc).__name__})", markers=LEAK_MARKERS + ("/srv/app",))
+
+    assert INTERNAL_ERROR_TEXT in caplog.text
+    assert "/srv/app/uploads/考勤.pdf" in caplog.text
+    # 分类能力保留：可读的原因仍在，只是不再附原文。
+    assert rendered[2].startswith("Embedding 调用失败")
+    assert rendered[3].startswith("DeepSeek 调用失败")
+
+
+class _FakeMessage:
+    ragas_status = ""
+    ragas_scores = ""
+    ragas_error = ""
+
+
+class _FakeMessageDb:
+    """`_mark_message` 的最小替身：让 message 可被取出并记录 commit。"""
+
+    def __init__(self, message):
+        self.message = message
+        self.committed = False
+        self.closed = False
+
+    def query(self, _model):
+        return self
+
+    def filter_by(self, **_kwargs):
+        return self
+
+    def first(self):
+        return self.message
+
+    def commit(self):
+        self.committed = True
+
+    def close(self):
+        self.closed = True
+
+
+def test_ragas_evaluation_failure_hides_internal_error(monkeypatch, caplog):
+    """RAGAS 后台评测异常：写回消息与轨迹事件的文案不得含异常原文。"""
+    import rag.ragas_eval as ragas_eval
+
+    message = _FakeMessage()
+    db = _FakeMessageDb(message)
+    captured = []
+
+    monkeypatch.setattr(ragas_eval, "RAGAS_ENABLED", True)
+    monkeypatch.setattr(ragas_eval, "SessionLocal", lambda: db)
+    monkeypatch.setattr(
+        ragas_eval,
+        "append_trace_event",
+        lambda trace_id, stage, function, **kwargs: captured.append((stage, kwargs)),
+    )
+    monkeypatch.setattr(ragas_eval, "_evaluate_message_sync", _boom)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(ragas_eval.evaluate_message_async(1, "问题", "回答", ["上下文"], "trace-1"))
+
+    _assert_no_leak(message.ragas_error, "message.ragas_error")
+    assert message.ragas_error.startswith("RAGAS 评测失败：")
+    assert db.committed and db.closed
+
+    failed = [kwargs for stage, kwargs in captured if stage == "ragas_failed"]
+    assert failed, f"评测失败时必须留下轨迹事件：{[stage for stage, _ in captured]}"
+    _assert_no_leak(str(failed[0].get("result")), "ragas_failed result")
+    # 消息与轨迹事件必须带同一个编号，否则用户报出来的编号在日志里对不上。
+    error_id = message.ragas_error.split("错误编号：", 1)[1].rstrip("）")
+    assert failed[0]["result"]["error"] == message.ragas_error.split("：", 1)[1]
+
+    assert INTERNAL_ERROR_TEXT in caplog.text
+    assert f"error_id={error_id}" in caplog.text
+
+
+def test_ragas_metric_failure_hides_internal_error(caplog):
+    """单个指标失败：`_format_metric_errors` 拼出的那串就是写进 ragas_error 的文本。"""
+    import rag.ragas_eval as ragas_eval
+
+    with caplog.at_level(logging.WARNING):
+        error_text = ragas_eval._format_metric_errors({
+            "faithfulness": ragas_eval._friendly_error(RuntimeError(INTERNAL_ERROR_TEXT)),
+            "response_relevancy": ragas_eval._friendly_error(
+                RuntimeError(f"Embedding 调用失败: {INTERNAL_ERROR_TEXT}")
+            ),
+        })
+
+    _assert_no_leak(error_text, "_format_metric_errors")
+    assert error_text.startswith("部分 RAGAS 指标评测失败：faithfulness: ")
+    assert "response_relevancy: Embedding 调用失败" in error_text
+    assert INTERNAL_ERROR_TEXT in caplog.text
