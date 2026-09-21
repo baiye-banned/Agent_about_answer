@@ -49,6 +49,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 # 扫的是临时目录，Layer 2 不参与：本文件只做内置正则的回归，gitleaks 缺失按明确跳过处理。
+# 这不违反 DEVELOPING.md 里「禁止 --patterns-only 之类跳过扫描的做法进入 CI」：那条规矩拦的是
+# **拿它扫仓库**、让门禁静默少扫一层；仓库自身的扫描完全不受影响，secret-scan.yml 仍以默认
+# 模式全量跑（gitleaks 缺失即退出 2）。这里 --patterns-only 只作用于 tmp_path 里的夹具目录，
+# 而且用例会断言脚本确实打印了跳过说明——跳过永远是显式的，不会变成一次「干净」的假绿。
 PATTERNS_ONLY = "--patterns-only"
 GITLEAKS_SKIP_NOTE = "--patterns-only - gitleaks skipped"
 
@@ -107,7 +111,10 @@ SHAPES = [
 ]
 
 # 替换掉判红样本的普通文本：同一批文件、同样的文件名，只是没有密钥。
-BENIGN = "#!/usr/bin/env python3\nvalue = 1\npassword = get_password()\n"
+# 刻意不含「大写变量名 + 取值」这类形态：那类串是否算凭据只有 gitleaks（Layer 2）的熵规则
+# 判得了，而本文件只跑 Layer 1，留一行「结果要到 CI 才知道」的文本不值当——判绿样本本来
+# 也不需要长成赋值的样子。
+BENIGN = "#!/usr/bin/env python3\n# ordinary module source\nvalue = 1\n"
 
 
 def _run_scan(target, script=SCAN_SCRIPT):
