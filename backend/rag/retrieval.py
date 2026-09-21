@@ -919,6 +919,26 @@ def _normalize_for_match(text: str, case_fold: bool = True) -> str:
     return _WHITESPACE_RE.sub("", lowered)
 
 
+def _split_keyword_chunks(
+    content: str, chunk_size: int = KEYWORD_CHUNK_SIZE, chunk_overlap: int = KEYWORD_CHUNK_OVERLAP
+) -> list[dict]:
+    """整篇物化关键字窗口：召回路径不再走它（issue #59 的内存修复），但它是**在用的契约面**。
+
+    ``tests/test_chunk_key_namespace.py``（issue #55）直接以它为准钉住「关键字窗口按字符偏移
+    从 0 编号、与入库切片的顺序序号撞键」这个性质；``rerank.chunk_key`` 的命名空间隔离也按同
+    一契约描述。删掉它会让那条守卫失去被测面（CI 在 merge ref 上红过一次，见 #82）。
+
+    起点与切片规则都走生产路径同一套 ``_keyword_chunk_starts`` + ``KEYWORD_CHUNK_SIZE``，所以
+    它不会与召回路径漂移；调用方只该把它当契约/排查入口，不要拿它做整篇召回。
+    """
+    chunks = []
+    for start in _keyword_chunk_starts(len(content), chunk_size, chunk_overlap):
+        text = content[start : start + chunk_size].strip()
+        if text:
+            chunks.append({"chunk_id": str(start), "content": text})
+    return chunks
+
+
 def _keyword_chunk_starts(
     content_length: int, chunk_size: int = KEYWORD_CHUNK_SIZE, chunk_overlap: int = KEYWORD_CHUNK_OVERLAP
 ) -> range:
