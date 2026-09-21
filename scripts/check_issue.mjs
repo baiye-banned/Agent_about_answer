@@ -6,7 +6,9 @@
 
 import { readFileSync } from 'node:fs';
 
-// 小节正文去掉注释与空白后至少要有这么多字符，避免用「无」占位。
+import { countSubstantive, stripComments } from './lib/markdown_sanitize.mjs';
+
+// 小节正文去掉注释与空白后至少要有这么多个实质字符（汉字/字母/数字），避免用「无」占位。
 const MIN_LENGTH = 3;
 // _no response_ 是 GitHub issue 表单对空字段自动写入的占位文本，必须当作空。
 const EMPTY_VALUES = [
@@ -28,8 +30,6 @@ const stripPunctuation = (text) => text.replace(PUNCTUATION, '').toLowerCase();
 const PLACEHOLDER_WORDS = EMPTY_VALUES.map(stripPunctuation)
   .filter((word) => word.length > 0)
   .sort((a, b) => b.length - a.length);
-// 实质字符：汉字、字母、数字。emoji 与纯符号不算，避免「🐛✨📝」凑够长度。
-const SUBSTANTIVE = /[\p{L}\p{N}]/u;
 
 // 整段内容由占位词拼成（`- 无`、`无 待补充`、`TODO（待补充）`）就算空：
 // 逐个抠掉占位词后什么都不剩才算占位，因此「无 UI 变更」这类真实内容不会被误杀。
@@ -76,10 +76,9 @@ function usage(message) {
   process.exit(2);
 }
 
-function stripComments(markdown) {
-  return markdown.replace(/<!--[\s\S]*?-->/g, '');
-}
-
+// 注释消毒与字符计数都在 scripts/lib/markdown_sanitize.mjs：消毒只删「渲染时真的看不见」
+// 的注释，其余起始符只拔掉标记本身，长度也只数实质字符——两个方向都不会被构造文本
+// 糊弄（issue #97）。
 const normalizeTitle = (text) =>
   text
     .toLowerCase()
@@ -143,14 +142,13 @@ function cleanContent(content) {
 }
 
 // 占位内容即使写成列表项（`- 无`、`1. 无`）、多行（`- 无` + `- 待补充`）或带标点（`暂无。`）也算空；
-// 长度按码点算，避免两个字符的 emoji 凑够 UTF-16 长度蒙混过关。
+// 长度只数实质字符（汉字/字母/数字），纯符号、emoji、注释残留都凑不出长度。
 function isFilled(content) {
   const cleaned = cleanContent(content)
     .replace(/^\s*(?:[-*+]|\d+[.)])\s+/gm, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  if ([...cleaned].length < MIN_LENGTH) return false;
-  if (!SUBSTANTIVE.test(cleaned)) return false;
+  if (countSubstantive(cleaned) < MIN_LENGTH) return false;
   const normalized = stripPunctuation(cleaned);
   if (normalized.length === 0) return false;
   return !isOnlyPlaceholders(normalized);
@@ -203,7 +201,7 @@ for (const keyword of kind.keywords) {
   if (section) {
     if (!isFilled(section.content)) {
       problems.push(
-        `「${keyword.section}」小节内容过短或只有占位内容（至少 ${MIN_LENGTH} 个字符，且不能是「无」这类占位文本）。`
+        `「${keyword.section}」小节内容过短或只有占位内容（至少 ${MIN_LENGTH} 个汉字/字母/数字，且不能是「无」这类占位文本）。`
       );
     }
     continue;
