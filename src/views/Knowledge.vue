@@ -503,7 +503,7 @@ async function refreshKnowledgeBasesPreserving(preferredBase) {
     if (preferredBase?.id && !list.some((item) => item.id === preferredBase.id)) {
       knowledgeStore.upsertKnowledgeBase(preferredBase)
     }
-  } catch (error) {
+  } catch {
     if (preferredBase?.id) {
       knowledgeStore.upsertKnowledgeBase(preferredBase)
     }

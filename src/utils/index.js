@@ -76,12 +76,16 @@ export const storage = {
     try {
       const target = getStorage()
       if (target) target.setItem(key, JSON.stringify(value))
-    } catch {}
+    } catch {
+      // 隐私模式或配额写满时 setItem 会抛错；本地存储属尽力而为，失败即忽略。
+    }
   },
   remove(key) {
     try {
       const target = getStorage()
       if (target) target.removeItem(key)
-    } catch {}
+    } catch {
+      // 同上：删除失败无需打扰调用方。
+    }
   },
 }
