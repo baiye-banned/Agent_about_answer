@@ -69,13 +69,13 @@ TTL_SECONDS = 24 * 60 * 60
 
 # 清扫链路用的对象键写字面量，形态照抄上传路径实际铸出来的样子
 # （rag-chat/<年>/<月>/<日>/<uuid4().hex><扩展名>）。
-KEY_A = "rag-chat/2026/09/21/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png"
-KEY_B = "rag-chat/2026/09/21/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.jpg"
-KEY_C = "rag-chat/2026/09/21/cccccccccccccccccccccccccccccccc.webp"
+UPLOAD_A = "rag-chat/2026/09/21/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png"
+UPLOAD_B = "rag-chat/2026/09/21/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.jpg"
+UPLOAD_C = "rag-chat/2026/09/21/cccccccccccccccccccccccccccccccc.webp"
 
 # 本服务从没铸过的键（客户端回带的附件列是自由 JSON，桶里别的东西都可能出现在这个位置）。
-FOREIGN_KEY = "finance-archive/2026/q3/payroll.sql"
-NEAR_MISS_KEY = "rag-chat/2026/09/21/../../finance-archive/2026/q3/payroll.sql"
+FOREIGN_UPLOAD = "finance-archive/2026/q3/payroll.sql"
+NEAR_MISS_UPLOAD = "rag-chat/2026/09/21/../../finance-archive/2026/q3/payroll.sql"
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n-fake-png-payload"
 
@@ -328,14 +328,14 @@ def test_sweep_leaves_objects_inside_the_retention_window_alone(api, oss_request
     上传与发送之间隔着用户打字、挑图、切页面的真实时间，清扫提前动手就会把一条马上
     要发出去的消息引用的对象删掉——对象存储没有回收站，那是不可逆的内容丢失。
     """
-    _add_pending_row(api, KEY_A, age_seconds=TTL_SECONDS - 60)
-    _add_pending_row(api, KEY_B, age_seconds=TTL_SECONDS + 60)
+    _add_pending_row(api, UPLOAD_A, age_seconds=TTL_SECONDS - 60)
+    _add_pending_row(api, UPLOAD_B, age_seconds=TTL_SECONDS + 60)
 
     report = chat_service.reclaim_orphan_chat_attachments(api.db, now=datetime.now())
 
     assert report["reclaimed"] == 1
-    assert oss_requests.urls("DELETE") == [f"https://{OSS_HOST}/{KEY_B}"]
-    assert [row.object_key for row in _pending_rows(api)] == [KEY_A]
+    assert oss_requests.urls("DELETE") == [f"https://{OSS_HOST}/{UPLOAD_B}"]
+    assert [row.object_key for row in _pending_rows(api)] == [UPLOAD_A]
 
 
 def test_sweep_is_idempotent_and_treats_a_missing_object_as_reclaimed(api, oss_requests):
@@ -344,15 +344,15 @@ def test_sweep_is_idempotent_and_treats_a_missing_object_as_reclaimed(api, oss_r
     404 是 httpx 层面的「目标状态已满足」：清扫跑到一半崩掉后重跑、或两个进程同时清扫，
     都不该因为对象已经删掉了而报错并把行留在表里。
     """
-    _add_pending_row(api, KEY_A, age_seconds=TTL_SECONDS + 60)
-    oss_requests.status_by_key[KEY_A] = 404
+    _add_pending_row(api, UPLOAD_A, age_seconds=TTL_SECONDS + 60)
+    oss_requests.status_by_key[UPLOAD_A] = 404
 
     first = chat_service.reclaim_orphan_chat_attachments(api.db, now=datetime.now())
     second = chat_service.reclaim_orphan_chat_attachments(api.db, now=datetime.now())
 
     assert (first["reclaimed"], first["failed"]) == (1, 0)
     assert second == {"candidates": 0, "reclaimed": 0, "failed": 0, "unclaimable": 0, "skipped": 0}
-    assert oss_requests.urls("DELETE") == [f"https://{OSS_HOST}/{KEY_A}"]
+    assert oss_requests.urls("DELETE") == [f"https://{OSS_HOST}/{UPLOAD_A}"]
 
 
 def test_sweep_batches_the_work_instead_of_walking_the_whole_backlog(api, oss_requests):
@@ -390,16 +390,16 @@ def test_sweep_signs_a_real_oss_delete_request(api, monkeypatch):
         monkeypatch.setattr(oss_service, name, value)
     monkeypatch.setattr(oss_service.httpx, "Client", lambda **kwargs: real_client_cls(transport=transport, **kwargs))
 
-    _add_pending_row(api, KEY_A, age_seconds=TTL_SECONDS + 60)
+    _add_pending_row(api, UPLOAD_A, age_seconds=TTL_SECONDS + 60)
 
     assert chat_service.reclaim_orphan_chat_attachments(api.db, now=datetime.now())["reclaimed"] == 1
 
     request = seen[0]
     assert request.method == "DELETE"
-    assert str(request.url) == f"https://{OSS_HOST}/{KEY_A}"
+    assert str(request.url) == f"https://{OSS_HOST}/{UPLOAD_A}"
     date = request.headers["Date"]
     expected = base64.b64encode(
-        hmac.new(b"test-secret", f"DELETE\n\n\n{date}\n/demo/{KEY_A}".encode("utf-8"), hashlib.sha1).digest()
+        hmac.new(b"test-secret", f"DELETE\n\n\n{date}\n/demo/{UPLOAD_A}".encode("utf-8"), hashlib.sha1).digest()
     ).decode("utf-8")
     assert request.headers["Authorization"] == f"OSS test-id:{expected}"
     assert request.headers["Host"] == OSS_HOST
@@ -411,22 +411,41 @@ def test_sweep_signs_a_real_oss_delete_request(api, monkeypatch):
 
 def test_one_object_failing_does_not_stop_the_others_and_keeps_its_row(api, oss_requests, caplog):
     """单个对象删不掉：其余照删，失败的那条登记行留着等下次重扫，且不回显给用户。"""
-    _add_pending_row(api, KEY_A, age_seconds=TTL_SECONDS + 60)
-    _add_pending_row(api, KEY_B, age_seconds=TTL_SECONDS + 60)
-    _add_pending_row(api, KEY_C, age_seconds=TTL_SECONDS + 60)
-    oss_requests.status_by_key[KEY_B] = 403
+    _add_pending_row(api, UPLOAD_A, age_seconds=TTL_SECONDS + 60)
+    _add_pending_row(api, UPLOAD_B, age_seconds=TTL_SECONDS + 60)
+    _add_pending_row(api, UPLOAD_C, age_seconds=TTL_SECONDS + 60)
+    oss_requests.status_by_key[UPLOAD_B] = 403
 
     with caplog.at_level(logging.WARNING, logger="service.chat_service"):
         report = chat_service.reclaim_orphan_chat_attachments(api.db, now=datetime.now())
 
     assert (report["reclaimed"], report["failed"]) == (2, 1)
     assert sorted(oss_requests.urls("DELETE")) == sorted(
-        [f"https://{OSS_HOST}/{KEY_A}", f"https://{OSS_HOST}/{KEY_B}", f"https://{OSS_HOST}/{KEY_C}"]
+        [f"https://{OSS_HOST}/{UPLOAD_A}", f"https://{OSS_HOST}/{UPLOAD_B}", f"https://{OSS_HOST}/{UPLOAD_C}"]
     )
     # 删不掉的行必须留着：删行等于把「桶里还有这个对象」这条唯一的线索也丢掉。
-    assert [row.object_key for row in _pending_rows(api)] == [KEY_B]
+    assert [row.object_key for row in _pending_rows(api)] == [UPLOAD_B]
     warnings = [record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING]
-    assert any(KEY_B in message for message in warnings)
+    assert any(UPLOAD_B in message for message in warnings)
+
+
+def test_a_failed_delete_puts_the_row_back_with_its_original_timestamp(api, oss_requests):
+    """放回队列时按**原时间戳**排队，不是 now()。
+
+    这条语义只在「同一把键反复删失败」（对象被锁、连接抖动）时才看得见：放回时若盖上当前
+    时刻，这条行每失败一轮就往后排一轮，最后饿死在新孤儿后面。放回也不该重新排队——这次
+    上传并没有被回收，它只是这一轮没删成，仍然按上传时刻算超期。
+    """
+    _add_pending_row(api, UPLOAD_A, age_seconds=TTL_SECONDS + 120)
+    original = _pending_rows(api)[0].created_at
+    oss_requests.status_by_key[UPLOAD_A] = 403
+
+    report = chat_service.reclaim_orphan_chat_attachments(api.db, now=datetime.now())
+
+    assert report["failed"] == 1
+    restored = _pending_rows(api)
+    assert [row.object_key for row in restored] == [UPLOAD_A]
+    assert restored[0].created_at == original, "放回时重写了时间戳：这条行被排到了队尾"
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +605,24 @@ def test_a_rolled_back_message_keeps_its_attachment_reclaimable(api, monkeypatch
     assert [row.object_key for row in _pending_rows(api)] == [key], "提交失败却消费了登记行"
 
 
+def test_consuming_the_upload_never_commits_on_its_own(api, oss_requests):
+    """契约：消费登记行必须留在调用方那次提交里，`confirm` 自己不许 commit。
+
+    「消息行 + 消费」分开提交会冒出一个中间态：登记行已经删掉、消息行还没落库。发送正好在这条
+    缝里失败（进程被杀、连接断），对象就既不在消息里、也不在登记表里——又回到这次修复要消灭的
+    孤儿形状。上面那条回滚用例盖不住这一臂：它的失败替身对**每一次** commit 都抛，于是「消费
+    先提交、消息后提交」里第一个提交就炸了，状态与不分开提交时不可区分。这里改从提交次数直接
+    钉住契约——`confirm` 内部只要自己提交一次，计数就不再是 0。
+    """
+    key = _upload(api).json()["object_key"]
+
+    session = _CountingSession(api.db)
+    consumed = crud_chat.confirm_attachment_uploads(session, [key], api.alice_id)
+
+    assert consumed == 1, "夹具没摆成：这条登记行本来就没被消费掉"
+    assert session.commits == 0, "消费动作自己提交了：它就不再与消息行同一次提交"
+
+
 # ---------------------------------------------------------------------------
 # (d) 入口：启动期清扫 + 对账
 # ---------------------------------------------------------------------------
@@ -622,8 +659,8 @@ def test_scheduled_sweep_runs_on_a_background_thread(api, monkeypatch, oss_reque
     """
     monkeypatch.setattr(chat_service, "SessionLocal", lambda: api.db)
     monkeypatch.setattr(chat_service, "CHAT_ATTACHMENT_SWEEP_BATCH_LIMIT", 1)
-    _add_pending_row(api, KEY_A, age_seconds=TTL_SECONDS + 60)
-    _add_pending_row(api, KEY_B, age_seconds=TTL_SECONDS + 60)
+    _add_pending_row(api, UPLOAD_A, age_seconds=TTL_SECONDS + 60)
+    _add_pending_row(api, UPLOAD_B, age_seconds=TTL_SECONDS + 60)
 
     stop = threading.Event()
     # interval 传 1 秒（实现另有 1 秒下限），两轮一共约 1 秒，远在下面的等待预算之内。
@@ -642,7 +679,7 @@ def test_scheduled_sweep_runs_on_a_background_thread(api, monkeypatch, oss_reque
     assert not thread.is_alive(), "stop 置位后清扫循环仍不退出"
     # 线程里跑的必须是真清扫（不是「起了个线程什么都没做」），且两把键都删掉了。
     assert sorted(oss_requests.urls("DELETE")) == sorted(
-        [f"https://{OSS_HOST}/{KEY_A}", f"https://{OSS_HOST}/{KEY_B}"]
+        [f"https://{OSS_HOST}/{UPLOAD_A}", f"https://{OSS_HOST}/{UPLOAD_B}"]
     )
     assert _pending_rows(api) == []
 
@@ -678,14 +715,14 @@ def test_pending_rows_are_the_reconciliation_entry_point(api, oss_requests):
 
 
 def test_reconciliation_can_be_scoped_to_one_user_and_one_window(api, oss_requests):
-    _add_pending_row(api, KEY_A, age_seconds=TTL_SECONDS + 60, user_id=api.alice.id)
-    _add_pending_row(api, KEY_B, age_seconds=0, user_id=api.bob.id)
+    _add_pending_row(api, UPLOAD_A, age_seconds=TTL_SECONDS + 60, user_id=api.alice.id)
+    _add_pending_row(api, UPLOAD_B, age_seconds=0, user_id=api.bob.id)
 
     stale = crud_chat.list_pending_attachment_uploads(api.db, older_than=datetime.now() - timedelta(seconds=TTL_SECONDS))
     bobs = crud_chat.list_pending_attachment_uploads(api.db, user_id=api.bob.id)
 
-    assert [row.object_key for row in stale] == [KEY_A]
-    assert [row.object_key for row in bobs] == [KEY_B]
+    assert [row.object_key for row in stale] == [UPLOAD_A]
+    assert [row.object_key for row in bobs] == [UPLOAD_B]
 
 
 # ---------------------------------------------------------------------------
@@ -700,20 +737,20 @@ def test_sweep_never_signs_a_delete_for_a_key_this_service_never_minted(api, oss
     （`rag-chat/.../../../finance-archive/x`）会被 httpx 规范化成桶里另一个对象的 URL，
     只查前缀的实现在这里就会删错对象。
     """
-    _add_pending_row(api, FOREIGN_KEY, age_seconds=TTL_SECONDS + 60)
-    _add_pending_row(api, NEAR_MISS_KEY, age_seconds=TTL_SECONDS + 60)
-    _add_pending_row(api, KEY_A, age_seconds=TTL_SECONDS + 60)
+    _add_pending_row(api, FOREIGN_UPLOAD, age_seconds=TTL_SECONDS + 60)
+    _add_pending_row(api, NEAR_MISS_UPLOAD, age_seconds=TTL_SECONDS + 60)
+    _add_pending_row(api, UPLOAD_A, age_seconds=TTL_SECONDS + 60)
 
     with caplog.at_level(logging.WARNING, logger="service.chat_service"):
         report = chat_service.reclaim_orphan_chat_attachments(api.db, now=datetime.now())
 
-    assert oss_requests.urls("DELETE") == [f"https://{OSS_HOST}/{KEY_A}"]
+    assert oss_requests.urls("DELETE") == [f"https://{OSS_HOST}/{UPLOAD_A}"]
     assert report["reclaimed"] == 1
     # 永远签不出 DELETE 的行不能一直留着：留着就会每轮清扫重复告警、还占着批次名额。
     assert report["unclaimable"] == 2
     assert _pending_rows(api) == []
     warnings = [record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING]
-    for key in (FOREIGN_KEY, NEAR_MISS_KEY):
+    for key in (FOREIGN_UPLOAD, NEAR_MISS_UPLOAD):
         assert any(key in message for message in warnings), f"没有为 {key!r} 留下可按对象对账的告警"
 
 
@@ -722,14 +759,14 @@ def test_sweep_does_not_touch_another_users_pending_upload(api, monkeypatch, oss
 
     bob 的上传还没超期时,alice 的超期对象被回收，bob 的不许动。
     """
-    _add_pending_row(api, KEY_A, age_seconds=TTL_SECONDS + 60, user_id=api.alice.id)
-    _add_pending_row(api, KEY_B, age_seconds=60, user_id=api.bob.id)
+    _add_pending_row(api, UPLOAD_A, age_seconds=TTL_SECONDS + 60, user_id=api.alice.id)
+    _add_pending_row(api, UPLOAD_B, age_seconds=60, user_id=api.bob.id)
 
     report = chat_service.reclaim_orphan_chat_attachments(api.db, now=datetime.now())
 
     assert report["reclaimed"] == 1
-    assert oss_requests.urls("DELETE") == [f"https://{OSS_HOST}/{KEY_A}"]
-    assert [row.object_key for row in _pending_rows(api)] == [KEY_B]
+    assert oss_requests.urls("DELETE") == [f"https://{OSS_HOST}/{UPLOAD_A}"]
+    assert [row.object_key for row in _pending_rows(api)] == [UPLOAD_B]
 
 
 def test_an_attachment_key_minted_by_someone_else_is_not_confirmed_by_my_send(api, monkeypatch, oss_requests):
@@ -738,13 +775,13 @@ def test_an_attachment_key_minted_by_someone_else_is_not_confirmed_by_my_send(ap
     附件列是客户端回带的自由 JSON，消息可以引用一把别人铸的键。若发送方也能把它消费掉，
     那把键就会一直被这条消息钉住，原主「上传了没发送」的对象再也回不到清扫任务手里。
     """
-    _add_pending_row(api, KEY_A, age_seconds=0, user_id=api.bob.id)
+    _add_pending_row(api, UPLOAD_A, age_seconds=0, user_id=api.bob.id)
 
-    cid = _run_stream_chat(api, monkeypatch, [{"object_key": KEY_A, "name": "a.png"}])
+    cid = _run_stream_chat(api, monkeypatch, [{"object_key": UPLOAD_A, "name": "a.png"}])
 
     stored = json.loads(api.db.query(Message).filter_by(conversation_id=cid).first().attachments)
-    assert [item["object_key"] for item in stored] == [KEY_A]
-    assert [row.object_key for row in _pending_rows(api)] == [KEY_A], "别人的待确认行被这条消息消费了"
+    assert [item["object_key"] for item in stored] == [UPLOAD_A]
+    assert [row.object_key for row in _pending_rows(api)] == [UPLOAD_A], "别人的待确认行被这条消息消费了"
 
 
 def test_no_http_route_can_delete_an_arbitrary_object_key(api):
@@ -799,6 +836,25 @@ class _FlushThenFailSession:
     def commit(self):
         self._db.flush()
         raise RuntimeError("commit failed")
+
+
+class _CountingSession:
+    """包一层真实会话，只数 commit 次数，其余原样转发。
+
+    用来钉「谁负责提交」这类契约：只看外部结果分不出「一次提交」与「两次提交」（后者在两次
+    之间失败时才会露馅），而提交次数是直接可辨的。
+    """
+
+    def __init__(self, db):
+        self._db = db
+        self.commits = 0
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def commit(self):
+        self.commits += 1
+        return self._db.commit()
 
 
 async def _collect_stream(iterator):
