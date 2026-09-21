@@ -33,6 +33,8 @@ BOUNDARY_BODY = f"{BOUNDARY_SENTENCE}{ORDER_BODY}"
 # 靠的是 chunk_text 的「整篇没有一行进正文」结构兜底。
 PHRASE_BODY = "员工迟到30分钟以内罚款50元，由人事部汇总"
 PHRASE_PREFIXES = ["三、", "（一）", "1、", "1. "]
+# 返工轮 major-1 的混合形状语料：编号与短语正文同行的整行。
+PHRASE_HEADLINE = f"三、{PHRASE_BODY}"
 # 兜底语料直接压到最短：标记后只有 10 字，长度阈值（48）与句末标点都够不着，
 # 单行判定必然是标题——兜底与阈值、标点都无关，这种输入也要整段入库。
 SHORT_PHRASE_BODY = "员工迟到罚款50元"
@@ -400,11 +402,12 @@ def test_chunk_text_recovers_mixed_documents_with_short_numbered_rows(sentence_p
         assert sentence in joined
 
 
-def test_chunk_text_fallback_does_not_fire_when_the_document_has_body_text():
-    """兜底只在「整篇没有一行进正文」时生效：有正文的文档里，短标题仍是标题。
+def test_chunk_text_keeps_short_headings_as_headings_when_every_section_has_body():
+    """每一节都有正文的常规排版不受影响：短标题仍是标题，不进正文。
 
-    对照 issue #75 的语料：标题 + 正文的常规排版不受影响，标题层级照旧进入
-    heading_path，正文并入所属小节。
+    名称与 docstring 原先写成「兜底只在整篇没有一行进正文时生效」，与实现及同文件
+    另两条用例冲突（兜底早就改判覆盖率口径了）——返工轮 minor-5 改成与断言一致的说法：
+    断言真正钉的是「标题层级照旧进入 heading_path，正文并入所属小节」，对照 issue #75 的语料。
     """
     source = "\n".join(["三、考勤管理", "员工迟到30分钟以内罚款50元。"] * 5)
 
@@ -415,6 +418,77 @@ def test_chunk_text_fallback_does_not_fire_when_the_document_has_body_text():
     # 标题作为标题进入 heading_path，跟着正文一起出现在切片里（而不是被兜底当正文）。
     assert joined.count("三、考勤管理") >= 1
     assert "员工迟到30分钟以内罚款50元。" in joined
+
+
+def _missing_line_occurrences(source: str, chunks: list[dict]) -> int:
+    """原文里有、入库文本里少掉的行**出现次数**。
+
+    按出现次数而不是「这一行在不在库里」计：制度文档大量重复同一句话，
+    只要有一行进过库，按存在性判会显示「没丢」，掩盖掉其余几十行。
+    """
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    lines = [line for line in source.split("\n") if line.strip()]
+    return sum(max(0, lines.count(line) - joined.count(line)) for line in set(lines))
+
+
+# 返工轮 major-1 的四种混合形状。编号短语正文行都只占少数（丢字不到一半），
+# 整篇覆盖率因此够不到 0.5 的兜底线——兜底与告警双双哑火，行整行消失。
+MIXED_MINORITY_SHAPES = {
+    "正文夹在编号行之间": "\n".join(
+        [
+            PHRASE_HEADLINE,
+            PHRASE_HEADLINE,
+            f"第1段 {CLAUSE_BODY * 3}",
+            f"第2段 {CLAUSE_BODY * 3}",
+            *[PHRASE_HEADLINE] * 8,
+            f"第3段 {CLAUSE_BODY * 3}",
+            f"第4段 {CLAUSE_BODY * 3}",
+        ]
+    ),
+    "正文在前、编号行收尾": "\n".join([CLAUSE_BODY * 20, *[PHRASE_HEADLINE] * 10]),
+    "编号行在前、正文在后": "\n".join([*[PHRASE_HEADLINE] * 5, CLAUSE_BODY * 4]),
+    "第N条与编号行混排": "\n".join(
+        item
+        for index in range(1, 11)
+        for item in (f"第{index}条 {CLAUSE_BODY}", PHRASE_HEADLINE)
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", list(MIXED_MINORITY_SHAPES))
+def test_chunk_text_keeps_numbered_rows_that_are_the_minority_of_a_mixed_document(shape):
+    """返工轮 major-1：编号短语正文行只占少数时也一行都不能丢。
+
+    先证红（对抗评审实测 53.9%~80.9%、本仓复算同值）：这些行仍被判成标题，
+    连续同层标题在 heading_path 里互相覆盖，只有紧跟正文的那一行能作为前缀进切片，
+    其余整行消失；而兜底（chunk_text 结构兜底）与告警（_warn_on_low_chunk_coverage）
+    共用 0.5 这条线，丢字不到一半就都不触发。
+
+    修在局部而不是调低全局阈值：阈值调低会让正常文档整篇当正文重排、标题层级全丢。
+    判据改成「从没进过任何切片、又马上被同层标题覆盖」的标题行收回正文。
+    """
+    source = MIXED_MINORITY_SHAPES[shape]
+
+    chunks = chunk_text(source, file_id=1)
+
+    assert _missing_line_occurrences(source, chunks) == 0
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+
+
+def test_chunk_text_keeps_every_repeated_row_when_they_are_the_minority():
+    """同一行重复出现时逐次计数：回收判据不能按标题**文本**去重。
+
+    先证红（本仓实现过程中实测）：按文本记「这一行进过库」时，40 行同文语料里
+    第一行进库就把后 39 行判成「已进过库」，只剩一份——正是本文件反复强调的
+    「重复出现时去重等于静默丢正文」。判据按标题**层位**记，与文本是否重复无关。
+    """
+    source = "\n".join([PHRASE_HEADLINE] * ORDER_ROWS)
+
+    chunks = chunk_text(source, file_id=1)
+
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    assert joined.count(PHRASE_BODY) >= ORDER_ROWS
+    assert _missing_line_occurrences(source, chunks) == 0
 
 
 @pytest.mark.parametrize("prefix", ORDER_PREFIXES)

@@ -427,6 +427,11 @@ def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: i
         heading_path: dict[int, str] = {}
         current_body: list[str] = []
         pending_overlap: list[str] = []
+        # 已经被写进过切片的标题**层位**（不是标题文本）。按层位记而不是按文本记：
+        # 制度文档里同一行会重复出现（40 行同文语料很常见），按文本记会把「这一行
+        # 进过库」误判成「这个位置进过库」，同一行只留一份、其余仍被丢掉。
+        # 层位在重新赋值时清掉（见下方 set），flush 成功时把当时路径里的层位全记上。
+        emitted_levels: set[int] = set()
 
         def flush_chunk() -> None:
             nonlocal current_body, pending_overlap
@@ -435,7 +440,8 @@ def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: i
 
             # 正文行必须逐条保留：同一句话在文档里重复出现（制度文档很常见）时去重，
             # 会让入库文本合计远小于原文，属于静默丢正文。
-            # 这里不会重复标题：_heading_level 对同一字符串判定恒定，标题不会进入 current_body，
+            # 标题不会在这里重复：进过 current_body 的标题只有 _rescue_dropped_headings
+            # 收回来那一种，而它同时会从 heading_path 里摘掉，不会再当一次前缀；
             # _overlap_units 也会跳过标题行。
             heading_lines = _heading_lines(heading_path)
             content_lines = [line for line in [*heading_lines, *pending_overlap, *current_body] if line]
@@ -443,8 +449,40 @@ def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: i
             chunk_text_value = "\n".join(content_lines).strip()
             if chunk_text_value:
                 chunks.append({"id": f"{len(chunks)}", "text": chunk_text_value})
+                emitted_levels.update(heading_path)
             pending_overlap = _overlap_units(current_body, overlap_limit)
             current_body = []
+
+        def _rescue_dropped_headings(min_level: int | None) -> None:
+            """把「从没进过任何切片、又马上要被覆盖掉」的标题行收回正文，独立成片。
+
+            issue #83 第 1 项的返工（对抗评审 major-1）：编号短语正文行只占少数时
+            （实测覆盖率 53.9%~80.9%），整篇覆盖率够不着 0.5 的兜底线，兜底与告警
+            双双哑火，这些行仍然整行消失。这是形状相关的静默丢字，全局阈值救不了
+            ——阈值调低会让正常文档整篇当正文重排、标题层级全丢。
+
+            判据落在局部：一个标题若是**从没进过任何切片**（没当过一次标题前缀），
+            紧接着又要被同层/更浅层标题覆盖，那它承载的文字除它自己以外没有任何
+            去处，只能丢——这正是「三、员工迟到30分钟以内罚款50元，由人事部汇总」
+            连排时的形态（前 N-1 行互相覆盖）。
+
+            收回来时先从 heading_path 摘掉再成片：留着会让同一行既当标题前缀又当正文。
+            成片时仍带上还没被覆盖的上级标题作前缀，位置就在原地，不打乱文档顺序。
+
+            只在 flush 之后调用：真被带进过切片的层位都记在 emitted_levels 里，
+            这里只回收确实没去处的那些，不会重复回收。
+            """
+            rescued: list[str] = []
+            for key in sorted(heading_path):
+                if min_level is not None and key < min_level:
+                    continue
+                if key in emitted_levels:
+                    continue
+                rescued.append(heading_path.pop(key))
+            if not rescued:
+                return
+            current_body.extend(rescued)
+            flush_chunk()
 
         for unit in candidate_units:
             level = None if as_body else _heading_level(unit)
@@ -455,8 +493,13 @@ def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: i
 
             if level is not None:
                 flush_chunk()
+                # flush 之后再判：走空的 flush 说明这些标题一个都没被带进切片。
+                _rescue_dropped_headings(level)
                 heading_path = _trim_heading_path(heading_path, level)
                 heading_path[level] = unit
+                # 换了新标题，这一层位「进过库」的记录必须作废，否则这一行被覆盖时
+                # 会被误判成已经进过库而丢掉。
+                emitted_levels.discard(level)
                 pending_overlap = []
                 continue
 
@@ -466,6 +509,9 @@ def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: i
             current_body.append(unit)
 
         flush_chunk()
+        # 文档以标题收尾（后面再没有正文行）时收尾的 flush 不会带上它们，
+        # 这些标题同样会整行消失——最后一次回收机会。
+        _rescue_dropped_headings(None)
         return chunks, heading_path
 
     chunks, _heading_path = assemble(units, as_body=False)
