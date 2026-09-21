@@ -1,4 +1,5 @@
 <template>
+  <!-- eslint-disable-next-line vue/no-v-html -- rendered 已在 script 里经 sanitizeHtml 过滤，这里是全仓库唯一的 v-html 出口 -->
   <div class="markdown-body" v-html="rendered" />
 </template>
 
