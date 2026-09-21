@@ -189,12 +189,31 @@ def defer_ingest_cleanup(work, entry_id: int, user_id: int) -> None:
     work.add_done_callback(_cleanup)
 
 
+def _keep_knowledge_file_row(entry_id: int, *, reason: str) -> None:
+    """向量没删干净时保留元数据行，等下次启动重建把它修好。
+
+    这是本文件统一的失败态取舍（见 defer_ingest_cleanup）：删向量失败还照样删行，
+    留下的是「列表里没有、检索却命中」的孤儿向量，而且**不会自愈**——行没了，
+    rebuild_existing_knowledge_index 只遍历数据库里的行，再也不会碰到这批向量，
+    占用的向量库存储也没有任何流程会回收。行留着，下次启动重建就会用 add_chunks
+    （整体替换语义）盖掉它残留的向量。
+    """
+    logger.warning("Keeping knowledge file row for the startup rebuild: file_id=%s reason=%s", entry_id, reason)
+
+
 def _delete_file_vectors_and_row(entry_id: int, user_id: int) -> None:
-    """删向量 + 删元数据行。只在清理专用池的线程里跑，不在事件循环线程上跑。"""
+    """删向量 + 删元数据行。只在清理专用池的线程里跑，不在事件循环线程上跑。
+
+    只有向量**确实删干净**才允许删元数据行——与单文件删除路径（delete_knowledge
+    先删向量、失败即抛 500 并保留行）同一条判据：删向量失败还照样删行，就会留下
+    上面 _keep_knowledge_file_row 记的那种不自愈的孤儿向量。
+    """
     try:
         delete_file_chunks(entry_id)
     except Exception as exc:
         logger.warning("Failed to clean up timed-out ingest vectors: file_id=%s error=%s", entry_id, exc, exc_info=True)
+        _keep_knowledge_file_row(entry_id, reason="vector delete failed")
+        return
     db = SessionLocal()
     try:
         # 复用既有 CRUD：归属过滤与「行可能已被并发删掉」都走它的语义。
@@ -484,12 +503,17 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
         raise HTTPException(500, _index_failure_detail(exc))
     except Exception as exc:
         logger.warning("Knowledge file indexing failed: file_id=%s error=%s", entry.id, exc, exc_info=True)
+        # 与超时清理同一条判据（见 _delete_file_vectors_and_row）：向量清理确认成功
+        # 才删元数据行。add_chunks 可能已经写过一部分，清理失败还删行就是孤儿向量。
+        vectors_removed = False
         try:
             # 清理走清理专用池并自带总时限（minor-1）：入库池只有 4 个槽位，被卡死的
             # 写入线程占满时这一步会无限期排队；不设上限还会把已经失败的请求再挂死。
-            # 超时只放弃等待——工作项已提交、会在后台跑完，下面的删行照常进行。
             await run_cleanup_step(delete_file_chunks, entry.id, deadline=ingest_deadline())
+            vectors_removed = True
         except KnowledgeIngestTimeout as cleanup_exc:
+            # 超时只放弃等待：工作项已提交、会在后台跑完，删成没删成无从得知，
+            # 因此按「没删干净」处理（下面保留行），而不是赌它成功。
             logger.warning(
                 "Vector cleanup timed out after indexing failure, abandoned the wait: file_id=%s error=%s",
                 entry.id,
@@ -498,11 +522,14 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
             )
         except Exception as cleanup_exc:
             logger.warning("Failed to clean partially indexed chunks: file_id=%s error=%s", entry.id, cleanup_exc, exc_info=True)
-        try:
-            crud_knowledge_file.delete_knowledge_file(db, entry.id, user.id)
-        except SQLAlchemyError as cleanup_commit_exc:
-            db.rollback()
-            logger.warning("Failed to rollback partially indexed knowledge file: file_id=%s error=%s", entry.id, cleanup_commit_exc, exc_info=True)
+        if vectors_removed:
+            try:
+                crud_knowledge_file.delete_knowledge_file(db, entry.id, user.id)
+            except SQLAlchemyError as cleanup_commit_exc:
+                db.rollback()
+                logger.warning("Failed to rollback partially indexed knowledge file: file_id=%s error=%s", entry.id, cleanup_commit_exc, exc_info=True)
+        else:
+            _keep_knowledge_file_row(entry.id, reason="indexing failed and vector cleanup did not confirm success")
         raise HTTPException(500, _index_failure_detail(exc))
 
     return crud_knowledge_file.serialize_knowledge_file(entry)
