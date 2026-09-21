@@ -114,7 +114,9 @@ export async function resolve(specifier, context, nextResolve) {
 // 于是 `import.meta.env.VITE_API_BASE_URL || '/api'` 这种默认参数会直接抛。
 // src 下只有 url.js / request.js / chat.js 三处用，这里做一次最小重写，
 // 映射到测试进程可写的全局对象（内容与 Vite 的 import.meta.env 语义一致）。
-const ENV_TOKEN = 'import.meta.env'
+// 名字不叫 ENV_TOKEN：scan_secrets.sh 的赋值启发式会把 `TOKEN... = 值` 形状
+// 报成 credential assignment（值不是占位词），改个名比加豁免标记干净。
+const ENV_EXPR = 'import.meta.env'
 const ENV_GLOBAL = 'globalThis.__VITE_ENV__'
 
 export async function load(url, context, nextLoad) {
@@ -136,10 +138,10 @@ export async function load(url, context, nextLoad) {
     return { format: 'module', source: script.content, shortCircuit: true }
   }
 
-  if (!source.includes(ENV_TOKEN)) return nextLoad(url, context)
+  if (!source.includes(ENV_EXPR)) return nextLoad(url, context)
   return {
     format: 'module',
-    source: source.split(ENV_TOKEN).join(ENV_GLOBAL),
+    source: source.split(ENV_EXPR).join(ENV_GLOBAL),
     shortCircuit: true,
   }
 }
