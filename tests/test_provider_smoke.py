@@ -17,6 +17,7 @@ No network access is required.
 """
 
 import asyncio
+import importlib.util
 import logging
 import os
 import subprocess
@@ -300,6 +301,101 @@ def test_rerank_without_api_key_reports_failed_trace(monkeypatch):
     assert ranked == []
     assert trace["status"] == "failed"
     assert "RERANK_API_KEY" in trace["error"]
+
+
+def _load_smoke_module(monkeypatch):
+    """Import scripts/smoke_providers.py with the environment it rewrites contained.
+
+    Importing the script decides offline mode from sys.argv and overwrites the provider
+    credentials and base URLs in os.environ before the config is imported. Registering each
+    of those names with monkeypatch first makes that rewrite revert with the test instead of
+    leaking into the rest of the session.
+    """
+    for name in (
+        "DEEPSEEK_API_KEY",
+        "TEXT_FALLBACK_API_KEY",
+        "EMBEDDING_API_KEY",
+        "RERANK_API_KEY",
+        "DEEPSEEK_BASE_URL",
+        "TEXT_FALLBACK_BASE_URL",
+        "EMBEDDING_BASE_URL",
+        "RERANK_BASE_URL",
+    ):
+        monkeypatch.setenv(name, os.environ.get(name, ""))
+    monkeypatch.setattr(sys, "argv", ["smoke_providers.py"])
+
+    spec = importlib.util.spec_from_file_location("smoke_providers_under_test", ROOT / "scripts" / "smoke_providers.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _UnreachableRerankClient:
+    """The client shape when the qwen3-rerank endpoint cannot be reached."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, json=None, headers=None):
+        raise httpx.ConnectError("dashscope rerank unreachable")
+
+
+def _reachable_fallback(*_args, **_kwargs):
+    """The LLM fallback answering: the shape that used to make `rerank` report a pass."""
+
+    async def _call():
+        return {"results": [{"id": 2, "score": 0.8, "reason": "fallback ok"}]}
+
+    return _call()
+
+
+def test_smoke_rerank_check_rejects_a_fallback_served_request(monkeypatch):
+    # issue #148: the LLM fallback returns status="done" too, so `rerank` used to report a
+    # pass while the qwen3-rerank endpoint never answered -- an unreachable endpoint, an
+    # expired key and a bad model name were all indistinguishable from a verified rerank.
+    smoke = _load_smoke_module(monkeypatch)
+    monkeypatch.setattr(smoke.config, "RERANK_API_KEY", "test-rerank-key")
+    monkeypatch.setattr(rerank, "RERANK_API_KEY", "test-rerank-key")
+    monkeypatch.setattr(rerank, "RERANK_LLM_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(rerank.httpx, "AsyncClient", _UnreachableRerankClient)
+    monkeypatch.setattr(rerank, "call_chat_json", _reachable_fallback)
+
+    with pytest.raises(AssertionError) as exc_info:
+        smoke.check_rerank(live=True)
+
+    # The failure has to carry enough to tell an operator which provider answered and why
+    # the primary one did not.
+    message = str(exc_info.value)
+    assert "status='done'" in message
+    assert "provider='deepseek_fallback'" in message
+    assert "fallback='dashscope rerank unreachable'" in message
+
+
+def test_smoke_rerank_fallback_check_rejects_a_primary_served_request(monkeypatch):
+    # The mirror invariant: `rerank-fallback` drives the LLM fallback directly, so a trace
+    # claiming the primary provider means the fallback was never verified.
+    smoke = _load_smoke_module(monkeypatch)
+
+    async def _primary_provider_trace(_question, _chunks):
+        return [{"file_id": 1, "chunk_id": "1", "rerank_score": 1.0}], {
+            "status": "done",
+            "provider": rerank.RERANK_PROVIDER,
+            "model": rerank.RERANK_MODEL,
+            "items": [],
+        }
+
+    monkeypatch.setattr(rerank, "_rerank_chunks_with_llm", _primary_provider_trace)
+
+    with pytest.raises(AssertionError) as exc_info:
+        smoke.check_rerank_fallback(live=False)
+
+    assert f"provider='{rerank.RERANK_PROVIDER}'" in str(exc_info.value)
 
 
 class _RecordingChatModel:
