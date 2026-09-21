@@ -47,7 +47,7 @@ flowchart LR
   FastAPI --> MySQL["MySQL"]
   FastAPI --> Retrieval["RAG 检索"]
   Retrieval --> Milvus["Milvus 向量库"]
-  Retrieval --> DeepSeek["DeepSeek 规划/重排"]
+  Retrieval --> DeepSeek["DeepSeek 规划"]
   FastAPI --> SSE["SSE 流式返回"]
   SSE --> Store
   Store --> Vue
@@ -359,8 +359,9 @@ flowchart TD
 |---|---|
 | MySQL | 主数据库 |
 | Milvus | 向量库 |
-| DeepSeek | 聊天、规划、重排 |
+| DeepSeek | 聊天、规划（rerank 仅在异常时兜底） |
 | DashScope embedding | 文本向量化 |
+| DashScope rerank | `qwen3-rerank` 重排主链路 |
 | RAGAS | 回答质量评估 |
 | OSS | 图片和头像 |
 | JWT | 登录鉴权 |
@@ -487,6 +488,7 @@ sequenceDiagram
   participant R as backend/rag/retrieval.retrieve_knowledge()
   participant V as milvus_client.query_vectors()
   participant L as DeepSeek
+  participant P as DashScope rerank
   participant DB as MySQL
 
   C->>Store: sendMessage()
@@ -498,7 +500,8 @@ sequenceDiagram
   R->>V: original / hyde / rewrite routes
   R->>R: keyword_recall()
   R->>R: rrf_fuse()
-  R->>L: rerank_chunks()
+  R->>P: rerank_chunks()（qwen3-rerank）
+  R->>L: rerank_chunks() 回退（仅 RERANK_LLM_FALLBACK_ENABLED=true 且主链路异常）
   B->>L: stream_rag_answer()
   B->>DB: 保存 user / assistant messages
 ```
