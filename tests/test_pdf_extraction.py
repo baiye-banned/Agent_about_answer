@@ -53,7 +53,15 @@ def _escape_pdf_text(text: str) -> bytes:
     return escaped.encode("latin-1")
 
 
-def _minimal_pdf(page_texts: list[str]) -> bytes:
+# 简单字体的字节到字符映射由 /Encoding 决定，不声明就是不明确的。
+# 两个字体对象分别用于「正确路径」与「钉住 pypdf 4→6 兜底差异」两类用例。
+_HELVETICA_WINANSI = (
+    b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+)
+_HELVETICA_NO_ENCODING = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+
+
+def _minimal_pdf(page_texts: list[str], font: bytes = _HELVETICA_WINANSI) -> bytes:
     """最小可用 PDF：1=Catalog、2=Pages、3=Font(Helvetica)，之后每页占 Page、Contents 两个对象。"""
     page_count = len(page_texts)
     page_obj_nums = [4 + index * 2 for index in range(page_count)]
@@ -63,12 +71,7 @@ def _minimal_pdf(page_texts: list[str]) -> bytes:
     objects: list[tuple[int, bytes]] = [
         (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
         (2, b"<< /Type /Pages /Kids [" + kids + b"] /Count %d >>" % page_count),
-        # /Encoding 必须显式声明：简单字体的字节到字符映射由它决定，不写就是不明确的。
-        # pypdf 4 对缺失声明按 Latin-1 兜底，pypdf 6 改按 PDF 规范默认的 StandardEncoding，
-        # 于是 0xE9(é)/0xFC(ü) 会被解成别的字符。真实 PDF（Word/LibreOffice 等产出）
-        # 要么显式声明 WinAnsi，要么用 CID 字体，不会落到这条兜底路径上。
-        (3, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
-            b"/Encoding /WinAnsiEncoding >>"),
+        (3, font),
     ]
 
     for index, text in enumerate(page_texts):
@@ -118,7 +121,10 @@ def _cjk_pdf(page_texts: list[str]) -> bytes:
     CID 从 1 起顺序分配（0 保留），每个字符一个 CID，逐字映射回 Unicode。
     对象号：1=Catalog、2=Pages、3=Type0、4=CIDFont、5=Descriptor、6=ToUnicode、7+=每页一个 Contents。
     """
-    cid_of: dict[int, list[tuple[int, str]]] = {}
+    # 逐页累积，按「页序号」存放而不是按文本对象：cpython 会驻留相同字面量，
+    # 两页文本相同时 id() 相等，用 id 当键会让后一页覆盖前一页的 CID，
+    # 于是前一页吐出的是 CMap 里根本没映射过的裸 CID。
+    page_pairs: list[list[tuple[int, str]]] = []
     page_hex: list[str] = []
     next_cid = 1
 
@@ -127,13 +133,12 @@ def _cjk_pdf(page_texts: list[str]) -> bytes:
         for char in text:
             pairs.append((next_cid, char))
             next_cid += 1
-        cid_of[id(text)] = pairs
+        page_pairs.append(pairs)
         # 所有 CID 必须拼在同一对尖括号内：拆成多个 <...><...> 会被当成多个
         # 字符串对象，Tj 只消费第一个，会静默丢掉后面的字。
         page_hex.append("<%s>" % "".join("%04X" % cid for cid, _ in pairs))
 
-    all_pairs = [pair for text in page_texts for pair in cid_of[id(text)]]
-    cmap = _to_unicode_cmap(all_pairs)
+    cmap = _to_unicode_cmap([pair for pairs in page_pairs for pair in pairs])
 
     content_obj_nums = [7 + index for index in range(len(page_texts))]
     page_obj_nums = [7 + len(page_texts) + index for index in range(len(page_texts))]
@@ -226,6 +231,27 @@ def test_extract_pdf_text_returns_empty_string_for_pdf_without_pages():
     assert extract_pdf_text(_minimal_pdf([])) == ""
 
 
+def test_font_without_encoding_follows_standard_encoding():
+    """把 pypdf 4 → 6 唯一真实的抽取行为差异钉在 CI 里，而不是只留在一次性探针里。
+
+    简单字体不声明 /Encoding 时，字节到字符的映射是不明确的：
+    pypdf 4 按 Latin-1 兜底，pypdf 6 按 PDF 规范默认的 StandardEncoding，
+    于是 0xE9(é) 不再解成 é。这里断言的是「**不带声明会解错**」这一事实本身，
+    用来固定差异存在；不去写死具体错成哪个字符（那属于 pypdf 实现细节，会随版本再变）。
+
+    上面所有夹具都显式声明了 /Encoding，走的是正确路径；真正受影响的是
+    那些不声明编码的畸形 PDF——它们的重音字符会静默抽错且不报错。
+
+    这条是**行为哨兵**：它若失败，先看是不是 pypdf 又改了兜底策略（那就更新本节说明），
+    而不是去找「谁引入了 bug」。
+    """
+    result = extract_pdf_text(_minimal_pdf(["café résumé"], font=_HELVETICA_NO_ENCODING))
+
+    # ASCII 部分照常抽出，只有重音字符坏掉——正是「静默」二字的来源。
+    assert "caf" in result
+    assert "café résumé" not in result
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -266,6 +292,19 @@ def test_extract_pdf_text_strips_blank_chinese_page():
 
     assert "有效条款" in result
     assert "第 2 页" not in result
+
+
+def test_extract_pdf_text_handles_pages_with_identical_text():
+    """两页文本完全相同时，两页都要抽对。
+
+    这条守的是夹具本身：CID 曾按 `id(text)` 存放，而 cpython 会驻留相同字面量，
+    两页的 id 相等会让后一页覆盖前一页的映射，前一页于是吐出 CMap 里没有的裸 CID
+    （实测量到 '\\x01\\x02\\x03\\x04'）。改成按页序号存放后不再发生。
+    """
+    result = extract_pdf_text(_cjk_pdf(["重复的页", "重复的页"]))
+
+    assert result.count("重复的页") == 2
+    assert "\x01" not in result
 
 
 # ---------------------------------------------------------------------------

@@ -252,18 +252,25 @@ def test_upload_keeps_non_ascii_filename(api):
 def test_upload_drops_rfc5987_filename_extended_parameter(api):
     """RFC 5987 的 filename* 不再被采信：该 part 会被当成普通表单字段，请求以 422 拒绝。
 
-    issue #98 的升级实测行为（0.0.9 → 0.0.31 唯一的行为变更）：
-    python-multipart 0.0.31 的加固解析器不再把 filename* 归一化成 filename，
-    而 starlette 0.38.6 的 formparsers 是把 Content-Disposition 解析委托给它
-    （starlette/formparsers.py:183 调 parse_options_header）、
-    再判 `b"filename" in options`（starlette/formparsers.py:188），
-    因此这个 part 不会被识别为文件，FastAPI 的 File(...) 匹配不上 → 422。
+    issue #98 的升级实测行为：加固后的解析器不再把 filename* 归一化成 filename。
+    逐版本实测（parse_options_header 直调）：0.0.20 / 0.0.29 **仍归一化**，
+    **0.0.30 起丢弃**——也就是说变更发生在 0.0.30，正是
+    GHSA-vffw-93wf-4j4q（RFC 2231/5987 参数走私）标注的修复版本，本单的 0.0.31 下限覆盖它。
 
-    这是修复 GHSA-vffw-93wf-4j4q（RFC 2231/5987 参数走私）所采取的方向：
+    之所以变成 422：starlette 0.38.6 的 formparsers 把 Content-Disposition 解析委托给
+    python-multipart（starlette/formparsers.py:183 调 parse_options_header），
+    再判 `b"filename" in options`（starlette/formparsers.py:188）。
+    键不存在 → 该 part 不被识别为文件 → FastAPI 的 File(...) 匹配不上 → 422。
+
+    这是修复 GHSA-vffw-93wf-4j4q 所采取的方向：
     不在应用层重新解析 filename* 来恢复兼容，否则等于把这条告警刚堵上的洞重新打开。
     浏览器一律只发 filename="..."（原始 UTF-8 字节），该形态在升级前后都正常，
     见 test_upload_keeps_non_ascii_filename；受影响的是自造报文的 API 客户端，
     改用 filename="制度文件.md" 即可。
+
+    注：0.0.30 同时还有第二处解析行为变更——QueryStringParser 不再把分号当字段分隔符
+    （GHSA-6jv3-5f52-599m，实测 0.0.29 及以前 `a=1;b=2` 拆成两个字段，0.0.30 起不拆）。
+    本仓库的表单字段只有整数 knowledge_base_id，不含分号，故不受影响；一并记录以免日后误判。
     """
     response = _raw_multipart_upload(
         api,
