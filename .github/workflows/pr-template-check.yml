@@ -15,6 +15,10 @@ permissions:
 jobs:
   pr-template-check:
     name: PR 描述必填节校验
+    # Dependabot 的 PR 描述由平台自动生成（版本对比 + 发布说明），结构上不可能带上
+    # 本仓库模板的必填小节，对这类 PR 执行只会产生恒红的噪音。改动别人 PR 描述也无从下手，
+    # 故直接跳过；标题门禁（Conventional Commits）对 Dependabot 仍然生效。
+    if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: 检出 PR 合并结果（脚本兜底来源）
