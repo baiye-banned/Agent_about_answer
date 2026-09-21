@@ -232,6 +232,34 @@ def test_chunk_text_keeps_order_text_when_marker_sits_on_its_own_line(prefix):
     assert chunk_coverage_ratio(source, chunks) >= 0.9
 
 
+@pytest.mark.parametrize("prefix", ORDER_PREFIXES)
+def test_chunk_text_indexes_every_order_row(prefix):
+    """issue #75：逐行核对每一条编号都真的进了库。
+
+    上面的用例沿用 issue 的语料（40 行内容相同），覆盖率是「长度求和」，
+    理论上「同一行重复 40 次」也能凑够；这条用例让每行互不相同再逐行断言。
+    """
+    source = "\n".join(f"{prefix}第{index}项 {ORDER_BODY}" for index in range(1, ORDER_ROWS + 1))
+
+    chunks = chunk_text(source, file_id=1)
+
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    for index in range(1, ORDER_ROWS + 1):
+        assert f"{prefix}第{index}项" in joined
+
+
+def test_heading_level_treats_overlong_decimal_chain_as_body():
+    """issue #75 复核：整行只由数字与点号组成的小数链仍按正文处理。
+
+    _DECIMAL_MARKER_RE 会把这种行整行吃光，统一判定取到的标记后文本为空、
+    长度信号失效，只能由 _looks_like_long_list_item 拦下——它不能被合并掉。
+    """
+    line = "1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17.18.19.20.1."
+    assert len(line) > _LONG_HEADING_MAX_LEN
+    assert _heading_level(line) is None
+
+
 def test_heading_level_keeps_order_heading_without_inline_body():
     """issue #75：标记后没有正文的行仍是标题，标题语义不被误判成正文。"""
     assert _heading_level("三、总则") == 2

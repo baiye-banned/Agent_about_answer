@@ -171,6 +171,18 @@ def _normalize_line(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _looks_like_long_list_item(line: str) -> bool:
+    """小数编号的超长行按正文处理。
+
+    不能并入 _looks_like_order_heading_with_body：_DECIMAL_MARKER_RE 是贪婪匹配，
+    碰到「1.2.…20.1.」这类整行只由数字与点号组成的行会把整行吃光、标记后为空；
+    而 _DECIMAL_HEADING_RE 能回溯到第一个点号后由 \\s*\\S+ 吃掉其余部分，仍然匹配。
+    只有这条长度保护拦得住这种行，删掉会让它们退回「整行当标题丢弃」。
+    """
+    stripped = _normalize_line(line)
+    return len(stripped) > _LONG_HEADING_MAX_LEN and bool(_DECIMAL_HEADING_RE.match(stripped))
+
+
 def _order_heading_tail(line: str) -> str:
     """取编号标记（第N条 / 三、 / （一） / 1、）之后的剩余文本；为空说明是纯标题行。"""
     for marker_re in _ORDER_MARKER_RES:
@@ -198,7 +210,7 @@ def _looks_like_order_heading_with_body(line: str) -> bool:
 
 def _heading_level(line: str) -> int | None:
     stripped = _normalize_line(line)
-    if not stripped:
+    if not stripped or _looks_like_long_list_item(stripped):
         return None
     if _PDF_PAGE_HEADING_RE.match(stripped):
         return 0
