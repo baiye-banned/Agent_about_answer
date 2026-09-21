@@ -25,11 +25,13 @@ from rag.rerank import (
 ROUTE_CONFIDENCE_THRESHOLD = 0.55
 
 # 关键词召回（issue #59）：窗口几何、取数批大小与 SQL 预筛参数。
-# 单批行数直接决定召回路径的峰值内存上界（单批行数 × 单文件最大体积），
-# 与知识库文件总数无关；同时兼顾小文件书库的往返次数。
+# 峰值内存上界 ≈ 单批累计字符数（而不是整库总量）。批大小按上一批的实际体积自适应：
+# 小文件多取几行省往返，大文件少取几行压内存。
 KEYWORD_CHUNK_SIZE = 900
 KEYWORD_CHUNK_OVERLAP = 180
-KEYWORD_RECALL_BATCH_SIZE = 4
+KEYWORD_RECALL_BATCH_SIZE = 2
+KEYWORD_RECALL_BATCH_ROWS_MAX = 32
+KEYWORD_RECALL_BATCH_CHARS = 4_000_000
 LIKE_ESCAPE = "!"
 # 与 _keyword_score 一致的高权重场景词。
 KEYWORD_BONUS_TERMS = frozenset({"迟到", "早退", "旷工", "罚款", "处罚", "考勤"})
@@ -308,9 +310,13 @@ def _iter_keyword_candidate_files(
 
     两个上界同时生效：SQL 侧 ``LIMIT`` 限制单批行数，``id > last_id`` 只向前扫描（不会
     重复扫已经处理过的行）；预筛推不下去时退化为整库分批扫描，内存上界不变。
+
+    批次大小按上一批的实际体积调整，让「单批累计字符数」落在预算附近：小文件书库少几次
+    往返，大文件书库把峰值压在预算量级（单个文件本身就超预算时无法再小）。
     """
     prefilter = _sql_prefilter_patterns(clean_keywords, case_fold)
     last_id = 0
+    batch_rows = KEYWORD_RECALL_BATCH_SIZE
     while True:
         query = db.query(KnowledgeFile.id, KnowledgeFile.name, KnowledgeFile.content).filter(
             KnowledgeFile.knowledge_base_id == knowledge_base_id,
@@ -320,20 +326,28 @@ def _iter_keyword_candidate_files(
             # 关键词含字母时先在库侧折叠大小写，再交给 LIKE；纯汉字关键词不必多做一遍。
             column = func.lower(KnowledgeFile.content) if case_fold else KnowledgeFile.content
             query = query.filter(or_(*[column.like(pattern, escape=LIKE_ESCAPE) for pattern in prefilter]))
-        rows = query.order_by(KnowledgeFile.id).limit(KEYWORD_RECALL_BATCH_SIZE).all()
+        rows = query.order_by(KnowledgeFile.id).limit(batch_rows).all()
         if not rows:
             return
+        batch_chars = 0
         for file_id, file_name, content in rows:
+            batch_chars += len(content or "")
             yield int(file_id), file_name, content or ""
         last_id = int(rows[-1][0])
+        average_chars = max(batch_chars // len(rows), 1)
+        batch_rows = max(
+            1, min(KEYWORD_RECALL_BATCH_ROWS_MAX, KEYWORD_RECALL_BATCH_CHARS // average_chars)
+        )
 
 
 def _sql_prefilter_patterns(clean_keywords: list[str], case_fold: bool = True) -> list[str] | None:
     """SQL 侧 LIKE 预筛模式（命中结果的必要条件），None 表示只能整库分批扫描。
 
-    关键词匹配的语义是「去掉空白 + 忽略大小写后的子串匹配」，SQL 里没法逐字复刻。这里退
-    一步只要求「字符按序出现」：没有空白的关键词就是普通子串（既必要也充分），含空白的
-    关键词用 ``%`` 夹住每个字符（只是必要条件，例如 "迟到 罚款" 允许正文里隔着空白）。
+    关键词匹配的语义是「去掉空白 + 忽略大小写后的子串匹配」，SQL 里没法逐字复刻。这里只
+    要求「各字符按序出现」（``%`` 夹住每个字符）：被匹配掉的空白可能出现在正文任意位置，
+    所以不能要求字面子串——正文写成「考 假」时去掉空白才等于「考假」，字面 LIKE 会漏掉
+    它。字面版只是这条必要条件的一个特例，为不漏召回一律用按序版。
+
     真正命中的行一定过筛，因此不会漏召回，只可能多取几行；多取的行由 Python 侧的精确
     判定再筛掉。
 
@@ -347,10 +361,7 @@ def _sql_prefilter_patterns(clean_keywords: list[str], case_fold: bool = True) -
         normalized = _normalize_for_match(keyword, case_fold)
         if len(normalized) < 2:
             continue
-        if _WHITESPACE_RE.search(keyword):
-            patterns.append("%" + "%".join(_escape_like_char(char) for char in normalized) + "%")
-        else:
-            patterns.append("%" + _escape_like_char(normalized) + "%")
+        patterns.append("%" + "%".join(_escape_like_char(char) for char in normalized) + "%")
     return patterns or None
 
 
