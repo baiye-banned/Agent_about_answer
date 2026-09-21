@@ -700,7 +700,11 @@ async function loadOlderMessages() {
   const container = chatRef.value
   const previousHeight = container?.scrollHeight ?? 0
   const previousTop = container?.scrollTop ?? 0
-  await chatStore.loadOlderMessages()
+  try {
+    await chatStore.loadOlderMessages()
+  } catch {
+    // 请求失败已经由 axios 拦截器提示，这里只保证不把异常抛成未处理的拒绝。
+  }
   await nextTick()
   if (container) {
     container.scrollTop = container.scrollHeight - previousHeight + previousTop
