@@ -35,6 +35,12 @@ bash scripts/scan_secrets.sh
   安装 gitleaks：<https://github.com/gitleaks/gitleaks#installing>。
   在 git worktree 里（`.git` 是文件）gitleaks 无法打开历史，脚本会打印提示并只扫工作区，
   历史扫描请在普通克隆或 CI 里做。
+- 「gitleaks 扫到了密钥」与「gitleaks 自己没跑成」是两种结论，脚本不会把它们混为一谈。
+  gitleaks 对两者都返回 1，只看退出码无法区分，所以脚本改用 gitleaks 自己的命中标记判定：
+  出现命中标记才是「发现密钥」（退出码 1），其余非零一律按「这一遍没扫成」处理并以退出码 2
+  失败，输出里会写明这是扫描器错误、不是命中。两种情形都不会放过真密钥。遇到退出码 2 时去
+  查 gitleaks 自己打印的错误（例如 `--source` 指向的目录它打不开），不必去日志里找一个并不
+  存在的泄漏。
 
 ## 密钥与配置
 

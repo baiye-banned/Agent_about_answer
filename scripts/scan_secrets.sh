@@ -58,11 +58,21 @@
 #   checkout - depending on the environment it fails outright or reports
 #   "0 commits scanned", a clean-looking scan of nothing. Use a normal clone,
 #   or CI, for history scanning.
+#   A pass that reports findings and a pass that fails to run are kept apart.
+#   gitleaks exits 1 both for "leaks found" and for a fatal error, so the exit
+#   code alone cannot tell a secret from a scanner that never scanned anything:
+#   a pass counts as findings only on gitleaks' own finding marker, and every
+#   other non-zero exit is a scanner error that fails the run without claiming a
+#   secret was found. The source path handed to gitleaks is normalized first,
+#   because under git-bash / MSYS $PWD is "/c/..." while gitleaks is a native
+#   binary that cannot open that form at all.
 #
 # Exit codes:
 #   0  clean
 #   1  findings (built-in scan and/or gitleaks)
-#   2  bad usage, gitleaks not installed, or no gitleaks pass could run
+#   2  bad usage, gitleaks not installed, or a gitleaks pass that did not run -
+#      a missing binary, or a pass that failed (e.g. on a source it cannot open)
+#      without reporting findings. Neither is ever reported as findings.
 #
 # A scan that quietly skips gitleaks reads as proof that the repository is
 # clean when nothing of the sort was checked, so a missing gitleaks is an
@@ -91,7 +101,8 @@ Usage: bash scripts/scan_secrets.sh [PATH] [--tracked-only] [--patterns-only]
                       history and no entropy scan happens (explicit opt-out)
   --require-gitleaks  accepted for compatibility; gitleaks is required by default
 
-Exit codes: 0 clean, 1 findings, 2 bad usage / gitleaks not installed / no pass ran.
+Exit codes: 0 clean, 1 findings, 2 bad usage / gitleaks not installed / a gitleaks
+pass that did not run (including one that failed without reporting findings).
 USAGE
 }
 
@@ -135,9 +146,13 @@ mkdir -p "$TMP_SCAN" || exit 2
 FINDINGS_FILE="$TMP_SCAN/findings.txt"
 ALLOWED_FILE="$TMP_SCAN/allowed.txt"
 GITLEAKS_LOG="$TMP_SCAN/gitleaks.log"
+# One pass writes here first, so its outcome can be classified on its own output
+# before it is appended to the shared log the run prints at the end.
+GITLEAKS_PASS_LOG="$TMP_SCAN/gitleaks-pass.log"
 : > "$FINDINGS_FILE"
 : > "$ALLOWED_FILE"
 : > "$GITLEAKS_LOG"
+: > "$GITLEAKS_PASS_LOG"
 trap 'rm -rf "$TMP_SCAN"' EXIT
 
 SKIP_DIRS='.git node_modules .venv venv __pycache__ .pytest_cache dist'
@@ -334,14 +349,78 @@ if [ -s "$ALLOWED_FILE" ]; then
   sort -u "$ALLOWED_FILE" | sed 's/^/  /'
 fi
 
-# Appends one gitleaks run to the shared log; the exit status is gitleaks'.
+# gitleaks is a native binary, so it needs the source in the platform's own path
+# form. Under git-bash / MSYS $PWD is "/c/..." while the history pass gets git's
+# own "C:/..." from rev-parse, and the native exe cannot open the MSYS form: it
+# dies with "FTL CreateFile /c/...: The system cannot find the path specified"
+# having read nothing. cygpath -m produces the mixed form git itself uses, keeps
+# spaces and non-ASCII bytes intact, and is idempotent, so an already-native path
+# passes through unchanged. On macOS / Linux cygpath does not exist and the path
+# is already native, so it is used as-is.
+native_path() {
+  local converted
+  if command -v cygpath >/dev/null 2>&1; then
+    converted=$(cygpath -m -- "$1" 2>/dev/null) || converted=""
+    if [ -n "$converted" ]; then
+      printf '%s' "$converted"
+      return 0
+    fi
+  fi
+  printf '%s' "$1"
+}
+
+# Runs one gitleaks pass into the pass log and classifies the outcome. The raw
+# exit status cannot be used on its own: gitleaks exits 1 both for "leaks found"
+# and for a fatal error such as a source it cannot open, and folding both into
+# "findings" is exactly the misreport this separation exists to prevent (an
+# environment error used to be announced as a found secret). A pass therefore
+# counts as findings only on gitleaks' own finding marker; any other non-zero
+# exit is a scanner error that fails the run without naming a secret. If a future
+# gitleaks renames that marker the outcome degrades to a scanner error (exit 2),
+# never to a silent pass: the run still goes red, it just says the scan did not
+# run instead of claiming findings.
+#
+# Returns 0 pass completed, 1 findings, 2 scanner error (nothing was scanned).
 GITLEAKS_PASSES=0
 gitleaks_pass() {
-  local label=$1 src=$2
+  local label=$1 src=$2 rc=0
   shift 2
+  src=$(native_path "$src")
+  # Checked before gitleaks is invoked so an unreachable source is reported as
+  # what it is, rather than as an ambiguous non-zero exit afterwards.
+  if [ ! -d "$src" ]; then
+    echo "scan_secrets: ERROR - the gitleaks $label source is not a directory: $src" >&2
+    return 2
+  fi
   echo "scan_secrets: gitleaks - scanning $label"
   GITLEAKS_PASSES=$((GITLEAKS_PASSES + 1))
-  gitleaks detect --source "$src" --redact --no-banner "$@" >> "$GITLEAKS_LOG" 2>&1
+  gitleaks detect --source "$src" --redact --no-banner "$@" > "$GITLEAKS_PASS_LOG" 2>&1 || rc=$?
+  cat "$GITLEAKS_PASS_LOG" >> "$GITLEAKS_LOG"
+  if [ "$rc" -eq 0 ]; then
+    return 0
+  fi
+  if grep -q 'leaks found:' "$GITLEAKS_PASS_LOG"; then
+    return 1
+  fi
+  # The pass output itself is not repeated here: it is already in the shared log
+  # the run prints just below, and printing it twice reads like two failures.
+  echo "scan_secrets: ERROR - the gitleaks $label pass failed without reporting findings" >&2
+  echo "  (gitleaks exit $rc); nothing was scanned for that pass" >&2
+  return 2
+}
+
+# Folds one pass' outcome into the run-level status. A scanner error (2) outranks
+# findings (1): either way the run fails, but "the scan did not run" is the
+# stronger claim and a later findings pass must not overwrite it.
+run_gitleaks_pass() {
+  local rc=0
+  gitleaks_pass "$@" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) [ "$GITLEAKS_RC" -eq 2 ] || GITLEAKS_RC=1 ;;
+    *) GITLEAKS_RC=2 ;;
+  esac
+  return 0
 }
 
 GITLEAKS_RC=0
@@ -356,7 +435,7 @@ elif command -v gitleaks >/dev/null 2>&1; then
         echo "  the history pass is skipped. Run in a normal clone, or rely on CI, for history."
       } >&2
     else
-      gitleaks_pass "commit history" "$GIT_ROOT" || GITLEAKS_RC=1
+      run_gitleaks_pass "commit history" "$GIT_ROOT"
     fi
     if [ "$TRACKED_ONLY" -eq 1 ]; then
       {
@@ -365,13 +444,19 @@ elif command -v gitleaks >/dev/null 2>&1; then
         echo "  layer. Drop the flag to scan the whole working tree."
       } >&2
     else
-      gitleaks_pass "working tree" "$PWD" --no-git || GITLEAKS_RC=1
+      run_gitleaks_pass "working tree" "$PWD" --no-git
     fi
   else
-    gitleaks_pass "working tree" "$PWD" --no-git || GITLEAKS_RC=1
+    run_gitleaks_pass "working tree" "$PWD" --no-git
   fi
   sed -n '1,120p' "$GITLEAKS_LOG"
-  if [ "$GITLEAKS_RC" -ne 0 ]; then
+  if [ "$GITLEAKS_RC" -eq 2 ]; then
+    {
+      echo "scan_secrets: ERROR - a gitleaks pass did not run (see the error above), so the"
+      echo "  history and entropy checks are incomplete; refusing to report a clean scan."
+      echo "  This is a scanner error, not a reported finding."
+    } >&2
+  elif [ "$GITLEAKS_RC" -ne 0 ]; then
     echo "scan_secrets: FAIL - gitleaks reported findings (secrets are redacted above)" >&2
   elif [ "$GITLEAKS_PASSES" -eq 0 ]; then
     {
