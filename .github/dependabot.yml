@@ -21,13 +21,17 @@
 #    只有一两条，行为等同于单独开 PR；只在积压期起「合并同类项」的作用。
 #    代价：一个安全 PR 会同时包含多条 CVE 修复，若其中一条让 CI 变红，需要再拆开定位——
 #    相对于几十个无人处理的 PR，这个代价是可接受的。
+#    安全组刻意不写 update-types：安全修复不该因为是 major 就被排除在批次之外，
+#    而 minor/patch 那组写 update-types 正是为了把 major 单独拎出来评审。
 #
 # 3) 版本更新按 semver 分组：minor + patch 合批（向后兼容，可整批过 CI 后合并），
 #    major 不分组、单独开 PR（可能破坏兼容，需要逐个判断）。
 #
-# 另外，commit-message 的 chore(deps) 前缀是必需的、不是装饰：Dependabot 默认标题形如
-# “Bump axios from 1.16.0 to 1.17.0”，会被仓库的 scripts/check_title.mjs 判红，
-# 带上前缀后才符合 Conventional Commits 门禁。
+# 另外，commit-message 的前缀是为「分组后的 PR」准备的，不是给单依赖 PR 兜底：本仓库本来就在用
+# Conventional Commits，Dependabot 会沿用仓库既有风格，实测开出的
+# “chore(deps): bump axios from 1.16.0 to 1.18.0” 不带任何配置就能过 scripts/check_title.mjs。
+# 但分组 PR 的默认标题是 “Bump the <组名> group with N updates”，前面没有合法 type，会被标题门禁
+# 判红；带上 chore 前缀后才会变成 “chore(deps): bump the <组名> group with N updates”。
 version: 2
 updates:
   # 前端依赖：package.json / package-lock.json 位于仓库根目录。
