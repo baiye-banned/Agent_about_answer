@@ -561,7 +561,7 @@ flowchart LR
 | `loading` / `uploading` / `uploadPercent` | `ref` | 页面加载与上传状态 |
 | `keyword` / `sortField` / `sortOrder` / `page` / `pageSize` | `ref` | 搜索和分页 |
 | `selectedFiles` | `ref` | 批量选择文件 |
-| `detailVisible` / `detailFile` / `detailContent` / `contentLoading` | `ref` | 文件详情抽屉/弹层 |
+| `detail` | `reactive` | 文件详情弹层状态（`src/utils/detailPreview.js` 的状态容器：`visible` / `file` / `content` / `loading` / `error`） |
 | `knowledgeBaseDialogVisible` / `knowledgeBaseSubmitting` / `knowledgeBaseDialogMode` | `ref` | 新建/重命名知识库弹层 |
 | `knowledgeBaseFormRef` / `knowledgeBaseInputRef` / `knowledgeBaseForm` | `ref/reactive` | 表单状态 |
 | `knowledgeStore` / `knowledgeBases` | store/computed | 知识库列表 |
@@ -577,7 +577,7 @@ flowchart LR
 | `handleUploadInputChange()` / `handleUpload()` / `openUploadDialog()` | 方法 | 文件上传 |
 | `confirmDelete()` / `confirmBatchDelete()` / `confirmCentered()` | 方法 | 删除确认弹窗 |
 | `refreshKnowledgeBaseAndFiles()` | 方法 | 同步刷新 |
-| `showDetail()` / `copyContent()` | 方法 | 查看文件详情与复制内容 |
+| `showDetail()` / `copyContent()` | 方法 | 查看文件详情与复制内容（`showDetail` 即 `createDetailPreview()` 的 `open`，请求序号守卫保证迟到的旧响应不改写正文；弹窗关闭时作废在飞请求） |
 | `getFileIcon()` / `getFileExt()` / `formatSize()` / `formatTime()` | 方法 | 文件显示辅助 |
 
 ### `src/views/UserProfile.vue`

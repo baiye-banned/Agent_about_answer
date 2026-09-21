@@ -45,12 +45,13 @@ Current files:
 - `chatApi.test.js`
 - `chatStore.test.js`
 - `clipboard.test.js`
+- `detailPreview.test.js`
 - `knowledgeFeedback.test.js`
 - `streamEvents.test.js`
 - `url.test.js`
 - `utils.test.js`
 
-These tests cover frontend stream parsing, stream response errors, chat store conversation switching, stale in-flight response handling and fallback reset events, clipboard fallback behavior, knowledge batch delete and upload feedback helpers, the shared delete confirmation orchestration (user cancel, API rejection, and success outcomes), URL normalization and link safety, display formatting, status helpers, image validation, and memory trace helpers.
+These tests cover frontend stream parsing, stream response errors, chat store conversation switching, stale in-flight response handling and fallback reset events, knowledge file detail preview ordering (a late response from a previously opened file must not rewrite the current one, and closing the dialog discards in-flight requests), clipboard fallback behavior, knowledge batch delete and upload feedback helpers, the shared delete confirmation orchestration (user cancel, API rejection, and success outcomes), URL normalization and link safety, display formatting, status helpers, image validation, and memory trace helpers.
 
 ## Python Tests
 
