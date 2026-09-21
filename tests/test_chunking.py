@@ -289,15 +289,29 @@ def test_heading_level_uses_one_tail_boundary_for_every_prefix(prefix):
     assert _heading_level(f"{prefix}{body_tail}") is None
 
 
-@pytest.mark.parametrize("prefix", TAIL_BOUNDARY_PREFIXES)
-def test_unified_tail_bound_is_never_stricter_than_the_old_line_rule(prefix):
-    """统一边界不得比旧口径（量整行、阈值 48）更严。
+# 统一边界只在标记不超过 _MAX_ORDER_MARKER_LEN 时成立；超出这个长度的编号
+# （中文序数写满、深层小数号）必须回落到旧口径，绝不能比它更严。
+LONG_MARKER_PREFIXES = TAIL_BOUNDARY_PREFIXES + [
+    "第一百二十三条 ",
+    "第一百二十三条",
+    "一二三四五六七八九十、",
+    "第1234567条 ",
+    "（1234567）",
+    "1.2.3.4. ",
+    "1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17.18.19.20. ",
+]
 
-    量到「标记之后」总会把边界提前；提前量一旦超过最长标记的长度，旧口径下
-    已经判成正文的行就会被重新判回标题、丢掉正文（对抗评审实测到过这批翻转）。
-    这里逐长度核对：旧口径判正文的行，新口径必须也是正文。
+
+@pytest.mark.parametrize("prefix", LONG_MARKER_PREFIXES)
+def test_unified_tail_bound_is_never_stricter_than_the_old_line_rule(prefix):
+    """统一边界不得比旧口径（量整行、阈值 48）更严——包括标记很长的编号。
+
+    量到「标记之后」总会把边界提前，提前量取决于标记长度，而标记长度没有上界。
+    只要统一边界单独生效，长标记的行就会比旧口径更严：旧口径判正文的行被重新判回
+    标题、正文丢掉（对抗评审实测「第一百二十三条 + 41 字」一例；更长的标记还要更多）。
+    所以这里逐长度核对每个前缀：旧口径判正文的行，新口径必须也是正文。
     """
-    for tail_len in range(1, 60):
+    for tail_len in range(1, 80):
         line = f"{prefix}{'甲' * tail_len}"
         if len(line) > _LONG_HEADING_MAX_LEN:
             assert _heading_level(line) is None, f"{line!r} 旧口径是正文，新口径又判成了标题"
@@ -355,23 +369,35 @@ def test_chunk_text_fallback_keeps_every_distinct_short_row():
         assert f"员工迟到{index}分钟罚款50元" in joined
 
 
-def test_chunk_text_documents_the_mixed_document_boundary():
-    """已知边界（与 develop 实测一致，不是本次改动引入的回归）。
+@pytest.mark.parametrize(
+    "sentence_position",
+    ["trailing", "leading", "none"],
+)
+def test_chunk_text_recovers_mixed_documents_with_short_numbered_rows(sentence_position):
+    """混合文档同样要救回来：编号行夹一两句正文，正是真实制度文档的形状。
 
-    文档里既有正文行、又有「编号 + 短短语正文」行时，兜底不触发（因为确实有正文），
-    短行仍按标题处理、被丢正文——覆盖率与修复前同为 4.9%。
-
-    这条用例的作用是把边界写进代码而不是留在口头：单行判定拿「短标题」和
-    「短正文」没办法，兜底只救「整篇塌缩」；真要连这一格也补上，需要的是
-    「编号行后面到底有没有正文」的结构判定，超出 issue #83 第 1 项的范围。
+    先证红：兜底最初只在「一行正文都没有」时才触发，这种文档里确实有正文，
+    于是 40 行短编号行照旧被整段丢掉——实测覆盖率 4.9%/2.4%，与修复前持平。
+    触发条件改用已有的异常覆盖率口径后，整篇按正文重排。
     """
-    source = "\n".join(
-        ["三、员工迟到罚款50元"] * 20 + ["四、由人事部负责解释"] * 20 + ["本制度自发布之日起施行。"]
-    )
+    rows = ["三、员工迟到罚款50元"] * 20 + ["四、由人事部负责解释"] * 20
+    sentence = "本制度自发布之日起施行。"
+    if sentence_position == "trailing":
+        source = "\n".join([*rows, sentence])
+    elif sentence_position == "leading":
+        source = "\n".join([sentence, *rows])
+    else:
+        source = "\n".join(rows)
 
     chunks = chunk_text(source, file_id=1)
 
-    assert chunk_coverage_ratio(source, chunks) < 0.1
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    assert joined.count("员工迟到罚款50元") >= 20
+    assert joined.count("由人事部负责解释") >= 20
+    if sentence_position != "none":
+        # 正文句同样要留住：整篇按正文重排时不能把它挤掉。
+        assert sentence in joined
 
 
 def test_chunk_text_fallback_does_not_fire_when_the_document_has_body_text():

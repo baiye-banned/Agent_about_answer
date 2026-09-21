@@ -560,6 +560,10 @@ def test_upload_knowledge_times_out_when_ingest_exceeds_the_document_budget(monk
 
     assert exc_info.value.status_code == 500
     assert "超过总时限" in exc_info.value.detail
+    # 500 的文案必须是「超过总时限」，不能落到通用失败分支。
+    # Python 3.10 上 asyncio.TimeoutError 不是内建 TimeoutError，写错 except 就会
+    # 悄悄走通用分支（CI 实测），这里把文案钉住，让那种回退过不了门禁。
+    assert exc_info.value.detail == knowledge_service.INGEST_TIMEOUT_MESSAGE
     # 关键断言：向量写入发生在删除之前。反过来就是评审复现出的孤儿向量。
     assert ("indexing-wrote-vectors", 11) in calls
     assert calls.index(("indexing-wrote-vectors", 11)) < calls.index(("vectors", 11))

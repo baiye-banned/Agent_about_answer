@@ -99,7 +99,11 @@ async def run_ingest_step(step: Callable[..., Any], /, *args: Any, deadline: flo
         raise KnowledgeIngestTimeout(INGEST_TIMEOUT_MESSAGE, work)
     try:
         return await asyncio.wait_for(future, timeout=remaining)
-    except TimeoutError:
+    except (asyncio.TimeoutError, TimeoutError):
+        # 两个都写：3.11 起 asyncio.TimeoutError 就是内建 TimeoutError 的别名，
+        # 而 3.10 上它是另一个类（继承自 Exception），只写内建那个接不住——
+        # 超时会落到下面的通用失败分支：既不报「超过总时限」，也走不到排在写入线程
+        # 之后的清理，等于把这一项的两个修复一起绕过去。CI 的 Python 3.10 实测过。
         raise KnowledgeIngestTimeout(INGEST_TIMEOUT_MESSAGE, work)
 
 
@@ -117,6 +121,12 @@ def defer_ingest_cleanup(work, entry_id: int, user_id: int) -> None:
 
     用独立 SessionLocal 而不是请求级 Session：回调跑在工作线程里，
     而且请求早已返回，请求级 Session 可能已经关闭。
+
+    这条路径的代价，写在这里备查：真正卡死（永不返回）的写入线程会让清理永不执行，
+    于是元数据行留在库里——文件出现在列表中、检索命中的是残缺向量，但用户已收到 500。
+    这是有意选的失败态：反过来先删行再等线程，留下的是「列表里没有、检索却命中」
+    的孤儿向量，那条路径不会自愈（行没了，启动重建也不会再碰它），
+    而留下行的这条会被 rebuild_existing_knowledge_index 在下次启动时重建索引。
     """
     def _cleanup(_finished_future) -> None:
         try:

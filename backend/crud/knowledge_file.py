@@ -175,9 +175,11 @@ _SENTENCE_END_RE = re.compile(r"[。！？；;]")
 # 超过该长度的整行无论如何都按正文处理。只服务于 _looks_like_long_list_item：
 # 小数链会把标记正则整行吃光，只有「整行长度」这个信号还够得着它。
 _LONG_HEADING_MAX_LEN = 48
-# 编号标记的最大长度，按「第一百二十条」+ 分隔空格算：中文序数到 4 位数字已经够用，
-# 留出这一段是为了让下面那条统一边界在任何真实前缀下都不比旧口径（量整行、阈值 48）更严。
-_MAX_ORDER_MARKER_LEN = 7
+# 编号标记的长度，中文序数按 4 位数字（「第一百二十三条」）再加一个分隔空格算。
+# 它只决定「边界统一到哪一档」：标记不超过这个长度的前缀，判定边界一律是
+# tail > _ORDER_HEADING_TAIL_MAX_LEN；更长的标记则回落到整行那条旧判据，只会更宽、
+# 不会更严，因此不会丢正文。
+_MAX_ORDER_MARKER_LEN = 8
 # 标题不会写这么长：**标记之后**的文本超过该长度即按正文处理。
 # 量在标记之后的文本上，而不是整行——标记本身长度随前缀不同
 # （「三、」2 字 /「（一）」3 字 /「第十二条」4 字），量整行会让「标题 ↔ 正文」的
@@ -185,6 +187,8 @@ _MAX_ORDER_MARKER_LEN = 7
 # 取 _LONG_HEADING_MAX_LEN - _MAX_ORDER_MARKER_LEN 而不是直接复用 48：量到标记之后
 # 总会让边界提前，提前得比最长标记还多，就会把旧口径下已经判成正文的行重新判回标题、
 # 把正文丢掉（对抗评审实测：45~48 字无标点正文换了长标记后整批翻转）。
+# 统一边界与「不比旧口径更严」由 _looks_like_order_heading_with_body 的两条判据
+# 取或来共同保证：这里负责统一，整行那条负责兜住超出上述长度的标记。
 _ORDER_HEADING_TAIL_MAX_LEN = _LONG_HEADING_MAX_LEN - _MAX_ORDER_MARKER_LEN
 
 
@@ -200,15 +204,16 @@ def _looks_like_long_list_item(line: str) -> bool:
     长度信号失效；而 _DECIMAL_HEADING_RE 能回溯到第一个点号后由 \\s*\\S+ 吃掉其余
     部分，仍然匹配。只有这里拦得住这种行。
 
-    判据是「标记吃光了整行」（即标记之后没有文本），不是「整行超长」：后者会把
-    「1. ……」这种正常的小数行也一并排除在长度信号之外，让 1、/1. 前缀的
-    「标题 ↔ 正文」边界与其它前缀再次错开，正好是 issue #83 第 2 项要消掉的分裂。
-    长度条件保留，是为了让短的小数链维持原有判定不变。
+    「标记吃光整行」是主判据，必须保留原有的长度保护作为兜底：深层小数编号的长行
+    （「1.2.…30. 某某」）标记之后仍有文本，主判据够不着它，而 _DECIMAL_HEADING_RE
+    仍会把它匹配成标题——只有整行长度拦得下。它不会重新造成前缀分裂：
+    长度信号在 tail > _ORDER_HEADING_TAIL_MAX_LEN 之前不会先开火（标记 2 字 +
+    tail ≤ 41 的整行远不到 48），两条判据给出同一边界。
     """
     stripped = _normalize_line(line)
     if not _DECIMAL_HEADING_RE.match(stripped):
         return False
-    return not _order_heading_tail(stripped) and len(stripped) > _LONG_HEADING_MAX_LEN
+    return not _order_heading_tail(stripped) or len(stripped) > _LONG_HEADING_MAX_LEN
 
 
 def _order_heading_tail(line: str) -> str:
@@ -239,7 +244,12 @@ def _looks_like_order_heading_with_body(line: str) -> bool:
     tail = _order_heading_tail(line)
     if not tail:
         return False
-    if len(tail) > _ORDER_HEADING_TAIL_MAX_LEN:
+    # 整行那条判据必须留着：量到标记之后总会让边界提前，提前量取决于标记有多长，
+    # 而标记长度没有上界（「第一百二十三条 」就是 8 字）。只按 tail 判，长标记的行
+    # 会比旧口径更严——旧口径判正文的行被重新判回标题、正文丢掉（对抗评审实测到
+    # 「第一百二十三条 + 41 字」这一例）。两条判据取或，等于「旧口径永远成立」，
+    # 新口径只是在它之上再把边界统一提前到 _ORDER_HEADING_TAIL_MAX_LEN。
+    if len(line) > _LONG_HEADING_MAX_LEN or len(tail) > _ORDER_HEADING_TAIL_MAX_LEN:
         return True
     return bool(_SENTENCE_END_RE.search(tail))
 
@@ -408,15 +418,13 @@ def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: i
     for block in raw_blocks:
         units.extend(_semantic_units(block, semantic_limit))
 
-    def assemble(candidate_units: list[str], *, as_body: bool) -> tuple[list[dict], dict[int, str], list[str]]:
+    def assemble(candidate_units: list[str], *, as_body: bool) -> tuple[list[dict], dict[int, str]]:
         """把候选单元按标题层级组装成切片。
 
         as_body=True 时所有单元一律当正文（结构兜底重跑用），此时不会产生标题路径。
-        返回值第三项是「被判成标题（层级 > 0）的单元」，按出现顺序，供结构兜底判断。
         """
         chunks: list[dict] = []
         heading_path: dict[int, str] = {}
-        heading_units: list[str] = []
         current_body: list[str] = []
         pending_overlap: list[str] = []
 
@@ -447,7 +455,6 @@ def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: i
 
             if level is not None:
                 flush_chunk()
-                heading_units.append(unit)
                 heading_path = _trim_heading_path(heading_path, level)
                 heading_path[level] = unit
                 pending_overlap = []
@@ -459,24 +466,21 @@ def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: i
             current_body.append(unit)
 
         flush_chunk()
-        return chunks, heading_path, heading_units
+        return chunks, heading_path
 
-    chunks, heading_path, heading_units = assemble(units, as_body=False)
+    chunks, _heading_path = assemble(units, as_body=False)
 
-    if not chunks and heading_units:
-        # 结构兜底（issue #83 第 1 项）：整篇没有一行进入正文，说明「标题」判定在这里
-        # 整体失效，典型是通篇「三、员工迟到30分钟以内罚款50元，由人事部汇总」这种
-        # 编号与短语正文同行的清单排版——40 行语料修复前只剩兜底的最后一行，覆盖率 2.4%。
-        # 一个标题树不可能只有标题、没有正文，此时把所有编号行当正文重新组装。
-        # 宁可标题层级不准（正文会并进上一节、继承上一节标题），也不能整段丢正文。
-        # 这层兜底与阈值/标点无关，标记后文本再短也不会漏——它救的是「塌缩」，不是单行误判。
-        chunks, _, _ = assemble(heading_units, as_body=True)
-
-    if not chunks and heading_path:
-        # 上一分支已覆盖「只有标题」的情形，这里只兜住 heading_units 为空的历史分支。
-        heading_text = "\n".join(_heading_lines(heading_path)).strip()
-        if heading_text:
-            chunks.append({"id": "0", "text": heading_text})
+    # 结构兜底（issue #83 第 1 项）：入库文本合计远低于原文，说明「标题」判定在这里
+    # 把正文吃掉了，典型是「三、员工迟到30分钟以内罚款50元，由人事部汇总」这种
+    # 编号与短语正文同行的排版——40 行语料修复前只剩兜底的最后一行，覆盖率 2.4%。
+    #
+    # 触发条件用已有的异常覆盖率口径，而不是「一行正文都没有」：真实制度文档常是
+    # 若干编号行夹一两句正文，那种文档同样会丢（对抗评审实测 4.9%），
+    # 只认「全篇皆标题」就漏掉了它们。整篇重新按正文组装，宁可标题层级不准
+    # （正文会并进上一节、继承上一节标题），也不能整段丢正文。
+    # 正常文档的覆盖率在 90% 以上，远高于这条线，分块结果不受影响。
+    if units and chunk_coverage_ratio(text, chunks) < KNOWLEDGE_INDEX_MIN_COVERAGE_RATIO:
+        chunks, _heading_path = assemble(units, as_body=True)
 
     return chunks
 
