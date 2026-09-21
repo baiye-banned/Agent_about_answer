@@ -37,11 +37,13 @@ const dom = new JSDOM('<!doctype html><html><body></body></html>', {
   pretendToBeVisual: true,
 })
 
-// 这张表是**白名单**：Element Plus 在事件回调里直接 new 的构造器、以及它做可聚焦性判断时
-// 直接 instanceof 的构造器，jsdom 的 window 上有、Node 全局没有，必须一并搬过来。
-// 打开 el-dialog 这条路径就会踩到 —— 输入框的 focus/blur 处理器 new FocusEvent(...)，
-// focus-trap 的 isSelectable 又 instanceof HTMLInputElement，缺哪个都会在回调里抛
-// ReferenceError（既有的挂载用例都不开对话框，所以这个缺口此前没被踩到）。
+// 列表按需增长，**只补真的缺过的**：Element Plus 在事件回调里直接 new 的构造器、以及它做
+// 可聚焦性判断时直接 instanceof 的元素类，jsdom 的 window 上有、Node 全局没有，必须逐个
+// 搬过来才在 Node 全局里可见。打开 el-dialog 这条路径就会踩到 —— 输入框的 focus/blur
+// 处理器 new FocusEvent(...)，focus-trap 的 isSelectable 又 instanceof HTMLInputElement，
+// 缺哪个都会在回调里抛 ReferenceError（既有的挂载用例都不开对话框，所以这个缺口此前没被
+// 踩到），表现为「instanceof 抛 ReferenceError」与「new 构造器抛 ReferenceError」两种形态。
+// 凡是 jsdom 没有的名字这里的 `continue` 会直接跳过，所以多写几个名字不会让别的用例变红。
 for (const key of [
   'window',
   'document',
@@ -55,6 +57,8 @@ for (const key of [
   'MouseEvent',
   'KeyboardEvent',
   'FocusEvent',
+  'InputEvent',
+  'ClipboardEvent',
   'CustomEvent',
   'MutationObserver',
   'requestAnimationFrame',
@@ -65,6 +69,32 @@ for (const key of [
   'Blob',
   'localStorage',
   'sessionStorage',
+  // el-dialog 挂载起来会走 focus-trap：它按元素类型做 instanceof 判定，
+  // 并给 overlay 里的元素依次聚焦，因此下面这批元素类必须有。
+  'HTMLInputElement',
+  'HTMLTextAreaElement',
+  'HTMLButtonElement',
+  'HTMLSelectElement',
+  'HTMLAnchorElement',
+  'HTMLDivElement',
+  'HTMLSpanElement',
+  'HTMLFormElement',
+  'HTMLImageElement',
+  'HTMLLabelElement',
+  'HTMLParagraphElement',
+  'HTMLPreElement',
+  'HTMLHeadingElement',
+  'HTMLUListElement',
+  'HTMLOListElement',
+  'HTMLLIElement',
+  'HTMLTableElement',
+  'HTMLTableRowElement',
+  'HTMLTableCellElement',
+  'HTMLStyleElement',
+  'HTMLTemplateElement',
+  'NodeList',
+  'Range',
+  'Selection',
 ]) {
   if (dom.window[key] === undefined) continue
   // Node 22 把 navigator 定义成只取的全局属性（直接赋值抛 TypeError），

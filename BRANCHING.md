@@ -39,7 +39,7 @@
 管理员开启保护时至少需要：
 
 - Require a pull request before merging：`main` 与 `develop` 都勾。**现状：两者都已勾选**，合并审查人数要求为 0（只要求走 PR、不要求 approve）。
-- Require status checks to pass：至少加在 `main` 上。**现状：`main` 已设 9 条必需检查**——`node --test (Node 22)`、`Playwright e2e (chromium)`、`PR 标题规范校验`、`PR 描述必填节校验`、`pytest (Python 3.10)`、`Scan for secrets`、`vite build (Node 22)`、`后端静态检查 (compileall + ruff, Python 3.10)`、`前端静态检查 (node --check, Node 22)`；`develop` 尚未设置，是本条保留的建议项。
+- Require status checks to pass：至少加在 `main` 上。**现状：`main` 已设 9 条必需检查**——`node --test (Node 22)`、`Playwright e2e (chromium)`、`PR 标题规范校验`、`PR 描述必填节校验`、`pytest (Python 3.10)`、`Scan for secrets`、`vite build (Node 22)`、`后端静态检查 (compileall + ruff, Python 3.10)`、`前端静态检查 (node --check + eslint, Node 22)`；`develop` 尚未设置，是本条保留的建议项。
 - **保留 Allow merge commits**：发布 PR 和回同步 PR 都依赖 merge commit，关掉它这两条流程就跑不通。squash 可以同时开着，日常 PR 靠约定选 squash。
 - 不要开 Allow force pushes 和 Allow deletions：本流程明确不改写历史、不删 `main` / `develop`。
 
