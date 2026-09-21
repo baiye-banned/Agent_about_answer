@@ -37,17 +37,24 @@ const dom = new JSDOM('<!doctype html><html><body></body></html>', {
   pretendToBeVisual: true,
 })
 
+// 这张表是**白名单**：Element Plus 在事件回调里直接 new 的构造器、以及它做可聚焦性判断时
+// 直接 instanceof 的构造器，jsdom 的 window 上有、Node 全局没有，必须一并搬过来。
+// 打开 el-dialog 这条路径就会踩到 —— 输入框的 focus/blur 处理器 new FocusEvent(...)，
+// focus-trap 的 isSelectable 又 instanceof HTMLInputElement，缺哪个都会在回调里抛
+// ReferenceError（既有的挂载用例都不开对话框，所以这个缺口此前没被踩到）。
 for (const key of [
   'window',
   'document',
   'navigator',
   'HTMLElement',
+  'HTMLInputElement',
   'SVGElement',
   'Element',
   'Node',
   'Event',
   'MouseEvent',
   'KeyboardEvent',
+  'FocusEvent',
   'CustomEvent',
   'MutationObserver',
   'requestAnimationFrame',
