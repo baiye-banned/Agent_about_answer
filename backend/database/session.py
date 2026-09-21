@@ -92,6 +92,10 @@ def _ensure_schema_columns():
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE knowledge_files ADD COLUMN user_id INTEGER"))
                 conn.execute(text("CREATE INDEX ix_knowledge_files_user_id ON knowledge_files (user_id)"))
+        # knowledge_base_id 早于本次改动就已存在，所以不能挂在上面那个「刚加列」的分支里。
+        _ensure_single_column_index(
+            "knowledge_files", "knowledge_base_id", "ix_knowledge_files_knowledge_base_id"
+        )
         _ensure_mysql_varchar_column("knowledge_files", "name", 255, nullable=False)
         _ensure_mysql_text_column("knowledge_files", "content", "LONGTEXT")
 
@@ -204,6 +208,31 @@ def _ensure_mysql_character_column(
                 f"MODIFY COLUMN `{column_name}` {sql_type} "
                 f"CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci{null_clause}"
             )
+        )
+
+
+def _ensure_single_column_index(table_name: str, column_name: str, index_name: str) -> None:
+    """给**已存在**的表补一条单列索引。
+
+    模型里的 index=True 只覆盖 create_all 新建的表；早先建好的库还得显式补，
+    否则升级后计数聚合仍是全表扫描。按 inspector 查到的列组合判断是否已存在，
+    不依赖 CREATE INDEX IF NOT EXISTS（MySQL 不支持）。
+    """
+    try:
+        inspector = inspect(engine)
+        if table_name not in inspector.get_table_names():
+            return
+        indexed_columns = {
+            tuple(index.get("column_names") or []) for index in inspector.get_indexes(table_name)
+        }
+        if (column_name,) in indexed_columns:
+            return
+        with engine.begin() as conn:
+            conn.execute(text(f"CREATE INDEX `{index_name}` ON `{table_name}` ({column_name})"))
+    except Exception:
+        # 建索引失败不阻塞启动：这些查询退化为全表扫描，结果仍然正确。
+        logger.warning(
+            "Failed to ensure index %s on %s(%s)", index_name, table_name, column_name, exc_info=True
         )
 
 
