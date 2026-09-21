@@ -25,20 +25,41 @@ from rag.rerank import (
 ROUTE_CONFIDENCE_THRESHOLD = 0.55
 
 # 关键词召回（issue #59）：窗口几何、取数批大小与 SQL 预筛参数。
-# 峰值内存上界 ≈ 单批累计字符数（而不是整库总量）。批大小按上一批的实际体积自适应：
-# 小文件多取几行省往返，大文件少取几行压内存。
+# 峰值内存由「本批取回的正文」决定，与知识库文件总数无关：批大小按上一批的实际体积自适应
+# （KEYWORD_RECALL_BATCH_CHARS），小文件多取几行省往返，大文件少取几行压内存。但要说清
+# 「上界」的量级，不能当硬性天花板：首个冷启动批固定 KEYWORD_RECALL_BATCH_SIZE 行、不按
+# 预算裁剪，单个文件本身就超预算时也无法再小；命中文件在归一化阶段还有瞬时放大，去空白
+# re.sub 一项实测 6.8 字节/字符（200 万字符中文语料，带空白），叠上 lower() 后 14.0 字节/
+# 字符，case_fold=False 只免掉 lower()、免不掉 re.sub。实测 2 个 1000 万字符且全部命中的
+# 文件：新实现峰值 94MB / 1.19s（旧实现 222MB / 2.70s）。
 KEYWORD_CHUNK_SIZE = 900
 KEYWORD_CHUNK_OVERLAP = 180
 KEYWORD_RECALL_BATCH_SIZE = 2
 KEYWORD_RECALL_BATCH_ROWS_MAX = 32
 KEYWORD_RECALL_BATCH_CHARS = 4_000_000
 LIKE_ESCAPE = "!"
+# 归一化后的关键词里出现这些字符时，正文还可能用另一个「SQL 的 LOWER 折不到」的写法
+# （键 = 归一化结果里的字符，值 = 它的另一个来源）。全码位扫描确认只有两处：
+# İ(U+0130).lower() == 'i' + U+0307（'i' 与那个组合点各有来源）、K(U+212A).lower() == 'k'。
+_UNFOLDED_CASE_SOURCES = {
+    "i": "İ",  # 拉丁大写 I 带点
+    "k": "K",  # KELVIN SIGN
+}
+# 反过来，一个原文字符折出两个归一化字符时，按「一个字符占一位」对齐的 LIKE 模式没法表达：
+# İ 同时提供 'i' 与组合点 U+0307，而模式要求它们各占一位，两者对不上。关键词里出现这个
+# 组合点时放弃预筛。（用转义写而不是裸字符：组合点不可见，裸写读不出是什么。）
+_MULTI_CHAR_FOLD_TARGETS = "\u0307"
 # 与 _keyword_score 一致的高权重场景词。
 KEYWORD_BONUS_TERMS = frozenset({"迟到", "早退", "旷工", "罚款", "处罚", "考勤"})
 KEYWORD_CLOSE_WINDOW = 120
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _DIGIT_RE = re.compile(r"\d")
+
+# 让「整篇归一化」与「逐窗口归一化」不再等价的字符（详见 _needs_exact_window_scan）。
+# U+0130 拉丁大写 I 带点：唯一一个 lower() 会变长（1→2 字符）的码位；
+# U+03A3 希腊大写 sigma：唯一一个 lower() 依赖上下文的码位（词尾折成 ς）。
+_EXACT_WINDOW_SCAN_RE = re.compile("[İΣ]")
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +301,11 @@ def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top
 
     返回值与旧实现逐条一致（字段、顺序、分值），等价性由
     tests/test_keyword_recall_memory_59.py 中冻结的旧实现做回归基线。
+
+    唯一的例外是含 ``İ``/``Σ`` 的正文（``_needs_exact_window_scan``）：这两个字符让
+    「整篇归一化后取区间」不再等于「对窗口切片单独归一化」，该文件回退到与旧实现逐行同构的
+    逐窗口路径（``_collect_file_keyword_candidates_exact``）。回退按文件粒度触发，中文语料
+    不会命中，取数层的批上界也不受影响。
     """
     if top_k <= 0:
         return []
@@ -296,7 +322,7 @@ def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top
         db, knowledge_base_id, clean_keywords, case_fold
     ):
         order = _collect_file_keyword_candidates(
-            file_id, file_name, content, prepared_keywords, case_fold, top_k, best, order
+            file_id, file_name, content, clean_keywords, prepared_keywords, case_fold, top_k, best, order
         )
     # 与旧实现 candidates.sort(key=keyword_score, reverse=True)[:top_k] 等价：Python 排序稳定，
     # 同分候选保持「文件主键序、窗口起点序」；这里用 -order 复刻同一顺序。
@@ -361,12 +387,48 @@ def _sql_prefilter_patterns(clean_keywords: list[str], case_fold: bool = True) -
         normalized = _normalize_for_match(keyword, case_fold)
         if len(normalized) < 2:
             continue
-        patterns.append("%" + "%".join(_escape_like_char(char) for char in normalized) + "%")
+        pattern = _like_necessary_pattern(normalized, case_fold)
+        if pattern is None:
+            # 该关键词的预筛退化成「任意一行」，整条预筛也就没有意义了：宁可整库分批扫。
+            return None
+        patterns.append(pattern)
     return patterns or None
 
 
+def _like_necessary_pattern(normalized_keyword: str, case_fold: bool = True) -> str | None:
+    """单个「各字符按序出现」的 LIKE 模式；退化时返回 None（调用方放弃整条预筛）。
+
+    含大小写折叠时，有两条字符在 Python 里另有来源、而 SQL 的 ``LOWER`` 折不到：
+    ``'i'`` 还能来自 ``U+0130``（İ，折成 ``i`` + 组合点），``'k'`` 还能来自
+    ``U+212A``（KELVIN SIGN）。要求字面出现会让这些行在取数层就被丢掉——旧实现没有
+    预筛、能召回，就是本 PR 引入的漏召回。这类位置改用一个单字符通配 ``_`` 顶替：
+    ``_`` 匹配任意单字符，所以真命中仍然一定过筛（预筛只是筛得更松），而 SQLite 与
+    MySQL 的 LIKE 都支持。全字符都被顶替时模式变成「任意非空行」，返回 None。
+    """
+    if any(char in _MULTI_CHAR_FOLD_TARGETS for char in normalized_keyword):
+        return None
+    pieces = []
+    substituted = 0
+    for char in normalized_keyword:
+        if case_fold and char in _UNFOLDED_CASE_SOURCES:
+            pieces.append("_")
+            substituted += 1
+        else:
+            pieces.append(_escape_like_char(char))
+    if substituted == len(normalized_keyword):
+        return None
+    return "%" + "%".join(pieces) + "%"
+
+
 def _sql_case_foldable(keyword: str) -> bool:
-    """关键词能否在 SQL 侧安全比较大小写：ASCII 交给 LOWER/LIKE，无大小写的字符原样比较。"""
+    """关键词能否在 SQL 侧安全比较大小写：ASCII 交给 LOWER/LIKE，无大小写的字符原样比较。
+
+    这里只管「库侧折叠强度够不够」：SQLite 的 ``LOWER`` 只折叠 ASCII，西里尔/希腊文这类
+    非 ASCII 大小写字母折不动，所以含它们的关键词整体放弃下推（见 _sql_prefilter_patterns）。
+    至于「Python 折得到、SQL 折不到」的那两处非 ASCII 来源（İ / KELVIN SIGN），由
+    ``_like_necessary_pattern`` 用单字符通配 ``_`` 顶替，不靠本函数兜底——本函数返回 True
+    的关键词同样不会漏召回。
+    """
     return all(char.isascii() or char.lower() == char.upper() for char in keyword)
 
 
@@ -406,10 +468,30 @@ def _prepare_keywords(clean_keywords: list[str], case_fold: bool = True) -> list
     return prepared
 
 
+def _needs_exact_window_scan(content: str) -> bool:
+    """该文件的窗口命中必须逐窗口重新归一化，不能走「整篇归一化 + 区间统计」的快路径。
+
+    快路径成立的前提是 ``str.lower()`` 逐字符可组合：``normalize(content[a:b])`` 等于
+    ``normalize(content)[rank(a):rank(b)]``。有两个码位打破它（已全码位扫描确认各自唯一）：
+
+    * ``U+0130``（İ）是 Python 中唯一个 ``lower()`` 会变长的码位（1→2）。整篇归一化后
+      文本变长，而 ``_NormalizedOffsetMap`` 按字符计数，窗口右边界会整体偏小，文件尾部
+      ``İ 的个数`` 个字符不再落在任何窗口里，命中直接丢失；
+    * ``U+03A3``（Σ）是唯一个 ``lower()`` 依赖上下文的码位，词尾折成 ``ς``、其余折成
+      ``σ``。整篇归一化拿到的是全文上下文，窗口切片拿到的是窗口内上下文，同一段文本在
+      两条路径上会得到不同的归一化结果（命中集合与分值都会变）。
+
+    这两类字符在中文语料里不出现，所以按文件粒度回退的代价可以忽略；判据是「正文是否含
+    这两个字符」，与关键词无关（关键词不含希腊字母时正文里的 Σ 同样会改变窗口边界）。
+    """
+    return _EXACT_WINDOW_SCAN_RE.search(content) is not None
+
+
 def _collect_file_keyword_candidates(
     file_id: int,
     file_name: str,
     content: str,
+    clean_keywords: list[str],
     prepared_keywords: list[tuple[str, str, float]],
     case_fold: bool,
     top_k: int,
@@ -417,6 +499,10 @@ def _collect_file_keyword_candidates(
     order: int,
 ) -> int:
     """把单个文件里命中的窗口并入 top_k 候选（有界堆），返回更新后的候选序号。"""
+    if _needs_exact_window_scan(content):
+        return _collect_file_keyword_candidates_exact(
+            file_id, file_name, content, clean_keywords, top_k, best, order
+        )
     normalized_content = _normalize_for_match(content, case_fold)
     occurrences = []
     for keyword, normalized, weight in prepared_keywords:
@@ -486,6 +572,60 @@ def _keep_best_candidate(
         heapq.heappush(best, entry)
     elif entry[:2] > best[0][:2]:
         heapq.heapreplace(best, entry)
+
+
+def _collect_file_keyword_candidates_exact(
+    file_id: int,
+    file_name: str,
+    content: str,
+    clean_keywords: list[str],
+    top_k: int,
+    best: list[tuple[float, int, dict]],
+    order: int,
+) -> int:
+    """含 ``İ``/``Σ`` 的文件：逐窗口重新归一化的精确路径（见 _needs_exact_window_scan）。
+
+    这里刻意复用 ``_matched_query_keywords`` / ``_keyword_score``——修复前的 ``keyword_recall``
+    调用的就是这两个函数——所以本路径与旧实现逐行同构，等价性由构造保证，而不是靠推理。
+    与旧实现唯一的有意差异：窗口不再一次性全部物化成列表（旧实现先切出整篇的所有窗口再逐个
+    打分，大文件上正是内存膨胀的来源），改成按起点现切一个窗口，峰值只与单个窗口有关。
+    """
+    normalized_content = _normalize_for_match(content)
+    if not any(_normalize_for_match(keyword) in normalized_content for keyword in clean_keywords):
+        # 文件层闸门：与旧实现同口径（整篇折叠后判定），不命中就整个文件跳过。
+        # 这一步不能省：窗口切片独立归一化时可能命中而整篇判定不命中（词尾 Σ 折成 ς），
+        # 省略会让本路径比旧实现多召回。
+        return order
+    for raw_start in _keyword_chunk_starts(len(content)):
+        chunk_content = content[raw_start : raw_start + KEYWORD_CHUNK_SIZE].strip()
+        if not chunk_content:
+            continue
+        matched_keywords = _matched_query_keywords(chunk_content, clean_keywords)
+        if not matched_keywords:
+            continue
+        score = _keyword_score(chunk_content, clean_keywords)
+        if score <= 0:
+            continue
+        order += 1
+        _keep_best_candidate(
+            best,
+            top_k,
+            order,
+            score,
+            {
+                "id": f"{file_id}_{raw_start}",
+                "chunk_id": str(raw_start),
+                "content": chunk_content,
+                "file_name": file_name,
+                "file_id": file_id,
+                "route": "keyword",
+                "keyword_score": score,
+                # 命中证据随候选一起带出，供 select_final_chunks 校验（issue #56）。
+                "keyword_hits": len(matched_keywords),
+                "matched_keywords": matched_keywords,
+            },
+        )
+    return order
 
 
 def rrf_fuse(route_results: list[tuple[str, list[dict]]], k: int = 60) -> list[dict]:
@@ -637,10 +777,11 @@ def _expand_keywords(keywords: list[str]) -> list[str]:
 
 
 def _keyword_score(content: str, keywords: list[str]) -> float:
-    """一段文本的关键词分值（字符串入口，供回归用例与等价性基线使用）。
+    """一段文本的关键词分值（字符串入口：自行归一化入参）。
 
-    keyword_recall 走的是窗口游标版本，但打分规则只有 ``_score_from_hits`` 一份，
-    字符串入口与窗口路径共用它。
+    keyword_recall 的常规路径走窗口游标版本（``_score_from_hits``），但含 İ/Σ 的正文走
+    ``_collect_file_keyword_candidates_exact``，那里与旧实现一样按窗口切片调用这个函数；
+    等价性基线用例（tests/test_keyword_recall_memory_59.py）也走它。
     """
     normalized_content = _normalize_for_match(content)
     hits = _keyword_hits(normalized_content, _prepare_keywords(keywords))
@@ -652,6 +793,8 @@ def _matched_query_keywords(content: str, keywords: list[str]) -> list[str]:
 
     issue #56：窗口是否与本次提问相关，只由这个命中集合决定；内容自身的场景
     特征词（考勤、迟到、罚款…）不构成相关性证据。
+
+    与 ``_keyword_score`` 一样，含 İ/Σ 的正文在回退路径上按窗口切片调用本函数。
     """
     normalized_content = _normalize_for_match(content)
     hits = _keyword_hits(normalized_content, _prepare_keywords(keywords))
@@ -736,6 +879,11 @@ class _NormalizedOffsetMap:
 
     归一化长度与原文长度相同时，文本既没有空白、大小写折叠也没有改变长度，映射就是恒等
     映射，连这一次扫描都省掉——中文语料大多走这条快路径。
+
+    前提：正文不含 ``İ``/``Σ``（``_needs_exact_window_scan`` 会把这类文件交给回退路径）。
+    İ 是唯一一个 ``lower()`` 会变长的码位，含它就等于「折叠改变了长度」，上面的恒等映射判据
+    与按字符计数的偏移换算都不再成立；Σ 不改长度，映射本身没错，但它让「归一化后的这一段」
+    不等于「对这一段再做归一化」（词尾折 ς 取决于窗口外的邻居），区间等价同样失效。
     """
 
     __slots__ = ("_content", "_identity", "_base", "_count")
@@ -756,10 +904,18 @@ class _NormalizedOffsetMap:
 
 
 def _normalize_for_match(text: str, case_fold: bool = True) -> str:
-    """去空白 + 转小写；``case_fold=False`` 时省掉整篇 str.lower()（见 _needs_case_fold）。"""
+    """去空白 + 转小写，顺序与旧实现一致：先 ``lower()`` 再去空白。
+
+    顺序不能对调：Σ 的折写取决于它后面是不是空白——``'ΑΣ ΟΔΟΣ'`` 先 lower 再去空白得
+    ``'αςοδος'``，先去空白再 lower 得 ``'ασοδος'``，同一段文本两个结果。两种顺序的瞬时峰值
+    实测相当（200 万字符中文语料：26.7MB vs 29.5MB，视空白密度各有胜负），没有拿顺序换内存
+    的理由。
+
+    ``case_fold=False`` 时省掉整篇 str.lower()（见 _needs_case_fold）。
+    """
     value = "" if text is None else str(text)
-    stripped = _WHITESPACE_RE.sub("", value)
-    return stripped.lower() if case_fold else stripped
+    lowered = value.lower() if case_fold else value
+    return _WHITESPACE_RE.sub("", lowered)
 
 
 def _keyword_chunk_starts(
