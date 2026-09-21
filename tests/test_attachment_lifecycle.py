@@ -16,6 +16,7 @@
 路径不得误删，用来挡住「不分青红皂白 unlink」的粗暴实现。
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -41,6 +42,7 @@ from database.session import Base
 from model.models import Conversation, Message, User
 from router import chat as chat_router
 from router import user as user_router
+from schema.schemas import ChatRequest
 from service import auth_service, chat_service, oss_service, user_service
 
 
@@ -53,9 +55,24 @@ OSS_CONFIG = {
 OSS_HOST = "demo.oss-cn-hangzhou.aliyuncs.com"
 
 # 用例里的对象键写字面量，不从被测实现里取，避免实现改名/改前缀时用例跟着一起「通过」。
-KEY_A = "rag-chat/2026/09/21/aaaaaaaaaaaaaaaa.png"
-KEY_B = "rag-chat/2026/09/21/bbbbbbbbbbbbbbbb.jpg"
-KEY_C = "rag-chat/2026/09/21/cccccccccccccccc.webp"
+# 形态照抄上传路径实际铸出来的样子：rag-chat/<年>/<月>/<日>/<uuid4().hex><扩展名>。
+KEY_A = "rag-chat/2026/09/21/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png"
+KEY_B = "rag-chat/2026/09/21/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.jpg"
+KEY_C = "rag-chat/2026/09/21/cccccccccccccccccccccccccccccccc.webp"
+
+# 客户端的附件列表是回带上传接口返回值的自由 JSON（schema/schemas.py 的 list[dict] 不校验），
+# 所以库里可能出现本服务从没铸过的键；它一旦进了删除链路就会被签成服务端 DeleteObject。
+FOREIGN_KEY = "finance-archive/2026/q3/payroll.sql"
+# 形似而实非的键：前缀对得上但结构不对。第二条尤其重要——`quote(key, safe="/")` 会把它
+# 原样拼进 URL，而 httpx 会把 `..` 规范化掉，只查前缀的实现会在这里删到桶里别的对象。
+NEAR_MISS_KEYS = [
+    "rag-chat/../../finance-archive/2026/q3/payroll.sql",
+    "rag-chat/2026/09/21/../../finance-archive/2026/q3/payroll.sql",
+    "rag-chat/2026/09/21/",
+    "rag-chat/2026/09/21/not-a-uuid.png",
+    "rag-chat/2026/09/21/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.sh",
+    "other-bucket/2026/09/21/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png",
+]
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n-fake-png-payload"
 
@@ -288,6 +305,9 @@ def test_attachment_delete_request_is_signed_for_oss_delete(api, monkeypatch):
     assert date == formatdate(usegmt=True)
     # 回收不该带上传时那条公开读 ACL 头：对象都要删了，改 ACL 没有意义且会改变签名内容。
     assert "x-oss-object-acl" not in request.headers
+    # 也不能带 content-type：签名串的 Content-Type 槽位留空（上面的 string-to-sign 是
+    # `DELETE\n\n\n{date}\n{resource}`），真发出去时若被补上 content-type，签名就对不上了。
+    assert "content-type" not in request.headers
 
 
 def test_failed_object_delete_keeps_the_conversation_delete_working(api, oss_requests, caplog):
@@ -426,3 +446,146 @@ def test_avatar_removal_stays_inside_the_avatar_directory(api, tmp_path):
 
     assert response.status_code == 200
     assert outsider.read_bytes() == b"untouched"
+
+
+# ---------------------------------------------------------------------------
+# (c) 对象键命名空间护栏：只为本服务铸造的键签发 DELETE
+# ---------------------------------------------------------------------------
+
+def test_foreign_object_key_is_never_signed_for_delete(api, oss_requests, caplog):
+    """附件列里的键由客户端回带，不得拿服务端凭据为陌生键签 DeleteObject。
+
+    `schema/schemas.py` 的 `attachments: list[dict]` 不校验、`stream_chat` 原样落库，所以
+    桶里除聊天附件以外的东西都可能出现在这个键上。这里直接把脏键写进库（最坏前提，绕开
+    写入侧那道过滤），删会话时：本服务的键照删，其余一个请求都不许发出去。
+
+    `NEAR_MISS_KEYS` 里的穿越键是这条护栏的重点：键会被 `quote(key, safe="/")` 拼进 URL，
+    httpx 会把 `..` 规范化掉，于是 `rag-chat/../../finance-archive/x` 会以 `/finance-archive/x`
+    发出去——只查 `rag-chat/` 前缀的实现在这里就会删到桶里别的对象。
+    """
+    _add_conversation(api, "c-foreign", [
+        _attachments_column(FOREIGN_KEY),
+        _attachments_column(*NEAR_MISS_KEYS),
+        _attachments_column(KEY_A),
+    ])
+
+    with caplog.at_level(logging.WARNING, logger="service.chat_service"):
+        response = api.client.delete("/api/chat/conversations/c-foreign")
+
+    assert response.status_code == 200
+    assert oss_requests.deleted_urls() == [f"https://{OSS_HOST}/{KEY_A}"]
+
+    # 被跳过的每个键都要留下可按对象对账的 warning（会话删了，日志是唯一线索）。
+    warnings = [record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING]
+    for key in [FOREIGN_KEY, *NEAR_MISS_KEYS]:
+        assert any(key in message for message in warnings), f"没有为 {key!r} 留下告警"
+
+    # 跳过的是对象，不是这次删除：行照删，被拒的键只进日志、不回显给用户。
+    assert api.db.query(Conversation).filter_by(id="c-foreign").first() is None
+    assert api.db.query(Message).filter_by(conversation_id="c-foreign").first() is None
+    assert "finance-archive" not in response.text
+
+
+def test_foreign_object_key_is_not_stored_by_the_chat_route(api, monkeypatch, oss_requests):
+    """端到端：客户端回带的外来键既不落库，也不会变成服务端签发的 DELETE。
+
+    走真实 `stream_chat`（模型与检索短路），把评审 PoC 的链路固化成回归：污点从
+    `/api/chat/stream` 的 body 进来，看它落在库里是什么、删会话时又发了什么请求。
+    与上一条互补——上一条锁删除侧的收口，这一条锁写入侧的收口，去掉任意一道，
+    对应用例变红。
+    """
+    cid = _run_stream_chat(api, monkeypatch, [
+        {"object_key": FOREIGN_KEY, "name": "payroll.sql"},
+        {"object_key": NEAR_MISS_KEYS[0], "name": "escape.png"},
+        {"object_key": KEY_A, "name": "a.png"},
+    ])
+
+    stored = json.loads(api.db.query(Message).filter_by(conversation_id=cid).first().attachments)
+    assert [item["object_key"] for item in stored] == [KEY_A]
+
+    assert api.client.delete(f"/api/chat/conversations/{cid}").status_code == 200
+    assert oss_requests.deleted_urls() == [f"https://{OSS_HOST}/{KEY_A}"]
+
+
+class _FakeChatTrace:
+    """聊天链路只用到 trace 的这几个方法，用例里不落库。"""
+
+    def __init__(self, user_id=None):
+        self.user_id = user_id
+        self.trace_id = "trace-test"
+
+    def add(self, *_args, **_kwargs):
+        pass
+
+    def attach(self, **_kwargs):
+        pass
+
+    def finish(self, *_args, **_kwargs):
+        pass
+
+    def snapshot(self):
+        return {"trace_id": self.trace_id, "events": []}
+
+
+async def _collect_stream(iterator):
+    chunks = []
+    async for chunk in iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+    return "".join(chunks)
+
+
+def _run_stream_chat(api, monkeypatch, attachments) -> str:
+    """跑一次真实聊天流（模型、检索、轨迹短路），返回新建会话的 id。"""
+
+    async def fake_build_effective_question(question, attachments):
+        return question, {"status": "skipped"}
+
+    async def fake_recent_memory_text(*_args, **_kwargs):
+        return ""
+
+    async def fake_decide_need_rag(*_args, **_kwargs):
+        return {"need_rag": False, "route": "direct", "confidence": 1.0, "reason": "test"}
+
+    async def fake_stream_rag_answer(*_args, **_kwargs):
+        yield "回答"
+
+    # 这个夹具只建 User/Conversation/Message 三张表，知识库解析短路掉（本用例与检索无关）。
+    monkeypatch.setattr(
+        chat_service,
+        "resolve_knowledge_base",
+        lambda db, knowledge_base_id, user_id: SimpleNamespace(id=1, name="kb", user_id=user_id),
+    )
+    monkeypatch.setattr(chat_service, "SessionLocal", lambda: api.db)
+    monkeypatch.setattr(chat_service, "decode_token", lambda authorization: api.alice.username)
+    monkeypatch.setattr(chat_service, "TraceRecorder", _FakeChatTrace)
+    monkeypatch.setattr(chat_service, "_build_effective_question", fake_build_effective_question)
+    monkeypatch.setattr(chat_service, "_build_recent_memory_text", fake_recent_memory_text)
+    monkeypatch.setattr(chat_service, "_build_memory_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        chat_service, "_build_memory_aware_retrieval_question", lambda question, memory_context: question
+    )
+    monkeypatch.setattr(chat_service, "decide_need_rag", fake_decide_need_rag)
+    monkeypatch.setattr(chat_service, "stream_rag_answer", fake_stream_rag_answer)
+    monkeypatch.setattr(chat_service, "_trace_sse_payloads", lambda trace: [])
+    monkeypatch.setattr(chat_service, "_build_sources", lambda chunks: [])
+    monkeypatch.setattr(chat_service, "_attach_grounding_trace", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat_service, "_safe_trace_attach", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat_service, "_safe_trace_finish", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat_service, "_schedule_memory_summary_update", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat_service, "schedule_ragas_evaluation", lambda *args, **kwargs: None)
+
+    def _conversation_ids():
+        return {cid for (cid,) in api.db.query(Conversation.id).filter_by(user_id=api.alice.id).all()}
+
+    before = _conversation_ids()
+    response = asyncio.run(
+        chat_service.stream_chat(
+            ChatRequest(question="这张图是什么", attachments=attachments),
+            authorization="Bearer token",
+        )
+    )
+    asyncio.run(_collect_stream(response.body_iterator))
+
+    created = _conversation_ids() - before
+    assert len(created) == 1, f"这次聊天没有新建出唯一一个会话：{created}"
+    return created.pop()
