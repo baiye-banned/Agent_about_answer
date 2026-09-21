@@ -13,7 +13,7 @@ from database.checkpointer import delete_thread_checkpoints
 from config import MEMORY_WINDOW_TURNS
 from crud import chat as crud_chat
 from database.session import SessionLocal, get_db
-from rag.learning_trace import TraceRecorder, compact_trace_reference, summarize_messages, summarize_text
+from rag.learning_trace import TraceRecorder, compact_trace_reference
 from model.models import Conversation, Message, User, _new_id
 from rag.ragas_eval import schedule_ragas_evaluation
 from schema.schemas import ChatRequest, RenameRequest
