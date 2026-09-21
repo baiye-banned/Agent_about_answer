@@ -94,7 +94,7 @@ them run offline and deterministic; no credentials and no network access are req
 Runs against a real Milvus Lite database created in a temporary directory (only the
 embedding function is replaced, with a deterministic offline implementation).
 
-- `test_acceptance_upload_query_delete_round_trip` - upload, query with cosine distance 0, delete, then query again returns nothing.
+- `test_acceptance_upload_query_delete_round_trip` - upload, query with cosine similarity 1, delete, then query again returns nothing.
 - `test_acceptance_knowledge_base_isolation` - a query in knowledge base A never sees knowledge base B chunks, while a query without a knowledge base filter sees both.
 - `test_acceptance_reupload_replaces_previous_chunks` - re-uploading a file replaces its previous chunks instead of appending.
 - `test_acceptance_delete_removes_only_target_file` - deleting one file leaves the other files of the same knowledge base searchable.

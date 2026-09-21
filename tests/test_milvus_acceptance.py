@@ -47,7 +47,7 @@ def _bigram_embedding(texts):
     """Deterministic offline embedding: unit vectors of character-bigram counts.
 
     Identical text yields identical vectors, so a search for a stored chunk returns it
-    with cosine distance 0, and texts sharing bigrams still rank above unrelated ones.
+    with cosine similarity 1, and texts sharing bigrams still rank above unrelated ones.
     """
     vectors = []
     for text in texts:
@@ -165,7 +165,13 @@ def test_acceptance_upload_query_delete_round_trip(lite_store):
     hits = milvus_client.query_vectors("迟到超过30分钟视为旷工半天。", top_k=5, knowledge_base_id=11)
 
     assert [hit["chunk_id"] for hit in hits][0] == "1"
-    assert hits[0]["distance"] == pytest.approx(0.0, abs=1e-6)
+    # milvus-lite 3.2 reports the raw COSINE score in this field (higher = nearer, 1.0
+    # for an identical vector) where the 3.0 line reported the 1 - similarity distance,
+    # so an exact match scores 1.0 rather than 0.0. Ordering is unaffected: the same
+    # chunk still ranks first and still carries the highest score of the three.
+    assert len(hits) == 3
+    assert hits[0]["distance"] == pytest.approx(1.0, abs=1e-6)
+    assert all(hit["distance"] < hits[0]["distance"] for hit in hits[1:])
     assert hits[0]["content"] == "迟到超过30分钟视为旷工半天。"
     assert hits[0]["file_name"] == "考勤制度.txt"
     assert hits[0]["file_id"] == 1101
