@@ -3,6 +3,7 @@ import pytest
 from crud.knowledge_file import (
     KNOWLEDGE_INDEX_MIN_COVERAGE_RATIO,
     _LONG_HEADING_MAX_LEN,
+    _ORDER_HEADING_TAIL_MAX_LEN,
     _heading_level,
     chunk_coverage_ratio,
     chunk_text,
@@ -21,10 +22,19 @@ ORDER_PREFIXES = ["三、", "（一）", "1、", "1. "]
 ORDER_BODY = CLAUSE_BODY
 LONG_ORDER_BODY_REPEATS = 6
 LONG_ORDER_BODY = ORDER_BODY * LONG_ORDER_BODY_REPEATS
-# 长度边界语料：45 字正文配上最长的 3 字标记「（一）」后整行恰好 48 字，
-# 卡在 _LONG_HEADING_MAX_LEN 上，四种前缀都只能靠句末标点被判定为正文。
+# 长度边界语料：44 字正文配上最长的 3 字标记「（一）」后整行恰好 48 字。
+# issue #83 之后长度信号量在「标记之后的文本」上，本语料由 44 > _ORDER_HEADING_TAIL_MAX_LEN
+# 判为正文，整行长度不再参与判定。
 BOUNDARY_SENTENCE = "本制度适用于全体员工，由人事部门解释与修订。"
 BOUNDARY_BODY = f"{BOUNDARY_SENTENCE}{ORDER_BODY}"
+
+# issue #83 第 1 项语料：编号与正文同行、正文**不带句末标点**，行间不空行。
+# 句末标点信号在这里完全失效，只能靠「标记之后的文本长度」救回正文。
+PHRASE_BODY = "员工迟到30分钟以内罚款50元，由人事部汇总"
+PHRASE_PREFIXES = ["三、", "（一）", "1、", "1. "]
+
+# issue #83 第 2 项：八种前缀（标记长度 2~4 字）的「标题 ↔ 正文」边界必须落在同一处。
+TAIL_BOUNDARY_PREFIXES = ["三、", "十、", "1、", "（一）", "(一)", "十一、", "1. ", "第三条 "]
 
 
 def _assert_clause_document_fully_indexed(source: str, chunks: list[dict]) -> None:
@@ -211,15 +221,74 @@ def test_chunk_text_keeps_order_text_when_marker_shares_long_line(prefix):
 
 @pytest.mark.parametrize("prefix", ORDER_PREFIXES)
 def test_chunk_text_keeps_order_text_at_heading_length_boundary(prefix):
-    """issue #75 边界：整行最多 48 字，长度阈值救不了场，四种前缀都要靠句末标点判定为正文。"""
+    """issue #75 边界语料：整行不超过 48 字，四种前缀同样要无损入库。
+
+    issue #83 第 2 项之后长度信号量在「标记之后的文本」上，本语料的 44 字正文
+    已超过 _ORDER_HEADING_TAIL_MAX_LEN，由长度信号兜住。整行长度不再参与判定，
+    所以这里不再断言整行恰好 48 字——那是旧口径下的边界。
+    """
     line = f"{prefix}{BOUNDARY_BODY}"
-    assert len(f"（一）{BOUNDARY_BODY}") == _LONG_HEADING_MAX_LEN
     assert len(line) <= _LONG_HEADING_MAX_LEN
+    assert len(BOUNDARY_BODY) > _ORDER_HEADING_TAIL_MAX_LEN
     source = "\n".join(line for _ in range(ORDER_ROWS))
 
     chunks = chunk_text(source, file_id=1)
 
     _assert_order_document_fully_indexed(source, chunks, BOUNDARY_SENTENCE, ORDER_ROWS)
+
+
+@pytest.mark.parametrize("prefix", PHRASE_PREFIXES)
+def test_chunk_text_keeps_order_text_when_inline_body_has_no_sentence_punctuation(prefix):
+    """issue #83 第 1 项：标记后跟不带句末标点的短语正文时，整行不能被当标题丢掉。
+
+    先证红：修复前这 40 行全部命中标题分支，chunk_text 只剩兜底的最后一行，
+    覆盖率 2.4%（1 个 chunk / 24 字 / 原文 999 字）；补一个句末标点就回到 100%。
+    修复后必须 ≥ 90%，且每一行的正文都要真的进库（覆盖率高不能靠重复行凑）。
+    """
+    line = f"{prefix}{PHRASE_BODY}"
+    source = "\n".join(line for _ in range(ORDER_ROWS))
+
+    chunks = chunk_text(source, file_id=1)
+
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    assert joined.count(PHRASE_BODY) >= ORDER_ROWS
+
+
+@pytest.mark.parametrize("prefix", PHRASE_PREFIXES)
+def test_chunk_text_keeps_every_distinct_phrase_row(prefix):
+    """同上语料但逐行互不相同：每一行的正文都要单独进库，不能靠重复行拉高覆盖率。"""
+    rows = [f"{prefix}员工迟到{index}分钟以内罚款50元，由人事部汇总" for index in range(1, ORDER_ROWS + 1)]
+    source = "\n".join(rows)
+
+    chunks = chunk_text(source, file_id=1)
+
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    for index in range(1, ORDER_ROWS + 1):
+        assert f"员工迟到{index}分钟以内罚款50元" in joined
+
+
+@pytest.mark.parametrize("prefix", TAIL_BOUNDARY_PREFIXES)
+def test_heading_level_uses_one_tail_boundary_for_every_prefix(prefix):
+    """issue #83 第 2 项：八种前缀的有效截断点统一在「标记之后的文本」长度上。
+
+    修复前阈值量在整行上，标记本身的 2~4 字被一起计入，边界随前缀漂移
+    （正文 46 字时「三、」已判正文而「（一）」仍被丢弃）；现在标记长度不再影响判定，
+    同一段正文换任何前缀都在同一个字符数上翻转。
+    """
+    heading_tail = "甲" * _ORDER_HEADING_TAIL_MAX_LEN
+    body_tail = "甲" * (_ORDER_HEADING_TAIL_MAX_LEN + 1)
+
+    assert _heading_level(f"{prefix}{heading_tail}") is not None
+    assert _heading_level(f"{prefix}{body_tail}") is None
+
+
+def test_heading_level_keeps_short_inline_tail_as_heading():
+    """边界另一侧：标记后的短文本（≤ 阈值且无句末标点）仍是标题，层级语义不被破坏。"""
+    assert _heading_level("三、考勤管理") == 2
+    assert _heading_level("（一）适用范围") == 3
+    assert _heading_level("第三条 罚款标准") == 2
 
 
 @pytest.mark.parametrize("prefix", ORDER_PREFIXES)

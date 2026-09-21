@@ -172,8 +172,14 @@ _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？；;])")
 _CLAUSE_SPLIT_RE = re.compile(r"(?<=[，,、：:])")
 # 标题行不会是一整句话，出现句末标点说明标记后面跟的是正文。
 _SENTENCE_END_RE = re.compile(r"[。！？；;]")
-# 超过该长度的编号行即使没有句末标点也按正文处理：标题不会这么长。
+# 超过该长度的整行无论如何都按正文处理。只服务于 _looks_like_long_list_item：
+# 小数链会把标记正则整行吃光，只有「整行长度」这个信号还够得着它。
 _LONG_HEADING_MAX_LEN = 48
+# 标题标记之后的文本超过该长度即按正文处理：中文标题不会写这么长。
+# 长度必须量在**标记之后的文本**上，而不是整行——标记本身长度随前缀不同
+# （「三、」2 字 /「（一）」3 字 /「第三条 」4 字），量整行会让「标题 ↔ 正文」
+# 的边界按前缀漂移，同一段正文换个编号方式就从丢弃变成保留（issue #83 第 2 项）。
+_ORDER_HEADING_TAIL_MAX_LEN = 20
 
 
 def _normalize_line(text: str) -> str:
@@ -202,17 +208,22 @@ def _order_heading_tail(line: str) -> str:
 
 
 def _looks_like_order_heading_with_body(line: str) -> bool:
-    """「编号 + 正文同行」排版：标记后跟着成句正文或整行过长时，不能整行当标题丢弃。
+    """「编号 + 正文同行」排版：标记后跟着成句正文或标记后文本过长时，不能整行当标题丢弃。
 
     制度/法规类文档常把编号与正文写在同一行，这类行一旦被当成标题，
     正文就永远进不了 current_body，最终整篇只剩兜底的最后一行标题。
     issue #53 只挂进了「第N条」，这里把「三、」「（一）」「1、」「1.」四种前缀
     并入同一套判定，避免它们各自依赖长度阈值兜底。
+
+    issue #83 第 1 项：两个信号都量在标记之后的文本上。两条判据缺一不可——
+    只有句末标点时，「三、员工迟到30分钟以内罚款50元，由人事部汇总」这种不带
+    句末标点的短语正文仍会被整行丢弃（40 行语料覆盖率 2.4%）；只有长度阈值时，
+    带句末标点的短正文会漏判。标记之后没有文本（纯标题行）的行仍走标题分支。
     """
     tail = _order_heading_tail(line)
     if not tail:
         return False
-    if len(line) > _LONG_HEADING_MAX_LEN:
+    if len(tail) > _ORDER_HEADING_TAIL_MAX_LEN:
         return True
     return bool(_SENTENCE_END_RE.search(tail))
 
