@@ -1,0 +1,217 @@
+// 单文件组件（SFC）挂载工具：让 `node --test` 能真正 mount 一个 .vue 视图。
+//
+// 仓库既有的前端用例做两件事：纯函数级行为断言（submit 到 src/utils 下的模块），
+// 以及静态读文件断言接线（knowledgeViewWiring.test.js 那种）。两者都执行不到 SFC 的
+// <script setup>：胶水层（调哪个 helper、toast 级别、失败时状态复位）至今只靠阅读。
+//
+// 这里不引入 vitest / @vue/test-utils 之类的新体系，全部走 package.json 里已有的依赖：
+//   @vue/compiler-sfc   把 SFC 编译成模块代码（@vitejs/plugin-vue 的传递依赖）
+//   jsdom               提供 document（已有的 devDependency）
+//   vue / element-plus  已有的运行时依赖
+//
+// 依赖顺序有硬约束：vue 的 runtime-dom 在模块求值时就抓走 document
+// （`const doc = typeof document !== 'undefined' ? document : null`），
+// 所以 jsdom 的全局变量必须在 import('vue') 之前装好。本模块在顶层做这件事，
+// 调用方只要 `import { mountSfc } from './helpers/vueMount.js'` 即自动满足顺序；
+// 但**不要**在同一个文件里再静态 import vue，那样会抢在前面。
+
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { createRequire, register } from 'node:module'
+import { JSDOM } from 'jsdom'
+
+const SRC_ROOT = fileURLToPath(new URL('../../src/', import.meta.url))
+const LOADER_URL = pathToFileURL(fileURLToPath(new URL('./vueSfcLoader.js', import.meta.url))).href
+
+// 站 Vite 构建期 import.meta.env 的位置，见 vueSfcLoader.js 的说明。
+globalThis.__VITE_ENV__ = Object.fromEntries(
+  Object.entries(process.env).filter(([key]) => key.startsWith('VITE_'))
+)
+
+// ---------------------------------------------------------------------------
+// jsdom 环境（必须在任何 vue import 之前执行）
+// ---------------------------------------------------------------------------
+
+const dom = new JSDOM('<!doctype html><html><body></body></html>', {
+  url: 'http://localhost/',
+  pretendToBeVisual: true,
+})
+
+for (const key of [
+  'window',
+  'document',
+  'navigator',
+  'HTMLElement',
+  'SVGElement',
+  'Element',
+  'Node',
+  'Event',
+  'MouseEvent',
+  'KeyboardEvent',
+  'CustomEvent',
+  'MutationObserver',
+  'requestAnimationFrame',
+  'cancelAnimationFrame',
+  'getComputedStyle',
+  'FormData',
+  'File',
+  'Blob',
+  'localStorage',
+  'sessionStorage',
+]) {
+  if (dom.window[key] === undefined) continue
+  // Node 22 把 navigator 定义成只取的全局属性（直接赋值抛 TypeError），
+  // 所以一律走 defineProperty 覆盖。
+  Object.defineProperty(globalThis, key, {
+    value: dom.window[key],
+    writable: true,
+    configurable: true,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// 模块替换 seam
+// ---------------------------------------------------------------------------
+
+// 装一次加载钩子。registry 随 data 进钩子线程，所以每次换 registry 都得重新注册；
+// 多次注册是叠加的，**后注册的先被问到**，于是最近一次 mount 的替换表优先命中。
+// 默认替换表：把 async-validator 的 CJS 入口换成拆掉一层包装的垫片，
+// 让 Element Plus 的表单校验在 Node 下真的生效（详见该文件里的说明）。
+// 调用方自己的 modules 优先级更高。
+function defaultModules() {
+  const shim = pathToFileURL(fileURLToPath(new URL('./asyncValidatorInterop.js', import.meta.url))).href
+  const targets = {}
+  try {
+    const entry = createRequire(import.meta.url).resolve('async-validator').replace(/\\/g, '/')
+    targets[entry] = shim
+  } catch {
+    // 依赖树里没有 async-validator 时无事可做，挂载用例自己会暴露症状。
+  }
+  return targets
+}
+
+function registerLoader(modules) {
+  // data 要过结构化克隆进钩子线程：URL 实例克隆不了（DataCloneError），
+  // 统一降成字符串再传。
+  const registry = Object.fromEntries(
+    Object.entries({ ...defaultModules(), ...(modules || {}) }).map(([key, value]) => [
+      key,
+      value instanceof URL ? value.href : value,
+    ])
+  )
+  register(LOADER_URL, {
+    data: { registry, srcRoot: SRC_ROOT },
+  })
+}
+
+/**
+ * 真正挂载一个 SFC。
+ *
+ * SFC 模板里 <el-switch> 这类标签靠 unplugin-vue-components 在构建期自动解析；
+ * 单独用 compiler-sfc 编译时它们退化成 resolveComponent('el-switch')，
+ * 所以这里 `app.use(ElementPlus)` 装上真实组件，而不是塞桩件——
+ * v-model、禁用态走的是 Element Plus 自己的实现，不是我们造的假货。
+ *
+ * @param {string} filePath 相对 src/ 的路径（如 'components/TraceVariableFlow.vue'）
+ * @param {{
+ *   props?: object,
+ *   modules?: Record<string, string>,  // 相对 src 的模块路径 -> 替代源码
+ *   pinia?: boolean,
+ *   stubs?: Record<string, any>,
+ * }} options
+ */
+export async function mountSfc(filePath, options = {}) {
+  // 必须在 import('vue') 之前，见文件头的顺序说明。
+  registerLoader(options.modules)
+
+  const url = pathToFileURL(SRC_ROOT + filePath).href
+  const [vue, component] = await Promise.all([import('vue'), import(url)])
+  const elementPlus = await import('element-plus')
+  const ElementPlus = elementPlus.default
+
+  const host = document.createElement('div')
+  document.body.appendChild(host)
+
+  // 用一层极薄的反应式宿主传 props，而不是 createApp(Component, props)——
+  // 后者把 props 焊死，改不动；本仓库的挂载用例要覆盖「props 变了之后组件怎么复位」。
+  // 宿主只做 h(Component, props) 转发，不含任何被测逻辑。
+  const props = vue.reactive({ ...(options.props || {}) })
+  const Host = {
+    name: 'SfcHost',
+    setup() {
+      return () => vue.h(component.default ?? component, { ...props })
+    },
+  }
+
+  const app = vue.createApp(Host)
+  app.use(ElementPlus)
+  for (const [name, impl] of Object.entries(options.stubs || {})) app.component(name, impl)
+
+  let pinia = null
+  if (options.pinia !== false) {
+    pinia = vue.createPinia?.() ?? (await import('pinia')).createPinia()
+    app.use(pinia)
+  }
+
+  app.mount(host)
+
+  // ElMessage 必须在 element-plus 已经加载之后才拿得到与组件同一个实例；
+  // 由本函数交出去，调用方就不必自己 import('element-plus')——
+  // 那样会抢在加载钩子注册之前把 element-plus 及其 async-validator 冻进模块缓存。
+  const messages = []
+  const messageTargets = ['success', 'error', 'warning', 'info']
+  const originals = {}
+  for (const level of messageTargets) {
+    originals[level] = elementPlus.ElMessage[level]
+    elementPlus.ElMessage[level] = (message) => messages.push({ level, message })
+  }
+
+  return {
+    app,
+    vue,
+    pinia,
+    props,
+    host,
+    elementPlus,
+    // 记录到的 toast：{ level, message }，level 即 success / error / warning。
+    messages,
+    elementPlusUnpatch() {
+      for (const level of messageTargets) elementPlus.ElMessage[level] = originals[level]
+    },
+    get html() {
+      return host.innerHTML
+    },
+    // 挂载后改 props：等价于 @vue/test-utils 的 setProps。
+    async setProps(patch) {
+      Object.assign(props, patch)
+      await vue.nextTick()
+    },
+    async nextTick() {
+      await vue.nextTick()
+    },
+    // 让挂载后 new 的 microtask / promise 链（上传、请求替身）跑完。
+    async flush(times = 3) {
+      for (let index = 0; index < times; index += 1) {
+        await vue.nextTick()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      }
+    },
+    text() {
+      return host.textContent
+    },
+    query(selector) {
+      return host.querySelector(selector)
+    },
+    queryAll(selector) {
+      return [...host.querySelectorAll(selector)]
+    },
+    buttonByText(label) {
+      return [...host.querySelectorAll('button')].find((node) => node.textContent.trim() === label)
+    },
+    async unmount() {
+      app.unmount()
+      host.remove?.()
+    },
+  }
+}
+
+export { dom }
