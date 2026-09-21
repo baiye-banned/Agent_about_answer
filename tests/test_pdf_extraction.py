@@ -63,7 +63,12 @@ def _minimal_pdf(page_texts: list[str]) -> bytes:
     objects: list[tuple[int, bytes]] = [
         (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
         (2, b"<< /Type /Pages /Kids [" + kids + b"] /Count %d >>" % page_count),
-        (3, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+        # /Encoding 必须显式声明：简单字体的字节到字符映射由它决定，不写就是不明确的。
+        # pypdf 4 对缺失声明按 Latin-1 兜底，pypdf 6 改按 PDF 规范默认的 StandardEncoding，
+        # 于是 0xE9(é)/0xFC(ü) 会被解成别的字符。真实 PDF（Word/LibreOffice 等产出）
+        # 要么显式声明 WinAnsi，要么用 CID 字体，不会落到这条兜底路径上。
+        (3, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+            b"/Encoding /WinAnsiEncoding >>"),
     ]
 
     for index, text in enumerate(page_texts):

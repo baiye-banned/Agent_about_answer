@@ -217,6 +217,29 @@ def _raw_multipart_upload(api, content_disposition_value, payload, content_type=
     )
 
 
+def test_upload_parses_pdf_and_indexes_extracted_text(api):
+    """PDF 走完整上传链路：解析出正文、按页标记入分块、落库。
+
+    issue #98：pypdf 4 → 6 跨两个大版本，解析器换成新版后这条路径必须仍然端点可达。
+    """
+    from test_pdf_extraction import _minimal_pdf
+
+    payload = _minimal_pdf(["Effective on release.", "Late arrivals are logged."])
+    response = _upload(api, "rule.pdf", payload, "application/pdf")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["name"] == "rule.pdf"
+    assert [entry.name for entry in _stored_files(api)] == ["rule.pdf"]
+
+    indexed_text = "\n".join(chunk["text"] for chunk in api.indexed[0])
+    assert "Effective on release." in indexed_text
+    assert "Late arrivals are logged." in indexed_text
+    # 页码标记是分块的页边界（_heading_level 判为 0 级），只用于切分、不进正文，
+    # 两页因此各成一块而不是被页码串成一段。
+    assert "第 1 页" not in indexed_text
+    assert len(api.indexed[0]) >= 2
+
+
 def test_upload_keeps_non_ascii_filename(api):
     """文件名含中文时，落库名与扩展名判定都要正确，不能被截断或错误解码。"""
     response = _upload(api, "制度文件.md", "# 迟到处理\n\n迟到 30 分钟以内记口头提醒。".encode(), "text/plain")
