@@ -15,6 +15,13 @@ permissions:
 jobs:
   pr-template-check:
     name: PR 描述必填节校验
+    # Dependabot 的 PR 描述由平台自动生成（版本对比 + 发布说明），结构上不可能带上
+    # 本仓库模板的必填小节，对这类 PR 执行只会产生恒红的噪音，提交者也无从补齐，故直接跳过。
+    # 这里判「PR 的作者」而不是 github.actor：actor 是触发本次运行的人，
+    # 维护者一旦编辑 / 重新打开 / 触发 rebase 这类 PR，actor 就变成维护者本人，
+    # 用 actor 判会重新跑起这道注定失败的门禁、又变回恒红；PR 作者才是不变的那个。
+    # 标题门禁（Conventional Commits）没有跳过，对 Dependabot 仍然生效。
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: 检出 PR 合并结果（脚本兜底来源）
