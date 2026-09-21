@@ -39,6 +39,7 @@ jobs:
   release-pr:
     name: Open the release PR
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Validate the version input
         env:

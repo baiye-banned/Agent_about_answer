@@ -40,6 +40,7 @@ jobs:
   sync:
     name: Open the main → develop sync PR
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # 回同步 PR 的 head：由本工作流维护的一次性 bot 分支，内容始终等于 main 的 tip。
     # 它是本工作流唯一会强推的引用，且强推只作用于这个名字（见下面的步骤注释）。
     env:
