@@ -502,33 +502,70 @@ def test_upload_knowledge_ingests_without_queuing_behind_a_saturated_default_exe
     assert len(ingest_threads) == 1
 
 
+class _CleanupSession:
+    """超时清理用的独立 Session 桩：交出句柄并记录关闭，不碰真实数据库。
+
+    实际删行走 crud_knowledge_file.delete_knowledge_file，那是 _patch_upload 已打桩的
+    既有清理出口（记录成 ("mysql", fid)），这里只要保证它拿到的是一个独立 Session。
+    """
+
+    def __init__(self, log):
+        self.log = log
+
+    def close(self):
+        self.log.append(("db-close",))
+
+
 def test_upload_knowledge_times_out_when_ingest_exceeds_the_document_budget(monkeypatch):
-    """issue #83 第 4 项：整份文档有总时限，超时按 500 收口并走既有清理路径。
+    """issue #83 第 4 项：整份文档有总时限，超时按 500 收口。
 
     先证红：修复前只有 EMBEDDING_INGEST_TIMEOUT_SECONDS 的单批超时，一份文档要发多批，
     没有总量约束——stuck 的向量化会把上传请求永久挂住。
+
+    清理必须排在写入线程**之后**（对抗评审实测的时序）：线程取消不掉，
+    先删向量再等它写完，就会留下「列表里没有、检索却命中」的孤儿向量。
     """
     calls = []
     release = threading.Event()
+    writer_wrote = threading.Event()
+    entry = _serializable_entry()
     _patch_upload(monkeypatch, calls, RuntimeError("unused"))
-    monkeypatch.setattr(
-        crud_knowledge_file, "create_knowledge_file", lambda db, **kwargs: _serializable_entry()
-    )
-    monkeypatch.setattr(
-        knowledge_service, "add_chunks", lambda chunks, file_id, *args: calls.append(("indexing", file_id)) or release.wait(10)
-    )
+    monkeypatch.setattr(crud_knowledge_file, "create_knowledge_file", lambda db, **kwargs: entry)
+    monkeypatch.setattr(knowledge_service, "SessionLocal", lambda: _CleanupSession(calls))
+
+    def stuck_add_chunks(chunks, file_id, *_args):
+        calls.append(("indexing-start", file_id))
+        release.wait(10)
+        # 模拟「请求已放弃、写入线程仍把这一批写进向量库」。
+        calls.append(("indexing-wrote-vectors", file_id))
+        writer_wrote.set()
+
+    monkeypatch.setattr(knowledge_service, "add_chunks", stuck_add_chunks)
     monkeypatch.setattr(knowledge_service, "KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS", 0.2, raising=False)
 
     try:
         with pytest.raises(HTTPException) as exc_info:
             _upload()
+        # 请求返回的那一刻，清理一次都还没跑：此时写入线程还在写。
+        assert calls == [("indexing-start", 11)]
+        # 放行写入线程，等它把向量写完。
+        release.set()
+        assert writer_wrote.wait(10)
     finally:
         release.set()
 
+    deadline = time.perf_counter() + 10
+    while time.perf_counter() < deadline and ("vectors", 11) not in calls:
+        time.sleep(0.01)
+
     assert exc_info.value.status_code == 500
     assert "超过总时限" in exc_info.value.detail
-    # 超时后仍按原路径清理：先删向量，再删元数据行。
-    assert calls == [("indexing", 11), ("vectors", 11), ("mysql", 11)]
+    # 关键断言：向量写入发生在删除之前。反过来就是评审复现出的孤儿向量。
+    assert ("indexing-wrote-vectors", 11) in calls
+    assert calls.index(("indexing-wrote-vectors", 11)) < calls.index(("vectors", 11))
+    # 删完向量再删元数据行，且用的是独立 Session（请求级 Session 早已随响应结束）。
+    assert calls.index(("vectors", 11)) < calls.index(("mysql", 11))
+    assert ("db-close",) in calls
 
 
 def test_startup_rebuild_runs_off_the_event_loop(monkeypatch):

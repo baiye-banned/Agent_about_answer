@@ -43,12 +43,32 @@ INGEST_TIMEOUT_MESSAGE = "知识文件上传失败：入库超过总时限，请
 
 
 class KnowledgeIngestTimeout(Exception):
-    """整份文档入库超过总时限。单独成型是为了让调用方与其它入库异常走同一条清理路径。"""
+    """整份文档入库超过总时限。
+
+    携带 future 是给清理用的：超时只是放弃**等待**，工作线程还在跑，
+    清理必须排在它之后（见 defer_ingest_cleanup）。
+    """
+
+    def __init__(self, message: str, future=None):
+        super().__init__(message)
+        self.future = future
 
 
 def ingest_deadline() -> float:
     """一次上传的入库截止时刻（事件循环时钟）。整份文档只算一次，各步骤共享。"""
     return asyncio.get_running_loop().time() + KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS
+
+
+def submit_ingest_work(step: Callable[..., Any], args: tuple) -> tuple:
+    """把一步入库工作提交到入库池，返回 (底层 concurrent future, asyncio future)。
+
+    自己 submit + wrap_future，而不是用 loop.run_in_executor：后者只返回 asyncio
+    那一层，而 asyncio.wait_for 超时时会立刻取消并**完成**它——哪怕工作线程还在跑。
+    要判断「工作线程真的跑完了」，必须持有底层 concurrent future，
+    超时清理正是挂在它上面（见 defer_ingest_cleanup）。
+    """
+    work = _INDEX_EXECUTOR.submit(partial(step, *args))
+    return work, asyncio.wrap_future(work)
 
 
 async def run_ingest_step(step: Callable[..., Any], /, *args: Any, deadline: float | None = None) -> Any:
@@ -63,23 +83,58 @@ async def run_ingest_step(step: Callable[..., Any], /, *args: Any, deadline: flo
 
     deadline=None 表示不设总时限（启动重建按文件数逐个跑，没有「一份文档」的语义）。
 
-    超时只放弃等待：工作线程会继续跑完，与 await asyncio.to_thread(...) 被取消时的
-    语义一致。调用方据此走既有清理路径；理论上存在「请求已放弃、向量库仍在写」的
-    窗口，该窗口已登记在 issue #83 的已知取舍里。
+    超时只放弃等待：asyncio 取消不了已经在跑的线程，工作项会继续跑完。
+    因此超时抛出的 KnowledgeIngestTimeout 会带上那个 future，
+    调用方必须把清理排在它之后，否则删掉的向量会被还在跑的批次重新写回来。
     """
     loop = asyncio.get_running_loop()
-    future = loop.run_in_executor(_INDEX_EXECUTOR, partial(step, *args))
+    work, future = submit_ingest_work(step, args)
     if deadline is None:
         return await future
 
     remaining = deadline - loop.time()
     if remaining <= 0:
-        future.cancel()
-        raise KnowledgeIngestTimeout(INGEST_TIMEOUT_MESSAGE)
+        # 还没轮到执行：可以真的取消掉这个工作项（cancel 只对未开始的任务生效）。
+        work.cancel()
+        raise KnowledgeIngestTimeout(INGEST_TIMEOUT_MESSAGE, work)
     try:
         return await asyncio.wait_for(future, timeout=remaining)
     except TimeoutError:
-        raise KnowledgeIngestTimeout(INGEST_TIMEOUT_MESSAGE)
+        raise KnowledgeIngestTimeout(INGEST_TIMEOUT_MESSAGE, work)
+
+
+def defer_ingest_cleanup(work, entry_id: int, user_id: int) -> None:
+    """把「删向量 + 删元数据行」挂到入库**工作线程真正结束**之后执行。
+
+    work 必须是底层 concurrent future（submit_ingest_work 的第一个返回值）：
+    asyncio 那一层在 wait_for 超时时就已经完成，挂在它上面等于没有排序。
+
+    超时后写入线程不会被取消，仍在往向量库写。若像其它失败路径那样立刻清理，
+    清理先删、写回后到，就留下了一批指向已删文件的向量：列表里没有它，
+    检索却还能命中，答案里会出现点开就 404 的来源（issue #83 第 4 项对抗评审实测）。
+    早先没有总时限时不会出现这条路径（请求会一直等到线程结束才清理），
+    所以这里必须自己保证顺序。
+
+    用独立 SessionLocal 而不是请求级 Session：回调跑在工作线程里，
+    而且请求早已返回，请求级 Session 可能已经关闭。
+    """
+    def _cleanup(_finished_future) -> None:
+        try:
+            delete_file_chunks(entry_id)
+        except Exception as exc:
+            logger.warning("Failed to clean up timed-out ingest vectors: file_id=%s error=%s", entry_id, exc, exc_info=True)
+        db = SessionLocal()
+        try:
+            # 复用既有 CRUD：归属过滤与「行可能已被并发删掉」都走它的语义。
+            crud_knowledge_file.delete_knowledge_file(db, entry_id, user_id)
+        except SQLAlchemyError as exc:
+            db.rollback()
+            logger.warning("Failed to remove knowledge file after ingest timeout: file_id=%s error=%s", entry_id, exc, exc_info=True)
+        finally:
+            db.close()
+
+    # 线程池的 done_callback 由**执行该工作项的线程**在返回后调用，天然落在写入之后。
+    work.add_done_callback(_cleanup)
 
 
 def upload_body_exceeds_limit(content_length: str | None, max_bytes: int) -> bool:
@@ -146,11 +201,18 @@ def rebuild_existing_knowledge_index():
         db.close()
 
 
-# 知识库重名唯一键在三类后端上的报错特征。模型侧的名字是 uq_knowledge_bases_user_name；
+# 知识库重名唯一键在各后端/各版本的报错特征。模型侧的名字是 uq_knowledge_bases_user_name；
 # SQLite 没有具名唯一键，只能从「哪几列冲突」反推。
+# 后三条覆盖 9b34e8a 之前的历史 schema（name 单列唯一）：那个索引在 MySQL 上由
+# _ensure_knowledge_base_owner_unique_index 换掉、且它的失败被吞掉，所以换库失败时
+# 仍可能带着旧索引跑；不认这三条的话，重名会被误判成「非重名冲突」而回 409，
+# 前端拿不到「知识库已存在」的提示。
 _KNOWLEDGE_BASE_NAME_UNIQUE_MARKERS = (
     "uq_knowledge_bases_user_name",
     "knowledge_bases.user_id, knowledge_bases.name",
+    "UNIQUE constraint failed: knowledge_bases.name",
+    "for key 'knowledge_bases.name'",
+    "for key 'name'",
 )
 
 
@@ -344,6 +406,13 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
         # 被独占，也不与检索侧抢 asyncio 默认池。deadline 是整份文档的总预算，
         # 多批外呼加起来也超不过它。
         await run_ingest_step(add_chunks, chunks, entry.id, entry.name, knowledge_base.id, deadline=deadline)
+    except KnowledgeIngestTimeout as exc:
+        # 写入线程还在跑，不能在这里清理：此时删掉的向量会被它重新写回来，
+        # 留下「列表里没有、检索却命中」的孤儿向量。客户端先拿到 500，
+        # 清理挂到工作项完成之后（顺序由线程池的 done_callback 保证）。
+        logger.warning("Knowledge file ingest timed out: file_id=%s error=%s", entry.id, exc, exc_info=True)
+        defer_ingest_cleanup(exc.future, entry.id, user.id)
+        raise HTTPException(500, _index_failure_detail(exc))
     except Exception as exc:
         logger.warning("Knowledge file indexing failed: file_id=%s error=%s", entry.id, exc, exc_info=True)
         try:

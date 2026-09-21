@@ -87,6 +87,36 @@ def test_duplicate_name_race_still_returns_400_with_the_same_message(api, monkey
     assert response.json()["detail"] == DUPLICATE_NAME_MESSAGE
 
 
+@pytest.mark.parametrize(
+    "detail, expected",
+    [
+        # 当前 schema：MySQL 具名唯一键（8.0.19 起带表名前缀 / 之前不带表名）。
+        ("(1062, \"Duplicate entry '考勤制度' for key 'uq_knowledge_bases_user_name'\")", True),
+        ("(1062, \"Duplicate entry '考勤制度' for key 'knowledge_bases.uq_knowledge_bases_user_name'\")", True),
+        # 当前 schema：SQLite 无具名键，按冲突列反推。
+        ("UNIQUE constraint failed: knowledge_bases.user_id, knowledge_bases.name", True),
+        # 历史 schema（9b34e8a 之前的 name 单列唯一）：迁移换索引失败时仍可能遇到。
+        ("UNIQUE constraint failed: knowledge_bases.name", True),
+        ("(1062, \"Duplicate entry '考勤制度' for key 'knowledge_bases.name'\")", True),
+        ("(1062, \"Duplicate entry '考勤制度' for key 'name'\")", True),
+        # 非重名约束：绝不能误判成大重名。
+        ("(1452, 'Cannot add or update a child row: a foreign key constraint fails "
+         "(`rag_system`.`knowledge_bases`, CONSTRAINT `knowledge_bases_ibfk_1` "
+         "FOREIGN KEY (`user_id`) REFERENCES `users` (`id`))')", False),
+        ("FOREIGN KEY constraint failed", False),
+        ("(1062, \"Duplicate entry '1' for key 'PRIMARY'\")", False),
+        ("NOT NULL constraint failed: knowledge_bases.name", False),
+    ],
+)
+def test_name_conflict_markers_cover_real_backend_errors(detail, expected):
+    """按真实后端报文逐条核对分流判据（SQLite 现状 + MySQL 新旧版本 + 历史 schema）。"""
+    from service.knowledge_service import _is_knowledge_base_name_conflict
+
+    exc = IntegrityError("INSERT INTO knowledge_bases ...", {}, Exception(detail))
+
+    assert _is_knowledge_base_name_conflict(exc) is expected
+
+
 def test_non_name_constraint_conflict_falls_through_to_the_global_409(api):
     """非重名约束冲突（user_id 外键失效）走全局兜底 409，不再谎称重名。
 
