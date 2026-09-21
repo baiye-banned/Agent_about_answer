@@ -771,3 +771,137 @@ def test_upload_knowledge_failure_cleanup_does_not_queue_behind_a_saturated_inge
     # 搬到了清理专用池——它才是会排在入库池后面、把请求挂住的那一步。
     vectors_thread = next(tid for name, _, tid in cleanup_threads if name == "vectors")
     assert vectors_thread != threading.get_ident()
+
+
+def _wait_for_cleanup_attempt(calls, file_id, timeout=5.0):
+    """等清理线程试过删向量，再留一小段窗口让「要不要跟着删行」也定下来。
+
+    与 _wait_for_cleanup 相反：这里等的正是不该出现的删行，不能拿它当结束信号。
+    """
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline and not any(
+        name == "vectors" and fid == file_id for name, fid, _ in calls
+    ):
+        time.sleep(0.01)
+    time.sleep(0.3)
+
+
+def test_timeout_cleanup_keeps_metadata_row_when_vector_delete_fails(monkeypatch, caplog):
+    """issue #126：超时清理里「删向量失败」时不得再删元数据行。
+
+    先证红：修复前 delete_file_chunks 的异常只记一条 warning（:196-197），紧接着
+    无条件删行（:201），于是留下「列表里没有、检索却命中」的孤儿向量——启动重建只
+    遍历数据库里的行，行没了就再也不会碰这批向量，这条路径不会自愈。
+    对照同一份设计意图在单文件删除路径上的既有护栏
+    （test_delete_knowledge_keeps_mysql_when_vector_cleanup_fails）。
+    """
+    calls = []
+    monkeypatch.setattr(knowledge_service, "SessionLocal", lambda: _CleanupSession(calls))
+
+    def fail_vector_cleanup(file_id):
+        calls.append(("vectors", file_id))
+        raise RuntimeError("milvus unavailable")
+
+    monkeypatch.setattr(knowledge_service, "delete_file_chunks", fail_vector_cleanup)
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "delete_knowledge_file",
+        lambda db, file_id, user_id: calls.append(("mysql", file_id)),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        knowledge_service._delete_file_vectors_and_row(11, 7)
+
+    # 关键断言：向量没删掉，元数据行必须留下（留下行下次启动会被重建修好）。
+    assert calls == [("vectors", 11)]
+    assert "Keeping knowledge file row" in caplog.text
+
+
+def test_timeout_cleanup_still_deletes_row_when_vector_delete_succeeds(monkeypatch):
+    """配对正控：向量删成功时照旧删行，修复不得把删除本身一起吞掉。"""
+    calls = []
+    monkeypatch.setattr(knowledge_service, "SessionLocal", lambda: _CleanupSession(calls))
+    monkeypatch.setattr(knowledge_service, "delete_file_chunks", lambda file_id: calls.append(("vectors", file_id)))
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "delete_knowledge_file",
+        lambda db, file_id, user_id: calls.append(("mysql", file_id)),
+    )
+
+    knowledge_service._delete_file_vectors_and_row(11, 7)
+
+    # 删行那次用的是清理自建的独立 Session（请求级 Session 早已随响应结束），
+    # 结束时要关掉：("db-close",) 由 _CleanupSession 记进同一个列表。
+    assert calls == [("vectors", 11), ("mysql", 11), ("db-close",)]
+
+
+def test_defer_ingest_cleanup_keeps_metadata_row_when_vector_delete_fails(monkeypatch):
+    """issue #126 端到端：超时清理真正走的 defer 路径，删向量失败也不得删行。"""
+    cleanup_threads = []
+    _patch_upload(monkeypatch, [], RuntimeError("unused"))
+    monkeypatch.setattr(knowledge_service, "SessionLocal", lambda: _CleanupSession([]))
+
+    def fail_vector_cleanup(file_id):
+        cleanup_threads.append(("vectors", file_id, threading.get_ident()))
+        raise RuntimeError("milvus unavailable")
+
+    monkeypatch.setattr(knowledge_service, "delete_file_chunks", fail_vector_cleanup)
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "delete_knowledge_file",
+        lambda db, file_id, user_id: cleanup_threads.append(("mysql", file_id, threading.get_ident())),
+    )
+
+    finished = Future()
+    finished.set_result(None)
+    knowledge_service.defer_ingest_cleanup(finished, 11, 7)
+
+    _wait_for_cleanup_attempt(cleanup_threads, 11)
+
+    assert [name for name, _, _ in cleanup_threads] == ["vectors"]
+    # 失败留痕同样不得落回调用线程（事件循环线程）。
+    assert all(tid != threading.get_ident() for _, _, tid in cleanup_threads)
+
+
+def test_indexing_failure_keeps_metadata_row_when_vector_cleanup_fails(monkeypatch, caplog):
+    """issue #126 同类形态：入库失败兜底分支的删向量失败时，同样不得删行。
+
+    :499-500 吞掉向量清理异常、:502 删行，与超时路径是同一个写法——
+    只是这条要 add_chunks 已经写过一部分再抛错才产生孤儿。
+    """
+    calls = []
+    _patch_upload(monkeypatch, calls, RuntimeError("milvus unavailable"))
+
+    def fail_vector_cleanup(file_id):
+        calls.append(("vectors", file_id))
+        raise RuntimeError("milvus unavailable")
+
+    monkeypatch.setattr(knowledge_service, "delete_file_chunks", fail_vector_cleanup)
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(HTTPException) as exc_info:
+            _upload()
+
+    assert exc_info.value.status_code == 500
+    assert calls == [("vectors", 11)]
+    assert "Keeping knowledge file row" in caplog.text
+
+
+def test_indexing_failure_keeps_metadata_row_when_vector_cleanup_times_out(monkeypatch):
+    """清理超时只是放弃等待、删成没删成无从得知：同样按「没删干净」保留行。
+
+    超时的工作项已经提交、会在后台跑完，先删行则它一旦失败就再没人知道。
+    """
+    calls = []
+    _patch_upload(monkeypatch, calls, RuntimeError("milvus unavailable"))
+
+    async def timing_out_run_cleanup_step(step, *args, deadline=None):
+        raise knowledge_service.KnowledgeIngestTimeout(knowledge_service.INGEST_TIMEOUT_MESSAGE)
+
+    monkeypatch.setattr(knowledge_service, "run_cleanup_step", timing_out_run_cleanup_step)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _upload()
+
+    assert exc_info.value.status_code == 500
+    assert calls == []
