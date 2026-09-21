@@ -47,7 +47,7 @@ flowchart LR
   FastAPI --> MySQL["MySQL"]
   FastAPI --> Retrieval["RAG 检索"]
   Retrieval --> Milvus["Milvus 向量库"]
-  Retrieval --> DeepSeek["DeepSeek 规划/重排"]
+  Retrieval --> DeepSeek["DeepSeek 规划"]
   FastAPI --> SSE["SSE 流式返回"]
   SSE --> Store
   Store --> Vue
@@ -359,8 +359,9 @@ flowchart TD
 |---|---|
 | MySQL | 主数据库 |
 | Milvus | 向量库 |
-| DeepSeek | 聊天、规划、重排 |
+| DeepSeek | 聊天、规划（rerank 仅在异常时兜底） |
 | DashScope embedding | 文本向量化 |
+| DashScope rerank | `qwen3-rerank` 重排主链路 |
 | RAGAS | 回答质量评估 |
 | OSS | 图片和头像 |
 | JWT | 登录鉴权 |
