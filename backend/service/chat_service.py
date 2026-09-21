@@ -18,7 +18,7 @@ from model.models import Conversation, Message, User, _new_id
 from rag.ragas_eval import schedule_ragas_evaluation
 from schema.schemas import ChatRequest, RenameRequest
 from service.auth_service import decode_token, get_current_user
-from service.oss_service import _delete_oss_object, _public_oss_url, _put_oss_object
+from service.oss_service import _delete_oss_object, _public_oss_url, _put_oss_object, is_service_minted_key
 from service.trace_service import _safe_trace_add, _safe_trace_attach, _safe_trace_finish, _trace_sse_payloads
 from service.utils_service import (
     CHAT_ATTACHMENT_MAX_BYTES,
@@ -107,6 +107,36 @@ def get_messages(cid: str,
     if rows is None:
         raise HTTPException(404, "对话不存在")
     return [crud_chat.serialize_message(m) for m in rows]
+
+
+def _service_minted_attachments(attachments: list[dict] | None, conversation_id: str) -> list[dict]:
+    """只留下带「本服务铸造的键」的附件条目，其余整条丢弃并记 warning。
+
+    附件列是客户端回带的：`/api/chat/stream` 的 body 里写什么就落什么。这个键后来会成为
+    删除会话时服务端凭据签发 DeleteObject 的目标，所以在**写入点**也按铸造形态过滤一次，
+    库里就不再有本服务没写过的键——删除侧另有一道同样的护栏，两道各自独立，都不可省。
+
+    丢弃而不是回 422：整条请求失败会让「键不合规」的用户连消息都发不出去，而这类条目对
+    应用没有意义（前端只回带上传接口的返回值，正常条目必带本服务的键）。被丢弃的键只进
+    服务端日志，便于按会话对账：合法请求这条日志恒不出现。
+    """
+    accepted: list[dict] = []
+    rejected: list[object] = []
+    for item in attachments or []:
+        if isinstance(item, dict) and is_service_minted_key(item.get("object_key")):
+            accepted.append(item)
+        else:
+            rejected.append(item.get("object_key") if isinstance(item, dict) else item)
+    if rejected:
+        logger.warning(
+            "chat attachments dropped: %d of %d entries carried no service-minted object_key "
+            "(conversation_id=%s rejected_keys=%s)",
+            len(rejected),
+            len(attachments or []),
+            conversation_id,
+            [str(key)[:120] for key in rejected[:5]],
+        )
+    return accepted
 
 
 def _reclaim_chat_attachments(object_keys: list[str]) -> None:
@@ -345,7 +375,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             conversation_id=cid,
             role="user",
             content=display_question,
-            attachments=json.dumps(body.attachments, ensure_ascii=False),
+            attachments=json.dumps(_service_minted_attachments(body.attachments, cid), ensure_ascii=False),
         )
         db.add(user_message)
         db.commit()
