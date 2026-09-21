@@ -218,7 +218,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   CopyDocument,
   Delete,
@@ -242,6 +242,7 @@ import {
   createDetailPreview,
   createDetailPreviewState,
 } from '@/utils/detailPreview'
+import { createFileListRequest } from '@/utils/fileListRequest'
 import { getApiErrorMessage } from '@/utils/httpError'
 import {
   DELETE_SUCCEEDED,
@@ -253,6 +254,7 @@ import {
   describeUploadSuccess,
   hasDeletedAnyFile,
   partitionUploadFiles,
+  refreshAfterDelete,
   runConfirmedDelete,
   uploadFilesInOrder,
 } from '@/utils/knowledgeFeedback'
@@ -285,7 +287,9 @@ const knowledgeBaseForm = reactive({
 const detail = reactive(createDetailPreviewState())
 const { open: showDetail, close: closeDetail } = createDetailPreview({
   state: detail,
-  fetchContent: (id) => knowledgeAPI.getContent(id),
+  // silent：详情读取失败只在预览区给出红字（模板里的 detail.error），
+  // 不再叠加 request.js 拦截器的顶部 toast。错误只提示一次（issue #83 第 9 项）。
+  fetchContent: (id) => knowledgeAPI.getContent(id, { silent: true }),
 })
 
 // 关闭弹窗（点 X / 按 ESC / 点遮罩，或任何把 visible 置回 false 的路径）都要作废在飞请求：
@@ -296,6 +300,9 @@ watch(
     if (!visible) closeDetail()
   }
 )
+
+// 卸载时同样要作废：离开页面后在飞的响应不得再写进已经卸载组件的状态对象（issue #83 第 9 项）。
+onBeforeUnmount(() => closeDetail())
 
 const knowledgeStore = useKnowledgeStore()
 const knowledgeBases = computed(() => knowledgeStore.knowledgeBases)
@@ -366,18 +373,21 @@ watch([filteredFiles, pageSize], () => {
   }
 })
 
+// 列表取数带请求时序守卫：切库时先发出、后返回的旧库响应不得覆盖当前库的列表
+// （issue #83 第 8 项）。守卫本体在 utils/fileListRequest.js，这里只负责接线。
+const fileList = createFileListRequest({
+  getKnowledgeBaseId: () => currentKnowledgeBaseId.value,
+  fetchList: (params) => knowledgeAPI.getList(params),
+  applyFiles: (files) => {
+    allFiles.value = files
+  },
+  applyLoading: (value) => {
+    loading.value = value
+  },
+})
+
 async function fetchFiles() {
-  if (!currentKnowledgeBaseId.value) {
-    allFiles.value = []
-    return
-  }
-  loading.value = true
-  try {
-    const response = await knowledgeAPI.getList({ knowledge_base_id: currentKnowledgeBaseId.value })
-    allFiles.value = Array.isArray(response) ? response : []
-  } finally {
-    loading.value = false
-  }
+  return fileList.load()
 }
 
 async function initializeKnowledgeBases() {
@@ -529,9 +539,15 @@ async function deleteKnowledgeBase() {
   if (status !== DELETE_SUCCEEDED) return
 
   ElMessage.success('知识库已删除')
-  await fetchKnowledgeBases()
-  currentKnowledgeBaseId.value = result.fallback_knowledge_base_id || knowledgeBases.value[0]?.id || null
-  await fetchFiles()
+  // 刷新失败不能逃逸成未捕获拒绝，也不能让用户以为删除没成功。
+  await refreshAfterDelete({
+    refresh: async () => {
+      await fetchKnowledgeBases()
+      currentKnowledgeBaseId.value = result.fallback_knowledge_base_id || knowledgeBases.value[0]?.id || null
+      await fetchFiles()
+    },
+    notifyError: notifyDeleteError,
+  })
 }
 
 function handleSearch() {
@@ -635,7 +651,10 @@ async function confirmDelete(file) {
   if (status !== DELETE_SUCCEEDED) return
 
   ElMessage.success('删除成功')
-  await refreshKnowledgeBaseAndFiles()
+  await refreshAfterDelete({
+    refresh: refreshKnowledgeBaseAndFiles,
+    notifyError: notifyDeleteError,
+  })
 }
 
 async function confirmBatchDelete() {
@@ -659,7 +678,10 @@ async function confirmBatchDelete() {
   if (!hasDeletedAnyFile(result)) return
 
   selectedFiles.value = []
-  await refreshKnowledgeBaseAndFiles()
+  await refreshAfterDelete({
+    refresh: refreshKnowledgeBaseAndFiles,
+    notifyError: notifyDeleteError,
+  })
 }
 
 async function refreshKnowledgeBaseAndFiles() {
