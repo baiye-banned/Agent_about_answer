@@ -29,7 +29,7 @@ jobs:
       # 这里写 "3.10" 表示 3.10.x 小版本线，避免钉死补丁号后在 runner 上取不到该构建；
       # 下一步会把两份 runtime.txt 原文与解释器实际版本打进日志，便于核对。
       - name: 安装 Python 3.10
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.10"
           # pip 缓存命中会在日志里显示 "Cache restored from key: ..."。
