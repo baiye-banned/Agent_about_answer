@@ -43,8 +43,39 @@ test('三个删除入口的刷新都经 refreshAfterDelete 收口（第 7 项）
     }
   }
 
-  // 上传路径的刷新有自己的 try/catch（既有行为，不属本项），不计入这三条入口。
+  // 上传路径的刷新有自己的出口（refreshAfterUpload，第 154 项修，见下一个用例），
+  // 不占 refreshAfterDelete，所以这里的计数恰为 3：多一处说明有删除入口漏接，
+  // 少一处说明有人把上传路径并了进来。
   assert.equal((VIEW.match(/refreshAfterDelete\(\{/g) || []).length, 3)
+})
+
+test('上传入口的刷新经 refreshAfterUpload 收口，不再落进上传自己的 catch（第 154 项）', () => {
+  const body = functionBody('handleUpload')
+  assert.ok(body.includes('refreshAfterUpload({'), 'handleUpload 的刷新没有接错误分支')
+  assert.ok(body.includes('notifyError: notifyUploadError'), 'handleUpload 没有复用 notifyUploadError 出口')
+
+  // 刷新必须作为参数传进 refreshAfterUpload（即落在它的 refresh 闭包内）才吃得到错误分支。
+  // 修复前它是同一段 try 里的裸 await，刷新自己的拒绝被上传的 catch 接走，而
+  // failedIndex < 0 在上传成功时恒成立，于是逐字弹「上传失败，请稍后重试」——
+  // 文件其实已经入库，用户被诱导重传成重复资料。
+  const guardIndex = body.indexOf('refreshAfterUpload({')
+  const refreshIndex = body.indexOf('refreshKnowledgeBaseAndFiles')
+  assert.ok(refreshIndex > -1, 'handleUpload 没有接上刷新')
+  assert.ok(
+    refreshIndex > guardIndex,
+    'handleUpload 的刷新落在 refreshAfterUpload 之外，刷新失败会被当成上传失败上报'
+  )
+
+  // 出口必须真的从 knowledgeFeedback 接进来：同名的本地函数能让上面两条断言空转。
+  // 文案本体（describeUploadRefreshFailure 的「上传成功，但列表刷新失败」）在
+  // knowledgeFeedback.js 里，由它的纯函数用例钉住，本文件只钉视图这一侧的接线。
+  const importEnd = VIEW.indexOf("} from '@/utils/knowledgeFeedback'")
+  assert.ok(importEnd > -1, '没有找到 knowledgeFeedback 的 import 块')
+  assert.match(
+    VIEW.slice(Math.max(0, importEnd - 400), importEnd),
+    /^\s*refreshAfterUpload,$/m,
+    'refreshAfterUpload 没有从 knowledgeFeedback 引入'
+  )
 })
 
 test('删除知识库：选中在刷新侧栏之前就落到 fallback 上（返工轮 minor-2）', () => {

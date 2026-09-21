@@ -255,6 +255,7 @@ import {
   hasDeletedAnyFile,
   partitionUploadFiles,
   refreshAfterDelete,
+  refreshAfterUpload,
   runConfirmedDelete,
   uploadFilesInOrder,
 } from '@/utils/knowledgeFeedback'
@@ -518,8 +519,14 @@ function resetKnowledgeBaseDialog() {
   knowledgeBaseFormRef.value?.resetFields?.()
 }
 
-// 三个删除入口的错误提示统一走这里，与上传路径的 ElMessage.error 保持同一形态。
+// 三个删除入口的错误提示统一走这里，与上传路径的 notifyUploadError 保持同一形态。
 function notifyDeleteError(message) {
+  ElMessage.error(message)
+}
+
+// 上传路径的错误提示出口。刷新失败也走这里，但文案由 describeUploadRefreshFailure 给出，
+// 说的是「上传成功，但列表刷新失败」——上传的 catch 只负责上传本身的失败。
+function notifyUploadError(message) {
   ElMessage.error(message)
 }
 
@@ -601,6 +608,7 @@ async function handleUpload(files) {
 
   let failedIndex = -1
   let attempted = 0
+  let uploadedAll = false
   uploading.value = true
   uploadPercent.value = 0
 
@@ -623,9 +631,7 @@ async function handleUpload(files) {
         uploadPercent.value = percent
       }
     )
-
-    ElMessage.success(describeUploadSuccess(supported.length))
-    await refreshKnowledgeBaseAndFiles()
+    uploadedAll = true
   } catch (error) {
     const reason = getApiErrorMessage(error, '上传失败，请稍后重试')
     if (failedIndex < 0) {
@@ -646,6 +652,19 @@ async function handleUpload(files) {
     uploading.value = false
     uploadPercent.value = 0
   }
+
+  // 文件一个都没传成时上面已经提示过了，不再进成功分支。
+  if (!uploadedAll) return
+
+  ElMessage.success(describeUploadSuccess(supported.length))
+  // 刷新必须留在上面那个 try 之外（issue #154）：留在里面时，刷新自己的拒绝会被上传的
+  // catch 接走，而 failedIndex < 0 在上传成功时恒成立，于是逐字弹「上传失败，请稍后重试」——
+  // 文件其实已经入库，只是列表没跟上；用户据此重传会再入一份（后端对文件名没有唯一约束）。
+  // 走 refreshAfterUpload 后失败只报「上传成功，但列表刷新失败」，上传成功的事实不被改写。
+  await refreshAfterUpload({
+    refresh: refreshKnowledgeBaseAndFiles,
+    notifyError: notifyUploadError,
+  })
 }
 
 function openUploadDialog() {
