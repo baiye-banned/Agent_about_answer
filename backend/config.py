@@ -121,6 +121,20 @@ EMBEDDING_INGEST_BATCH_MAX_CHARS = _env_int("EMBEDDING_INGEST_BATCH_MAX_CHARS", 
 # extends how long one stuck batch holds a thread-pool slot.
 EMBEDDING_INGEST_TIMEOUT_SECONDS = _env_int("EMBEDDING_INGEST_TIMEOUT_SECONDS", 60)
 
+# Ingestion runs on a thread pool of its own rather than the asyncio default
+# executor that retrieval shares. A round of retrieval fans out up to nine
+# concurrent recalls through asyncio.to_thread; without the split, uploads that
+# fill the default pool queue every recall behind them. Keep this pool small --
+# it bounds how many uploads can hold an embedding connection at once.
+KNOWLEDGE_INDEX_MAX_WORKERS = _env_int("KNOWLEDGE_INDEX_MAX_WORKERS", 4)
+
+# Whole-document budget for one upload's ingest. EMBEDDING_INGEST_TIMEOUT_SECONDS
+# above only caps a single batch; a document is split into several batches, so
+# without a total budget one upload can hold an ingest slot indefinitely. The
+# budget is measured from the start of the upload and shared by every step of
+# that document (parse, chunk, embed), not restarted per step.
+KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS = _env_int("KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS", 300)
+
 # Dedicated reranker for retrieved chunks.
 RERANK_PROVIDER = os.getenv("RERANK_PROVIDER", "dashscope")
 RERANK_MODEL = os.getenv("RERANK_MODEL", "qwen3-rerank")

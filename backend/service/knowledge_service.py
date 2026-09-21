@@ -1,11 +1,15 @@
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from typing import Any, Callable
 
 from fastapi import Depends, File, Form, HTTPException, Request, UploadFile
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from config import KNOWLEDGE_INDEX_MAX_WORKERS, KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS
 from rag.milvus_client import EmbeddingBackendError, add_chunks, delete_file_chunks
 from crud import knowledge_base as crud_knowledge_base
 from crud import knowledge_file as crud_knowledge_file
@@ -26,6 +30,56 @@ logger = logging.getLogger(__name__)
 UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 # multipart 的 content-length 含边界和表单字段等开销，预检留出余量，避免误伤刚好达标的文件。
 MULTIPART_OVERHEAD_ALLOWANCE_BYTES = 4096
+
+# 入库专用线程池。解析、分块、向量化外呼与 Milvus 写入都是同步实现，之前两类走
+# asyncio.to_thread —— 那是 asyncio 的**默认** executor，检索侧一轮多路召回也用同一个，
+# 于是并发上传占满默认池时整轮检索排在入库后面（issue #83 第 4 项）。
+_INDEX_EXECUTOR = ThreadPoolExecutor(
+    max_workers=KNOWLEDGE_INDEX_MAX_WORKERS,
+    thread_name_prefix="knowledge-index",
+)
+
+INGEST_TIMEOUT_MESSAGE = "知识文件上传失败：入库超过总时限，请稍后重试。"
+
+
+class KnowledgeIngestTimeout(Exception):
+    """整份文档入库超过总时限。单独成型是为了让调用方与其它入库异常走同一条清理路径。"""
+
+
+def ingest_deadline() -> float:
+    """一次上传的入库截止时刻（事件循环时钟）。整份文档只算一次，各步骤共享。"""
+    return asyncio.get_running_loop().time() + KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS
+
+
+async def run_ingest_step(step: Callable[..., Any], /, *args: Any, deadline: float | None = None) -> Any:
+    """在入库专用线程池上执行一步同步入库工作。
+
+    与 asyncio.to_thread 的两点差别都是 issue #83 要求的：
+
+    ① 走 _INDEX_EXECUTOR 而不是默认池：入库与检索不再互相排队。
+    ② deadline 给的是整份文档的截止时刻。EMBEDDING_INGEST_TIMEOUT_SECONDS 只约束
+       单批外呼，一份文档要发多批，没有总预算时一次上传可以无限期占住一个槽位。
+       调用方在入库开始时算一次 deadline，解析/分块/向量化共享它。
+
+    deadline=None 表示不设总时限（启动重建按文件数逐个跑，没有「一份文档」的语义）。
+
+    超时只放弃等待：工作线程会继续跑完，与 await asyncio.to_thread(...) 被取消时的
+    语义一致。调用方据此走既有清理路径；理论上存在「请求已放弃、向量库仍在写」的
+    窗口，该窗口已登记在 issue #83 的已知取舍里。
+    """
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(_INDEX_EXECUTOR, partial(step, *args))
+    if deadline is None:
+        return await future
+
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        future.cancel()
+        raise KnowledgeIngestTimeout(INGEST_TIMEOUT_MESSAGE)
+    try:
+        return await asyncio.wait_for(future, timeout=remaining)
+    except TimeoutError:
+        raise KnowledgeIngestTimeout(INGEST_TIMEOUT_MESSAGE)
 
 
 def upload_body_exceeds_limit(content_length: str | None, max_bytes: int) -> bool:
@@ -96,6 +150,8 @@ def _index_failure_detail(exc: Exception) -> str:
     """向量化失败时把可读原因透出给前端，其余写入异常保持原有提示。"""
     if isinstance(exc, EmbeddingBackendError):
         return f"知识文件上传失败：{exc}"
+    if isinstance(exc, KnowledgeIngestTimeout):
+        return INGEST_TIMEOUT_MESSAGE
     return "知识文件上传失败，向量库写入异常。"
 
 
@@ -207,7 +263,17 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
         raise HTTPException(400, knowledge_upload_too_large_message())
 
     content = await read_upload_within_limit(file, KNOWLEDGE_UPLOAD_MAX_BYTES)
-    text = crud_knowledge_file.extract_file_text(file.filename or "", content)
+    # 整份文档的入库预算从这里起算，解析、分块、向量化共享同一个截止时刻。
+    deadline = ingest_deadline()
+    # 解析（含 .docx/.pdf 解码）是同步 CPU 活：直接调用会独占事件循环，
+    # 大文件上传期间同进程其它请求（含健康检查）全部停摆。
+    try:
+        text = await run_ingest_step(
+            crud_knowledge_file.extract_file_text, file.filename or "", content, deadline=deadline
+        )
+    except KnowledgeIngestTimeout:
+        # 此时既没落库也没写向量，无需清理，直接按超时回 500。
+        raise HTTPException(500, INGEST_TIMEOUT_MESSAGE)
 
     try:
         entry = crud_knowledge_file.create_knowledge_file(
@@ -223,16 +289,29 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
         logger.warning("Knowledge file metadata save failed: filename=%s error=%s", file.filename, exc, exc_info=True)
         raise HTTPException(500, crud_knowledge_file.knowledge_file_save_error_message(exc))
 
-    chunks = crud_knowledge_file.chunk_text(text, entry.id)
+    try:
+        chunks = await run_ingest_step(
+            crud_knowledge_file.chunk_text, text, entry.id, deadline=deadline
+        )
+    except KnowledgeIngestTimeout:
+        # 分块超时发生在写向量之前，只回滚刚落下的元数据行。
+        try:
+            crud_knowledge_file.delete_knowledge_file(db, entry.id, user.id)
+        except SQLAlchemyError as cleanup_commit_exc:
+            db.rollback()
+            logger.warning("Failed to remove knowledge file after ingest timeout: file_id=%s error=%s", entry.id, cleanup_commit_exc, exc_info=True)
+        raise HTTPException(500, INGEST_TIMEOUT_MESSAGE)
+
     _warn_on_low_chunk_coverage(entry, text, chunks, scope="Knowledge file upload")
     try:
-        # 向量化外呼与 Milvus 写入都是同步的，放进线程池执行：否则整份文档入库期间
-        # 事件循环被独占，同进程的其它请求（含健康检查）全部停摆。
-        await asyncio.to_thread(add_chunks, chunks, entry.id, entry.name, knowledge_base.id)
+        # 向量化外呼与 Milvus 写入都是同步的，放进入库专用线程池执行：既不让事件循环
+        # 被独占，也不与检索侧抢 asyncio 默认池。deadline 是整份文档的总预算，
+        # 多批外呼加起来也超不过它。
+        await run_ingest_step(add_chunks, chunks, entry.id, entry.name, knowledge_base.id, deadline=deadline)
     except Exception as exc:
         logger.warning("Knowledge file indexing failed: file_id=%s error=%s", entry.id, exc, exc_info=True)
         try:
-            await asyncio.to_thread(delete_file_chunks, entry.id)
+            await run_ingest_step(delete_file_chunks, entry.id)
         except Exception as cleanup_exc:
             logger.warning("Failed to clean partially indexed chunks: file_id=%s error=%s", entry.id, cleanup_exc, exc_info=True)
         try:

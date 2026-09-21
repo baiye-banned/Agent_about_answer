@@ -1,11 +1,15 @@
 import asyncio
+import io
 import logging
+import os
 import threading
 import time
 
 import pytest
+from docx import Document
 from fastapi import HTTPException
 
+from crud import knowledge_file as crud_knowledge_file
 from rag import milvus_client
 from service import knowledge_service
 
@@ -351,6 +355,180 @@ def test_upload_knowledge_indexes_off_the_event_loop_thread_and_keeps_heartbeats
     # 同步入库被移出了事件循环所在线程，且是被等待完成的（不是发出去就不管）。
     assert calls[0]["thread"] != threading.get_ident()
     assert elapsed >= delay
+
+
+def _serializable_entry(file_id=11, name="考勤制度.txt"):
+    """成功路径要序列化返回体，桩 entry 必须带齐 serialize_knowledge_file 用到的字段。"""
+    return type(
+        "Entry",
+        (),
+        {"id": file_id, "name": name, "knowledge_base_id": 2, "size": 4, "created_at": None},
+    )()
+
+
+def _docx_payload(paragraphs):
+    document = Document()
+    for index in range(paragraphs):
+        document.add_paragraph(f"第{index}条 员工迟到{index}分钟以内罚款50元，由人事部汇总")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def test_upload_knowledge_parses_docx_off_the_event_loop(monkeypatch):
+    """issue #83 第 3 项：.docx 解析与分块都离开事件循环线程。
+
+    先证红：修复前 extract_file_text / chunk_text 是在协程里直接同步调用的，
+    解析 1500 段文档的 ~150ms 里心跳协程一次都排不上，且两个调用都发生在事件循环线程上。
+    上面那条心跳用例把 extract_file_text / chunk_text 都打了桩，够不到这一段。
+    """
+    real_extract_file_text = crud_knowledge_file.extract_file_text
+    real_extract_docx_text = crud_knowledge_file.extract_docx_text
+    real_chunk_text = crud_knowledge_file.chunk_text
+    payload = _docx_payload(1500)
+    calls = []
+    seen = {}
+
+    _patch_upload(monkeypatch, calls, RuntimeError("unused"))
+    # 恢复真实的抽取链，只在外面套一层记录线程的壳。
+    monkeypatch.setattr(crud_knowledge_file, "extract_file_text", real_extract_file_text)
+
+    def recording_extract_docx(content):
+        seen["parse_thread"] = threading.get_ident()
+        time.sleep(0.2)  # 把解析耗时钉死，不依赖机器速度
+        return real_extract_docx_text(content)
+
+    def recording_chunk_text(text, file_id):
+        seen["chunk_thread"] = threading.get_ident()
+        time.sleep(0.2)
+        return real_chunk_text(text, file_id)
+
+    monkeypatch.setattr(crud_knowledge_file, "extract_docx_text", recording_extract_docx)
+    monkeypatch.setattr(crud_knowledge_file, "chunk_text", recording_chunk_text)
+    monkeypatch.setattr(
+        crud_knowledge_file, "create_knowledge_file", lambda db, **kwargs: _serializable_entry()
+    )
+    # 本用例只关心解析与分块线程：向量化桩成空操作，走成功路径。
+    monkeypatch.setattr(knowledge_service, "add_chunks", lambda *args, **kwargs: None)
+
+    async def scenario():
+        heartbeats = []
+
+        async def ticker():
+            while True:
+                await asyncio.sleep(0.02)
+                heartbeats.append(time.perf_counter())
+
+        loop_thread = threading.get_ident()
+        ticker_task = asyncio.create_task(ticker())
+        await asyncio.sleep(0.05)
+        started_at = time.perf_counter()
+        result = await knowledge_service.upload_knowledge(
+            request=_Request(),
+            file=_UploadFile("考勤制度.docx", payload, content_type=None),
+            knowledge_base_id=2,
+            user=_User(),
+            db=object(),
+        )
+        finished_at = time.perf_counter()
+        ticker_task.cancel()
+        return [beat for beat in heartbeats if started_at < beat < finished_at], result, loop_thread
+
+    heartbeats_during_upload, result, loop_thread = asyncio.run(scenario())
+
+    assert result["id"] == 11
+    # 解析与分块都真的跑了（没有被桩挡掉），且都不在事件循环线程上。
+    assert set(seen) == {"parse_thread", "chunk_thread"}
+    assert seen["parse_thread"] != loop_thread
+    assert seen["chunk_thread"] != loop_thread
+    # 解析与分块期间事件循环仍在调度心跳协程：修复前这里是 0。
+    assert heartbeats_during_upload
+
+
+def test_upload_knowledge_ingests_without_queuing_behind_a_saturated_default_executor(monkeypatch):
+    """issue #83 第 4 项：入库走独立线程池，不与检索抢 asyncio 默认池。
+
+    先证红：修复前 add_chunks 通过 asyncio.to_thread 提交到**默认** executor，
+    把默认池的全部槽位占满（模拟并发检索/上传把池吃满）之后，入库请求只能排队，
+    这里的 wait_for 会超时。修复后入库有自己的池，默认池再忙也影响不到它。
+    """
+    # asyncio 默认 executor 的容量就是 concurrent.futures 的默认值。
+    default_slots = min(32, (os.cpu_count() or 1) + 4)
+    calls = []
+    ingest_threads = []
+    _patch_upload(monkeypatch, calls, RuntimeError("unused"))
+    monkeypatch.setattr(
+        crud_knowledge_file, "create_knowledge_file", lambda db, **kwargs: _serializable_entry()
+    )
+    monkeypatch.setattr(
+        knowledge_service, "add_chunks", lambda *args, **kwargs: ingest_threads.append(threading.get_ident())
+    )
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        gate = threading.Event()
+        started = 0
+        started_lock = threading.Lock()
+        all_started = asyncio.Event()
+
+        def blocker():
+            nonlocal started
+            with started_lock:
+                started += 1
+                if started >= default_slots:
+                    loop.call_soon_threadsafe(all_started.set)
+            gate.wait(10)
+
+        blockers = [asyncio.ensure_future(asyncio.to_thread(blocker)) for _ in range(default_slots)]
+        await asyncio.wait_for(all_started.wait(), timeout=10)
+        try:
+            return await asyncio.wait_for(
+                knowledge_service.upload_knowledge(
+                    request=_Request(),
+                    file=_UploadFile("考勤制度.txt", b"text"),
+                    knowledge_base_id=2,
+                    user=_User(),
+                    db=object(),
+                ),
+                timeout=5,
+            )
+        finally:
+            gate.set()
+            await asyncio.gather(*blockers, return_exceptions=True)
+
+    result = asyncio.run(scenario())
+
+    assert result["id"] == 11
+    assert len(ingest_threads) == 1
+
+
+def test_upload_knowledge_times_out_when_ingest_exceeds_the_document_budget(monkeypatch):
+    """issue #83 第 4 项：整份文档有总时限，超时按 500 收口并走既有清理路径。
+
+    先证红：修复前只有 EMBEDDING_INGEST_TIMEOUT_SECONDS 的单批超时，一份文档要发多批，
+    没有总量约束——stuck 的向量化会把上传请求永久挂住。
+    """
+    calls = []
+    release = threading.Event()
+    _patch_upload(monkeypatch, calls, RuntimeError("unused"))
+    monkeypatch.setattr(
+        crud_knowledge_file, "create_knowledge_file", lambda db, **kwargs: _serializable_entry()
+    )
+    monkeypatch.setattr(
+        knowledge_service, "add_chunks", lambda chunks, file_id, *args: calls.append(("indexing", file_id)) or release.wait(10)
+    )
+    monkeypatch.setattr(knowledge_service, "KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS", 0.2, raising=False)
+
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            _upload()
+    finally:
+        release.set()
+
+    assert exc_info.value.status_code == 500
+    assert "超过总时限" in exc_info.value.detail
+    # 超时后仍按原路径清理：先删向量，再删元数据行。
+    assert calls == [("indexing", 11), ("vectors", 11), ("mysql", 11)]
 
 
 def test_startup_rebuild_runs_off_the_event_loop(monkeypatch):
