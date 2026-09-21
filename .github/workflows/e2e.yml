@@ -87,7 +87,7 @@ jobs:
 
       # Python 版本来源：仓库根目录 runtime.txt（与 python-tests.yml 保持一致）。
       - name: 安装 Python 3.10
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.10"
           cache: pip
