@@ -68,16 +68,47 @@ export function describeDeleteRefreshFailure(error) {
   return `删除成功，但列表刷新失败：${getApiErrorMessage(error, DELETE_REFRESH_FAILED_HINT)}`
 }
 
-// 返回刷新是否成功，调用方一般不关心——存在的意义是保证「不抛出」：
-// 参数里传进来的是模板事件处理器，返回被拒 Promise 就是一条 unhandledrejection。
-export async function refreshAfterDelete({ refresh, notifyError }) {
+// 刷新失败的处置在删除与上传两条链上完全一致（都不抛出、都交给调用方的 notifyError
+// 出口），只有文案里的操作名不同。收口的形态由这一份实现给出，两个具名出口各自绑定文案，
+// 免得两处各写一份 try/catch 后各自漂移 —— 上传面正是漂移出来的（issue #154：
+// 刷新的裸 await 留在了上传自己的 try 里，被上传的 catch 接走）。
+export async function refreshAfterMutation({ refresh, notifyError, describeFailure }) {
   try {
     await refresh()
     return true
   } catch (error) {
-    notifyError?.(describeDeleteRefreshFailure(error))
+    notifyError?.(describeFailure(error))
     return false
   }
+}
+
+// 返回刷新是否成功，调用方一般不关心——存在的意义是保证「不抛出」：
+// 参数里传进来的是模板事件处理器，返回被拒 Promise 就是一条 unhandledrejection。
+export async function refreshAfterDelete({ refresh, notifyError }) {
+  return refreshAfterMutation({
+    refresh,
+    notifyError,
+    describeFailure: describeDeleteRefreshFailure,
+  })
+}
+
+export const UPLOAD_REFRESH_FAILED_HINT = '请手动刷新页面'
+
+// 与 describeDeleteRefreshFailure 同一条规则：刷新失败不等于操作失败。
+// 上传成功后的刷新此前留在 handleUpload 的 try 内裸 await，刷新一失败就被上传自己的
+// catch 接走，逐字弹「上传失败，请稍后重试」——而文件其实已经入库，列表只是没跟上。
+// 用户据此重传会真的再入一份（后端对文件名没有唯一约束），所以文案必须先认下「上传成功」。
+export function describeUploadRefreshFailure(error) {
+  return `上传成功，但列表刷新失败：${getApiErrorMessage(error, UPLOAD_REFRESH_FAILED_HINT)}`
+}
+
+// 上传成功后的刷新出口，与删除侧同形：失败只报「刷新失败」，不回写上传失败态。
+export async function refreshAfterUpload({ refresh, notifyError }) {
+  return refreshAfterMutation({
+    refresh,
+    notifyError,
+    describeFailure: describeUploadRefreshFailure,
+  })
 }
 
 // 上传白名单：必须与 backend/service/utils_service.py 的 KNOWLEDGE_UPLOAD_TYPES 完全一致
