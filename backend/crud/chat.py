@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session, selectinload
 
 from crud import trace as crud_trace
-from model.models import ChatTraceSession, Conversation, Message
+from model.models import ChatAttachmentUpload, ChatTraceSession, Conversation, Message
 from service.json_utils import load_json_value
 
 
@@ -106,6 +106,134 @@ def list_conversation_attachment_keys(db: Session, cid: str, user_id: int) -> li
             seen.add(object_key)
             keys.append(object_key)
     return keys
+
+
+def register_attachment_upload(db: Session, object_key: str, user_id: int) -> ChatAttachmentUpload:
+    """登记一次上传铸出的对象键，并立刻提交。
+
+    提交必须发生在**写对象之前**（调用方负责顺序）：反过来时，一次「对象已经进桶、进程
+    随即退出」就留下一个库里没有任何痕迹的对象——正是 issue #142 的形状。先落库之后，
+    写对象失败最坏只是一条指向不存在对象的登记行，清扫任务顺手抹掉即可。
+
+    对象键是主键，重复登记会撞唯一约束；上传接口每次铸的都是新的 uuid4().hex，正常路径
+    不会重复。
+    """
+    upload = ChatAttachmentUpload(object_key=object_key, user_id=user_id)
+    db.add(upload)
+    db.commit()
+    return upload
+
+
+def confirm_attachment_uploads(db: Session, object_keys: list[str], user_id: int) -> int:
+    """消费已经转为正式引用的登记行，返回消费掉的条数。**故意不提交**。
+
+    调用方必须把它和消息行放进同一次 commit：分开提交时，「消息已落库、登记行还在」的
+    中间态会让清扫任务把一条活消息引用的对象当成孤儿删掉；反过来则是消息没落库却把登记行
+    消费掉，对象从此脱离所有回收路径。
+
+    只消费 user_id 自己的行：附件列由客户端回带，一条消息可以引用一把别人铸的键（形态校验
+    只认键的形状，不认归属）。若发送方也能替别人消费，那把键就被这条消息永久钉住，
+    原主「上传了没发送」的对象再也回不到清扫任务手里。
+    """
+    keys = [key for key in dict.fromkeys(object_keys or []) if isinstance(key, str) and key]
+    if not keys:
+        return 0
+    return (
+        db.query(ChatAttachmentUpload)
+        .filter(
+            ChatAttachmentUpload.user_id == user_id,
+            ChatAttachmentUpload.object_key.in_(keys),
+        )
+        .delete(synchronize_session=False)
+    )
+
+
+def list_pending_attachment_uploads(
+    db: Session,
+    *,
+    older_than=None,
+    user_id: int | None = None,
+    limit: int | None = None,
+) -> list[ChatAttachmentUpload]:
+    """「桶里有、库里没有」的对账入口：本服务铸过、还没有被任何消息消费的对象键。
+
+    这是 #142 要补的那块——上传即登记之后，行还在这张表里就等于「服务端写过一个对象，
+    但没有任何消息引用它」。清扫任务用 older_than 取超期的那批，排查/导出可以不加时间
+    条件看全量，也可以按 user_id 收窄到单个账号。
+
+    按 created_at 升序（同刻按 object_key 兜底定序）：一批超过 limit 时，先被回收的
+    是积压更久的那批，且顺序稳定可复现。
+    """
+    query = db.query(ChatAttachmentUpload)
+    if older_than is not None:
+        query = query.filter(ChatAttachmentUpload.created_at < older_than)
+    if user_id is not None:
+        query = query.filter(ChatAttachmentUpload.user_id == user_id)
+    query = query.order_by(
+        ChatAttachmentUpload.created_at.asc(),
+        ChatAttachmentUpload.object_key.asc(),
+    )
+    if limit is not None:
+        query = query.limit(max(1, int(limit)))
+    return query.all()
+
+
+def claim_attachment_upload(db: Session, object_key: str, older_than) -> dict | None:
+    """原子地把一条「已超期且仍未被消费」的登记行领走；领不到返回 None。
+
+    领的动作是**条件删除 + 提交**：`WHERE object_key = ? AND created_at < ?`。并发的发送
+    （消费）与另一条清扫（领）竞争的是同一行，数据库的行级原子性保证只有一个能拿到
+    rowcount=1。领不到的一方据此知道「这个对象已经归别人管了」，于是**不去碰对象本身**。
+
+    这是「清扫取到候选之后、动手之前，用户正好把这条附件发送成功」那一臂的解药：清扫不再
+    按自己先前那份快照动手，而是每一步都要先赢下这一行；赢不下来就说明这条键已经成了正式
+    引用（或已被另一条清扫处理），对象必须留着。对象存储没有回收站，删错没有第二遍。
+
+    返回的行数据交给调用方在删除对象失败时**放回队列**（restore_attachment_upload），所以
+    带上 user_id 与 created_at。
+    """
+    row = (
+        db.query(ChatAttachmentUpload)
+        .filter(
+            ChatAttachmentUpload.object_key == object_key,
+            ChatAttachmentUpload.created_at < older_than,
+        )
+        .first()
+    )
+    if row is None:
+        return None
+    claimed = {"object_key": row.object_key, "user_id": row.user_id, "created_at": row.created_at}
+    deleted = (
+        db.query(ChatAttachmentUpload)
+        .filter(
+            ChatAttachmentUpload.object_key == object_key,
+            ChatAttachmentUpload.created_at < older_than,
+        )
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return claimed if deleted else None
+
+
+def restore_attachment_upload(db: Session, *, object_key: str, user_id: int, created_at) -> None:
+    """把「领走了但对象没删成」的登记行按原时间戳放回队列。
+
+    原时间戳（而不是 now）是刻意的：这条行还没被回收，回合后仍按上传时刻排队，下一轮清扫
+    会立刻再试它，不会因为失败过一次就被排到所有新孤儿后面去。
+    """
+    db.add(ChatAttachmentUpload(object_key=object_key, user_id=user_id, created_at=created_at))
+    db.commit()
+
+
+def drop_attachment_upload(db: Session, object_key: str) -> bool:
+    """丢弃一条登记行并提交（清扫用它处理「永远签不出 DELETE」的行）。幂等：重跑返回 False。"""
+    deleted = (
+        db.query(ChatAttachmentUpload)
+        .filter(ChatAttachmentUpload.object_key == object_key)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return bool(deleted)
 
 
 def delete_conversation(db: Session, cid: str, user_id: int) -> Conversation | None:

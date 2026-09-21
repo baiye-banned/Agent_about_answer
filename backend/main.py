@@ -15,6 +15,7 @@ from router.chat import router as chat_router
 from router.checkpointer import router as checkpointer_router
 from router.knowledge import router as knowledge_router
 from router.user import router as user_router
+from service.chat_service import schedule_orphan_attachment_sweep
 from service.knowledge_service import rebuild_existing_knowledge_index, run_ingest_step
 from service.user_service import seed_default_users
 
@@ -35,6 +36,14 @@ async def lifespan(_app: FastAPI):
         # 重建按文件数逐个跑，没有「一份文档」的预算语义，逐文件的失败隔离已由
         # rebuild_existing_knowledge_index 自己保证。
         await run_ingest_step(rebuild_existing_knowledge_index)
+    # 回收「上传了但从未被发送」的聊天附件（issue #142）：上传即登记一条待确认行，发送成功
+    # 时被消费，超过保留窗口还没被消费的由清扫删掉对应对象。挂后台守护线程而不是 await：
+    # DELETE 是串行外呼，积压一批能把就绪时间拖成分钟级；清扫只碰超过保留窗口的登记行，
+    # 与启动时正在上传的对象没有交集，晚一点跑没有正确性代价。
+    #
+    # 启动只是第一轮：线程里是个循环，之后按间隔继续扫。只扫启动那一轮的话，跑几个月不重启
+    # 的进程永远等不到第二轮，孤儿会一直攒着——issue #142 的形态会以「服务没重启」为由复活。
+    schedule_orphan_attachment_sweep()
     yield
 
 
