@@ -35,7 +35,7 @@ from rag.memory_service import (
     _schedule_memory_summary_update,
 )
 from rag.vision_service import _build_effective_question
-from rag.milvus_client import embedding_backend_status
+from rag.milvus_client import embedding_backend_status, embedding_trace_status
 from rag.chains import stream_rag_answer
 from rag.retrieval import decide_need_rag, retrieve_knowledge
 
@@ -398,7 +398,9 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
         retrieved_contexts = []
         knowledge_chunks = []
         retrieval_trace = {
-            "embedding": embedding_backend_status(),
+            # 同一份状态会随 retrieval_trace 落库并回查给用户：last_error 原文（上游地址 +
+            # 原始异常）只留服务端，轨迹里给固定文案。
+            "embedding": embedding_trace_status(embedding_backend_status()),
             "query_plan": {},
             "routes": [],
             "rrf": [],

@@ -87,9 +87,14 @@ def _internal_error_detail(user_message: str, scope: str, exc: Exception) -> str
     异常原文（数据库/驱动报错、文件路径、上游服务地址）对用户没有价值，却能给后续
     针对性攻击提供信息，因此一律不回显；排障靠这条 warning 的 exc_info 与用户报出的
     error_id 对照。与 main.py 兜底 IntegrityError 的判据一致。
+
+    exc_info 传异常对象而不是 True：调用点不一定在 except 体内（如
+    `retrieval.py` 从 `asyncio.gather(return_exceptions=True)` 的返回值里取异常），
+    那种位置 `sys.exc_info()` 是空的，traceback 会打成无意义的 "NoneType: None"。
+    异常对象自带 `__traceback__`，两种情况都能落出与消息里同一个异常的真实栈。
     """
     error_id = uuid4().hex[:8]
-    logger.warning("%s failed [error_id=%s]: %s", scope, error_id, exc, exc_info=True)
+    logger.warning("%s failed [error_id=%s]: %s", scope, error_id, exc, exc_info=exc)
     return f"{user_message}（错误编号：{error_id}）"
 
 
