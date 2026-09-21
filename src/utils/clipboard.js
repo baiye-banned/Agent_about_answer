@@ -24,7 +24,9 @@ export async function writeClipboardText(text) {
       await navigator.clipboard.writeText(value)
       return true
     }
-  } catch {}
+  } catch {
+    // 异步剪贴板被拒（文档未聚焦、权限不足）时静默跳过，交给下面的 textarea 兜底方案。
+  }
 
   return writeWithTextarea(value)
 }

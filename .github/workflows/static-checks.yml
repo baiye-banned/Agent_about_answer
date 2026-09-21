@@ -2,14 +2,14 @@ name: 静态检查
 
 # 当前是**最低档**：只拦语法错误和未定义名这类确定性错误，不做风格规范。
 # 升级路线（改这里之前先确认不会把存量代码一次性判红）：
-#   1) 后端：现在 ruff 只用 E9/F63/F7/F82（语法错误、未定义名、比较写法错误）。
-#      为什么不直接开 E4/E7/E9/F：存量代码在该档下有 6 个历史告警、会让门禁一上来就红
+#   1) 后端：ruff 选择集已经放宽到 E4,E7,E9,F。原先卡在这一档的 6 个历史告警
 #      （backend/main.py 2 个 F401、backend/service/chat_service.py 2 个 F401、
-#      backend/rag/milvus_client.py 2 个 E402）。先清掉这 6 处，再把选择集放宽到 E4,E7,E9,F，
+#      backend/rag/milvus_client.py 2 个 E402）已清掉，所以这里可以直接开。
 #      之后加仓库根 ruff.toml，逐步放开 E/W/F 全量，再逐个评估 I（import 排序）、
 #      B（bugbear）、UP（pyupgrade）、SIM 等规则集。
-#   2) 前端：现在只有 node --check（只覆盖 src/**/*.js；.vue 由 build.yml 的 vite build 兜底），
-#      后续引入 eslint + eslint-plugin-vue，再考虑 prettier 与 vue-tsc。
+#   2) 前端：node --check 保留为不依赖依赖安装的兜底语法门禁（只覆盖 src/**/*.js），
+#      其后追加 eslint（eslint + eslint-plugin-vue，覆盖 src/ 全量含 .vue；规则集见仓库根
+#      eslint.config.js）。后续再考虑 prettier 与 vue-tsc。
 # 这个 workflow 不做"风格即门禁"的事，也不允许用 continue-on-error 把失败掩盖成绿色。
 
 # 触发：PR → develop / main；push → develop（合入后回归）。
@@ -51,10 +51,10 @@ jobs:
         run: pip install ruff==0.16.8
 
       - name: ruff 基础规则集
-        run: ruff check --select E9,F63,F7,F82 backend
+        run: ruff check --select E4,E7,E9,F backend
 
   frontend-lint:
-    name: 前端静态检查 (node --check, Node 22)
+    name: 前端静态检查 (node --check + eslint, Node 22)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -76,3 +76,14 @@ jobs:
             node --check "$file" || failed=1
           done < <(find src -name '*.js' -print0)
           exit "$failed"
+
+      # eslint 需要依赖，所以放在不依赖安装的 node --check 之后：即使 npm 装不上，
+      # 上面那道语法门禁仍然有效。
+      - name: 安装依赖
+        run: npm ci
+
+      # 与本地 `npm run lint`（eslint src）同一个作用域，覆盖 src/ 下全部 .js 与 .vue。
+      # 这里写全命令而不用 npm run lint，是为了避免 package.json 脚本被改（比如加上 --fix）
+      # 时门禁跟着悄悄变松。
+      - name: eslint (src)
+        run: npx eslint src

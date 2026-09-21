@@ -1,6 +1,5 @@
 import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 
 from config import REBUILD_KNOWLEDGE_INDEX_ON_STARTUP, ensure_secret_key_configured
 from database.session import init_db
-from paths import UPLOAD_DIR, AVATAR_DIR
+from paths import UPLOAD_DIR
 from router.auth import router as auth_router
 from router.chat import router as chat_router
 from router.checkpointer import router as checkpointer_router
