@@ -22,6 +22,7 @@ import json
 import logging
 
 import docx
+import httpx
 import pypdf
 import pytest
 from fastapi import HTTPException
@@ -30,7 +31,9 @@ import rag.learning_trace as learning_trace
 import rag.llm as llm
 from conftest import FakeKnowledgeBase
 from crud import knowledge_file
-from rag import vision_service
+from crud import chat as crud_chat
+from model.models import Message
+from rag import milvus_client, vision_service
 from schema.schemas import ChatRequest
 from service import chat_service, oss_service
 
@@ -590,6 +593,165 @@ def test_retrieval_query_plan_failure_hides_internal_error(monkeypatch, caplog):
     _assert_no_leak(str(plan.get("error")), "query_plan.error")
     assert plan["error"], "失败标记必须保留，调用方靠它区分规划是否成功"
     assert INTERNAL_ERROR_TEXT in caplog.text
+
+
+# --- 检索轨迹：向量化后端不可达（retrieval_trace 的两个载体） ----------------
+#
+# `retrieval.py` 从 `asyncio.gather(..., return_exceptions=True)` 的**返回值**里取出
+# `EmbeddingBackendError` 再 `str()` 化——它不在任何 `except` 体内，所以「逐个体检
+# except 处理器」的扫法看不见这条通路，只能按「哪些数据最终进了响应体」回查。
+# `retrieval_trace` 由 `chat_service` 用 `json.dumps` 落进 assistant 消息，随后
+# `crud.chat.serialize_message` 把它原样放进 `GET /api/chat/conversations/{cid}`
+# 的响应体；同一份轨迹里的 `embedding.last_error` 是 `embedding_backend_status()`
+# 的进程级状态——**没赶上这次失败的用户**也会拿到它，因此两个载体都要断言。
+
+EMBEDDING_UPSTREAM_BASE = "https://embedding.internal.example/v1"
+EMBEDDING_TRANSPORT_ERROR = "[Errno 11001] getaddrinfo failed"
+# 这些字样只要出现在用户侧负载里，就说明上游地址或原始异常回显了。
+EMBEDDING_LEAK_MARKERS = ("embedding.internal.example", "/v1/embeddings", EMBEDDING_TRANSPORT_ERROR)
+
+
+class _FailingEmbeddingTransport:
+    """httpx.Client 替身：只替换传输层，抛真实的 `httpx.ConnectError`。
+
+    与 `test_milvus_client.py` 的 `_FakeHttpClient(error=...)` 同一口径：被测的是
+    「异常文本进不进用户负载」，不是 httpx 本身，因此边界止于传输层。
+    """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def post(self, url, json=None, headers=None):
+        raise httpx.ConnectError(EMBEDDING_TRANSPORT_ERROR)
+
+
+@pytest.fixture
+def clean_embedding_state():
+    """`_embedding_state` 是进程级全局：用例前后都清空，避免影响同进程里的其它用例。"""
+
+    def reset():
+        milvus_client._embedding_state.update(source="", last_error="", last_error_at="", last_used_at="")
+
+    reset()
+    yield
+    reset()
+
+
+def _configure_failing_embedding(monkeypatch) -> None:
+    monkeypatch.setattr(milvus_client, "EMBEDDING_BASE_URL", EMBEDDING_UPSTREAM_BASE)
+    monkeypatch.setattr(milvus_client, "EMBEDDING_API_KEY", "sk-test-not-a-real-key")
+    monkeypatch.setattr(
+        milvus_client.httpx, "Client", lambda *_args, **_kwargs: _FailingEmbeddingTransport()
+    )
+
+
+def _fake_query_vectors(query, top_k, knowledge_base_id, route):
+    """只替换 Milvus 连接与召回结果，向量化仍走真实实现。
+
+    `milvus_client._embedding_fn` 是真实实例：真实 httpx 失败 → 真实
+    `_embedding_failure()` 拼出含上游地址的文案 → 真实 `EmbeddingBackendError`。
+    """
+    milvus_client._embedding_fn([query])
+    return []
+
+
+def _failing_query_plan() -> dict:
+    return {
+        "original_question": "迟到30分钟以内怎么罚款",
+        "simplified_question": "",
+        "sub_questions": [],
+        "rewrites": [],
+        "keywords": ["考勤", "迟到"],
+        "required_evidence": [],
+    }
+
+
+def test_retrieval_embedding_failure_trace_hides_internal_error(monkeypatch, clean_embedding_state, caplog):
+    """向量化后端不可达：retrieval_trace 的两个载体都不得把上游地址与原始异常交给用户。"""
+    import rag.retrieval as retrieval
+
+    _configure_failing_embedding(monkeypatch)
+
+    async def fake_rerank_chunks(question, chunks):
+        return chunks, {"status": "done", "items": []}
+
+    monkeypatch.setattr(retrieval, "query_vectors", _fake_query_vectors)
+    monkeypatch.setattr(retrieval, "keyword_recall", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(retrieval, "rerank_chunks", fake_rerank_chunks)
+
+    with caplog.at_level(logging.WARNING):
+        _chunks, trace = asyncio.run(
+            retrieval.retrieve_knowledge(
+                "考勤 迟到 罚款", knowledge_base_id=1, db=object(), query_plan=_failing_query_plan()
+            )
+        )
+
+    # 阳性对照：这段敏感文本确实产生过，否则下面的「负载干净」可能只是空跑。
+    assert EMBEDDING_TRANSPORT_ERROR in milvus_client.embedding_backend_status()["last_error"]
+
+    # 降级语义与失败标记不变：收敛的是文本，不是行为。
+    assert trace["embedding_error"]
+    assert trace["embedding"]["mode"] == "unavailable"
+
+    # 1) 轨迹整体（embedding_error + embedding.last_error）不含上游地址/原文
+    _assert_no_leak(json.dumps(trace, ensure_ascii=False), "retrieval_trace", EMBEDDING_LEAK_MARKERS)
+
+    # 2) 可诊断性不降级：原文、真实栈与用户可报出的编号都能在服务端日志里对上
+    assert EMBEDDING_TRANSPORT_ERROR in caplog.text
+    # 本处不在 except 体内，`exc_info=True` 只会落出 "NoneType: None"；类名只可能来自
+    # 真实 traceback，因此这一行锁住「异常对象自带 __traceback__ 被真的用上」。
+    assert "EmbeddingBackendError" in caplog.text
+    error_id = trace["embedding_error"].split("错误编号：", 1)[1].rstrip("）")
+    assert f"error_id={error_id}" in caplog.text
+
+    # 3) 真落库形态 → 真 serialize_message → 消息历史接口的用户可见负载
+    message = Message(id=1, role="assistant", content="回答", conversation_id="c-1")
+    message.retrieval_trace = json.dumps(trace, ensure_ascii=False)
+    body = json.dumps(crud_chat.serialize_message(message), ensure_ascii=False, default=str)
+    _assert_no_leak(body, "GET /api/chat/conversations/{cid} 响应体", EMBEDDING_LEAK_MARKERS)
+
+
+def test_embedding_trace_status_masks_last_error_on_the_copy_only(clean_embedding_state):
+    """轨迹副本收敛 `last_error`；`embedding_backend_status()` 的返回值是诊断面，保持不变。"""
+    error = milvus_client._embedding_failure(
+        f"向量化接口调用失败（{EMBEDDING_UPSTREAM_BASE}/embeddings）：{EMBEDDING_TRANSPORT_ERROR}"
+    )
+    assert isinstance(error, milvus_client.EmbeddingBackendError)
+
+    status = milvus_client.embedding_backend_status()
+    assert EMBEDDING_TRANSPORT_ERROR in status["last_error"]
+
+    masked = milvus_client.embedding_trace_status(status)
+    _assert_no_leak(json.dumps(masked, ensure_ascii=False), "轨迹副本", EMBEDDING_LEAK_MARKERS)
+    assert masked["mode"] == "unavailable", "降级语义必须保留，前端靠它区分是否可用"
+    # 收敛的是副本：状态接口的原文没有被就地改写（既有用例锁定着它）。
+    assert EMBEDDING_TRANSPORT_ERROR in status["last_error"]
+
+
+def test_direct_mode_trace_embedding_status_hides_internal_error(
+    monkeypatch, fake_db, real_trace, clean_embedding_state
+):
+    """直答模式（不跑检索）同样会把这份状态写进 retrieval_trace 并落库回查。"""
+    _patch_stream_boundaries(monkeypatch, fake_db)
+
+    async def fake_decide_need_rag(*_args, **_kwargs):
+        return {"need_rag": False, "route": "direct", "confidence": 1.0, "source": "test", "reason": "直答"}
+
+    monkeypatch.setattr(chat_service, "decide_need_rag", fake_decide_need_rag)
+    milvus_client._embedding_failure(
+        f"向量化接口调用失败（{EMBEDDING_UPSTREAM_BASE}/embeddings）：{EMBEDDING_TRANSPORT_ERROR}"
+    )
+
+    _run_stream(fake_db)
+
+    assistants = fake_db.added_by_role("assistant")
+    assert assistants, "直答模式也应把 assistant 消息落库"
+    persisted = str(assistants[0].retrieval_trace)
+    _assert_no_leak(persisted, "assistant 消息的 retrieval_trace", EMBEDDING_LEAK_MARKERS)
+    assert json.loads(persisted)["embedding"]["mode"] == "unavailable"
 
 
 def test_memory_summary_update_failure_trace_hides_internal_error(monkeypatch, caplog):
