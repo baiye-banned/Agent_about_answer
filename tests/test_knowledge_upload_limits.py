@@ -254,8 +254,9 @@ def test_upload_drops_rfc5987_filename_extended_parameter(api):
 
     issue #98 的升级实测行为（0.0.9 → 0.0.31 唯一的行为变更）：
     python-multipart 0.0.31 的加固解析器不再把 filename* 归一化成 filename，
-    而 starlette 0.38.6 的 formparsers 是把 Content-Disposition 解析委托给它、
-    再判 `b"filename" in options`（见 starlette/formparsers.py:183），
+    而 starlette 0.38.6 的 formparsers 是把 Content-Disposition 解析委托给它
+    （starlette/formparsers.py:183 调 parse_options_header）、
+    再判 `b"filename" in options`（starlette/formparsers.py:188），
     因此这个 part 不会被识别为文件，FastAPI 的 File(...) 匹配不上 → 422。
 
     这是修复 GHSA-vffw-93wf-4j4q（RFC 2231/5987 参数走私）所采取的方向：
