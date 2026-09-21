@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import pytest
 from docx import Document
@@ -614,3 +615,103 @@ def test_startup_rebuild_runs_off_the_event_loop(monkeypatch):
     assert calls
     assert elapsed >= delay
     assert calls[0] != threading.get_ident()
+
+
+def _wait_for_cleanup(cleanup_threads, file_id, timeout=5.0):
+    """等异步清理落地：清理现在跑在线程池里，请求返回之后才完成。"""
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline and not any(
+        name == "mysql" and fid == file_id for name, fid, _ in cleanup_threads
+    ):
+        time.sleep(0.01)
+
+
+def test_defer_ingest_cleanup_never_runs_blocking_io_on_the_calling_thread(monkeypatch):
+    """返工轮 major-2：已完成的 future 不得在调用线程上就地跑清理。
+
+    先证红（对抗评审实测循环停摆 300.5ms、本仓复现 304.4ms）：总预算在工作项还
+    排队（PENDING）时耗尽，work.cancel() 会成功、future 立刻 done，
+    concurrent.futures 对**已完成**的 future 是在调用线程上就地执行 done_callback
+    的——调用线程正是事件循环线程，于是整段向量库外呼 + 一次删行都回到了循环上。
+
+    这里直接把「已完成的 future」喂给 defer_ingest_cleanup：等价于 cancel 成功、
+    也是 asyncio.wait_for 超时把取消传导到底层 future 之后的形态。
+    """
+    loop_thread = threading.get_ident()
+    cleanup_threads = []
+    _patch_upload(monkeypatch, [], RuntimeError("unused"))
+    monkeypatch.setattr(knowledge_service, "SessionLocal", lambda: _CleanupSession([]))
+    monkeypatch.setattr(
+        knowledge_service,
+        "delete_file_chunks",
+        lambda file_id: cleanup_threads.append(("vectors", file_id, threading.get_ident())),
+    )
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "delete_knowledge_file",
+        lambda db, file_id, user_id: cleanup_threads.append(("mysql", file_id, threading.get_ident())),
+    )
+
+    finished = Future()
+    finished.set_result(None)
+    knowledge_service.defer_ingest_cleanup(finished, 11, 7)
+
+    _wait_for_cleanup(cleanup_threads, 11)
+
+    assert [name for name, _, _ in cleanup_threads] == ["vectors", "mysql"]
+    # 关键断言：清理一律不在调用线程（事件循环线程）上跑。
+    assert all(tid != loop_thread for _, _, tid in cleanup_threads)
+
+
+def test_upload_knowledge_cleans_up_off_the_event_loop_when_the_budget_expires_while_queued(monkeypatch):
+    """返工轮 major-2 端到端：预算在 add_chunks 仍排队时耗尽，清理不得落回事件循环线程。
+
+    单槽位入库池 + chunk 在工作线程里占住槽位，让 add_chunks 的工作项**确定性地**
+    停在 PENDING（不依赖线程调度时序）：这正是「4 个并发慢上传占满入库池、第 5 个
+    上传的 add_chunks 一直排队到预算耗尽」的形态。
+    """
+    calls = []
+    cleanup_threads = []
+    release = threading.Event()
+    entry = _serializable_entry()
+    _patch_upload(monkeypatch, calls, RuntimeError("unused"))
+    monkeypatch.setattr(crud_knowledge_file, "create_knowledge_file", lambda db, **kwargs: entry)
+    monkeypatch.setattr(knowledge_service, "SessionLocal", lambda: _CleanupSession(calls))
+    monkeypatch.setattr(knowledge_service, "KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS", 0.3, raising=False)
+    monkeypatch.setattr(
+        knowledge_service,
+        "delete_file_chunks",
+        lambda file_id: cleanup_threads.append(("vectors", file_id, threading.get_ident())),
+    )
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "delete_knowledge_file",
+        lambda db, file_id, user_id: cleanup_threads.append(("mysql", file_id, threading.get_ident())),
+    )
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(knowledge_service, "_INDEX_EXECUTOR", pool)
+
+    def chunk_text_then_occupy_the_pool(text, file_id):
+        # 排在 chunk 自己之后、占住唯一的槽位：add_chunks 于是只能排队。
+        pool.submit(release.wait, 30)
+        return [{"id": "0", "text": text}]
+
+    monkeypatch.setattr(crud_knowledge_file, "chunk_text", chunk_text_then_occupy_the_pool)
+    monkeypatch.setattr(knowledge_service, "add_chunks", lambda *args, **kwargs: calls.append(("indexed", 11)))
+
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            _upload()
+    finally:
+        release.set()
+        pool.shutdown(wait=False)
+
+    _wait_for_cleanup(cleanup_threads, 11)
+
+    assert exc_info.value.detail == knowledge_service.INGEST_TIMEOUT_MESSAGE
+    # 队列中的工作项真的被取消了（没写进任何向量），清理仍然照跑。
+    assert ("indexed", 11) not in calls
+    assert [name for name, _, _ in cleanup_threads] == ["vectors", "mysql"]
+    # 超时兜底的整段清理（外呼 + 删行）都不得落回事件循环线程。
+    assert all(tid != threading.get_ident() for _, _, tid in cleanup_threads)

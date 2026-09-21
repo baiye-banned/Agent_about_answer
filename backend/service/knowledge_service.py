@@ -39,6 +39,13 @@ _INDEX_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="knowledge-index",
 )
 
+# 清理专用线程池。超时/中止后的「删向量 + 删元数据行」都是同步阻塞外呼：
+# ① 不能落回事件循环线程（返工轮 major-2：total budget 耗尽时 work.cancel() 让 future
+#    立刻 done，add_done_callback 于是在事件循环线程上就地执行整段清理，循环停摆 300ms）；
+# ② 也不该排进上面的入库池——入库池只有 KNOWLEDGE_INDEX_MAX_WORKERS 个槽位，
+#    被卡死的写入线程占满时清理会无限期排队（返工轮 minor-1，实测 1.5s 未完成）。
+_CLEANUP_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="knowledge-cleanup")
+
 INGEST_TIMEOUT_MESSAGE = "知识文件上传失败：入库超过总时限，请稍后重试。"
 
 
@@ -119,7 +126,7 @@ def defer_ingest_cleanup(work, entry_id: int, user_id: int) -> None:
     早先没有总时限时不会出现这条路径（请求会一直等到线程结束才清理），
     所以这里必须自己保证顺序。
 
-    用独立 SessionLocal 而不是请求级 Session：回调跑在工作线程里，
+    用独立 SessionLocal 而不是请求级 Session：清理跑在线程池里，
     而且请求早已返回，请求级 Session 可能已经关闭。
 
     这条路径的代价，写在这里备查：真正卡死（永不返回）的写入线程会让清理永不执行，
@@ -129,22 +136,42 @@ def defer_ingest_cleanup(work, entry_id: int, user_id: int) -> None:
     而留下行的这条会被 rebuild_existing_knowledge_index 在下次启动时重建索引。
     """
     def _cleanup(_finished_future) -> None:
+        # 回调体只做「派活」这一件非阻塞的事，真正的阻塞外呼全部交给清理专用池。
+        #
+        # 返工轮 major-2：future 已经完成时，concurrent.futures 是在**调用线程**上
+        # 就地执行回调的，而这里的调用线程常常就是事件循环线程——总预算在工作项还
+        # 排队（PENDING）时耗尽，work.cancel() 成功、future 立刻 done，
+        # upload_knowledge 紧接着调本函数，整段 delete_file_chunks 外呼 + 一次删行
+        # 就回到了事件循环上（对抗评审实测循环停摆 300.5ms；asyncio.wait_for 那条
+        # 超时分支把取消传导到底层 future，同样使其 done，形态一致）。
+        # 回调在线程池工作线程里被调用时也不能就地做阻塞活：那会占住入库槽位。
         try:
-            delete_file_chunks(entry_id)
-        except Exception as exc:
-            logger.warning("Failed to clean up timed-out ingest vectors: file_id=%s error=%s", entry_id, exc, exc_info=True)
-        db = SessionLocal()
-        try:
-            # 复用既有 CRUD：归属过滤与「行可能已被并发删掉」都走它的语义。
-            crud_knowledge_file.delete_knowledge_file(db, entry_id, user_id)
-        except SQLAlchemyError as exc:
-            db.rollback()
-            logger.warning("Failed to remove knowledge file after ingest timeout: file_id=%s error=%s", entry_id, exc, exc_info=True)
-        finally:
-            db.close()
+            _CLEANUP_EXECUTOR.submit(_delete_file_vectors_and_row, entry_id, user_id)
+        except RuntimeError as exc:
+            # 解释器退出、线程池已关时 submit 会抛 RuntimeError：留痕即可，
+            # 让异常从 done_callback 里冒出去只会污染线程池的工作线程。
+            logger.warning("Failed to schedule ingest cleanup: file_id=%s error=%s", entry_id, exc, exc_info=True)
 
-    # 线程池的 done_callback 由**执行该工作项的线程**在返回后调用，天然落在写入之后。
+    # 线程池的 done_callback 由**执行该工作项的线程**在返回后调用，天然落在写入之后；
+    # 派活也因此在写入结束之后才发生，清理依旧排在写入线程之后。
     work.add_done_callback(_cleanup)
+
+
+def _delete_file_vectors_and_row(entry_id: int, user_id: int) -> None:
+    """删向量 + 删元数据行。只在清理专用池的线程里跑，不在事件循环线程上跑。"""
+    try:
+        delete_file_chunks(entry_id)
+    except Exception as exc:
+        logger.warning("Failed to clean up timed-out ingest vectors: file_id=%s error=%s", entry_id, exc, exc_info=True)
+    db = SessionLocal()
+    try:
+        # 复用既有 CRUD：归属过滤与「行可能已被并发删掉」都走它的语义。
+        crud_knowledge_file.delete_knowledge_file(db, entry_id, user_id)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.warning("Failed to remove knowledge file after ingest timeout: file_id=%s error=%s", entry_id, exc, exc_info=True)
+    finally:
+        db.close()
 
 
 def upload_body_exceeds_limit(content_length: str | None, max_bytes: int) -> bool:
