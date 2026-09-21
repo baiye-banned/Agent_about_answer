@@ -40,6 +40,7 @@
 
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -252,6 +253,179 @@ def test_allow_marker_exempts_only_when_a_reason_follows(tmp_path):
     assert "%s:1 [credential assignment]" % dual not in stderr, stderr
     assert "%s:1 [sk- token]" % dual in stderr, stderr
     assert "%s:1 [sk- token]" % dual not in stdout, stdout
+
+
+# ---------------------------------------------------------------------------
+# Layer 2（gitleaks）的归因：环境错误 ≠ 发现密钥（issue #168）
+#
+# gitleaks 对「有命中」和「自己报错」都返回 1（实测 8.24.3：`WRN leaks found: 1` 与
+# `FTL CreateFile …` 同为退出码 1），所以只看退出码无法把两者分开。修法把「有命中」收窄成
+# 只看 gitleaks 自己的命中标记，其余非零一律归为扫描器错误（退出码 2）。下面用桩二进制把
+# 两种非零退出分别喂进去，钉住归因；真实二进制那条路径另由 `$PWD` 的形态归一负责。
+#
+# 桩是**可控输入**，不是「复现了 gitleaks 的 bug」：它证明的是脚本怎么读 gitleaks 的结果。
+# 真二进制的失败形态另在 PR 证据里用 `FTL` 原文比对过，这里的桩首行就抄自那条原文。
+# ---------------------------------------------------------------------------
+
+# 实测自 `gitleaks.exe` 8.24.3（与 secret-scan.yml 的 GITLEAKS_VERSION 同号）的原文，
+# 换成不存在的路径只为让断言不依赖任何本机目录。
+GITLEAKS_FTL_LINE = (
+    "FTL CreateFile C:/no/such/path: The system cannot find the path specified."
+)
+GITLEAKS_HIT_LINE = "WRN leaks found: 1"
+GITLEAKS_CLEAN_LINE = "INF no leaks found"
+# 脚本在「发现密钥」分支里打印的那句话：归因错了就会以它出现为标志。
+FINDINGS_CLAIM = "FAIL - gitleaks reported findings"
+
+
+def _shell_path(path):
+    """返回 shell 查找 PATH 时认得的那种形态。
+
+    git-bash 下 PATH 里只认 MSYS 形态（`/c/…`）：实测把 `C:/…` 塞进 PATH，`command -v`
+    查不到——桩目录若按 Windows 形态传进去，用例会因为「桩没被找到」而以「找不到 gitleaks」
+    退出 2，看起来却像是归因逻辑失败。
+    """
+    text = str(path)
+    cygpath = shutil.which("cygpath")
+    if cygpath:
+        result = subprocess.run([cygpath, "-u", text], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    return text
+
+
+def _stub_gitleaks(bin_dir, exit_code, output_line):
+    """写一个假 gitleaks：退出码与输出首行可控，并把自己的 argv 记进文件。
+
+    记录 argv 是为了钉住 `--source` 的形态：光看退出码没法证明路径归一真的生效。
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    args_file = bin_dir / "gitleaks-argv.txt"
+    stub = bin_dir / "gitleaks"
+    stub.write_text(
+        "#!/bin/sh\n"
+        + "printf '%s\\n' \"$@\" > "
+        + shlex.quote(args_file.as_posix())
+        + "\n"
+        + "printf '%s\\n' "
+        + shlex.quote(output_line)
+        + "\n"
+        + "exit %d\n" % exit_code,
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return args_file
+
+
+def _run_scan_with_gitleaks(target, script, stub_dir):
+    """把桩目录插到 PATH 前面跑一次完整扫描（Layer 1 + Layer 2），返回 (rc, stdout, stderr)。
+
+    PATH 是在 bash **内部**改的：继承来的 PATH 是 Windows 形态，若在 Python 里用 `;`
+    拼一个 MSYS 形态的条目上去，拼出来的串会按错误的引号/分隔符被切开，桩目录静默不生效。
+    """
+    argv = [
+        BASH,
+        "-c",
+        'PATH="$1:$PATH"; export PATH; shift; exec "$@"',
+        "bash",
+        _shell_path(stub_dir),
+        BASH,
+        script.as_posix(),
+        Path(target).as_posix(),
+    ]
+    result = subprocess.run(
+        argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300
+    )
+    return result.returncode, result.stdout, result.stderr
+
+
+def _gitleaks_fixture(tmp_path, name="gitleaks-target"):
+    """一个干净的目标准备好，另起一个目录放桩。"""
+    target = tmp_path / name
+    target.mkdir(parents=True)
+    (target / "ordinary.txt").write_text("ordinary module text\n", encoding="utf-8")
+    return target
+
+
+def test_a_gitleaks_scanner_error_is_not_reported_as_findings(tmp_path):
+    """gitleaks 自己报错（FTL）时：退出码 2、措辞是扫描器错误，**不得**声称发现密钥。
+
+    这是 issue #168 的正面缺陷：原先三处调用一律 `|| GITLEAKS_RC=1`，再统一打印
+    `FAIL - gitleaks reported findings`，于是一个连一个字节都没读到的环境错误被转述成
+    「扫到密钥」。断言分两半——退出码仍是失败（fail-closed），且措辞不再是「发现密钥」。
+    """
+    stub_dir = tmp_path / "bin"
+    _stub_gitleaks(stub_dir, 1, GITLEAKS_FTL_LINE)
+
+    rc, stdout, stderr = _run_scan_with_gitleaks(
+        _gitleaks_fixture(tmp_path), SCAN_SCRIPT, stub_dir
+    )
+
+    combined = stdout + stderr
+    assert rc == 2, combined
+    assert FINDINGS_CLAIM not in combined, combined
+    assert "scanner error" in combined, combined
+    # 失败必须看得见：静默放行会让「环境坏了」变成一次干净扫描。
+    assert "not a reported finding" in combined, combined
+
+
+def test_a_real_gitleaks_finding_is_still_reported_as_findings(tmp_path):
+    """阳性对照：真的命中时，归因不能矫枉过正地变成「扫描器错误」，更不能变绿。
+
+    与上一条用例只差桩的退出码语义（同样是 1，输出标记不同）。两条合起来说明判别力来自
+    「有没有命中标记」而不是「退出码是不是非零」；少掉这一条，把任何非零都报成扫描器错误
+    也能让上一条通过。
+    """
+    stub_dir = tmp_path / "bin"
+    _stub_gitleaks(stub_dir, 1, GITLEAKS_HIT_LINE)
+
+    rc, stdout, stderr = _run_scan_with_gitleaks(
+        _gitleaks_fixture(tmp_path), SCAN_SCRIPT, stub_dir
+    )
+
+    combined = stdout + stderr
+    assert rc == 1, combined
+    assert FINDINGS_CLAIM in combined, combined
+
+
+def test_a_clean_gitleaks_pass_is_green(tmp_path):
+    """退出码 0 仍是干净：归因改动没有把正常路径带进新的分支。"""
+    stub_dir = tmp_path / "bin"
+    _stub_gitleaks(stub_dir, 0, GITLEAKS_CLEAN_LINE)
+
+    rc, stdout, stderr = _run_scan_with_gitleaks(
+        _gitleaks_fixture(tmp_path), SCAN_SCRIPT, stub_dir
+    )
+
+    combined = stdout + stderr
+    assert rc == 0, combined
+    assert "gitleaks scan clean" in combined, combined
+    assert FINDINGS_CLAIM not in combined, combined
+
+
+def test_the_source_reaches_gitleaks_in_a_path_form_it_can_open(tmp_path):
+    """`--source` 必须指到那个目录，且不能是原生 exe 打不开的 MSYS 形态。
+
+    目标目录刻意带上空格与非 ASCII：`$PWD` 归一化（cygpath -m）若把这类路径截断或转义坏，
+    `Path(source).is_dir()` 这一半就会转红——这正是「归一化有没有破坏非 ASCII/空格路径」
+    的排除证据。MSYS 形态那一半只在有 cygpath 的平台（git-bash）上成立：实测把 `/c/…` 交给
+    原生 gitleaks.exe 会 `FTL CreateFile`，一个字节都不扫。
+    """
+    stub_dir = tmp_path / "bin"
+    args_file = _stub_gitleaks(stub_dir, 0, GITLEAKS_CLEAN_LINE)
+    target = _gitleaks_fixture(tmp_path, "gitleaks target 目录")
+
+    rc, stdout, stderr = _run_scan_with_gitleaks(target, SCAN_SCRIPT, stub_dir)
+
+    combined = stdout + stderr
+    assert rc == 0, combined
+    argv = args_file.read_text(encoding="utf-8").splitlines()
+    assert "--source" in argv, argv
+    source = argv[argv.index("--source") + 1]
+    # 归一指到的必须仍然是那个目录（不是被改坏的别的路径，也不是空串）。
+    assert Path(source).is_dir(), source
+    if shutil.which("cygpath"):
+        assert not re.match(r"^/[A-Za-z]/", source), source
 
 
 # ---------------------------------------------------------------------------
