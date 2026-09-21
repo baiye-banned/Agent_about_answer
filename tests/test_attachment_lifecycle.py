@@ -39,7 +39,7 @@ from sqlalchemy.pool import StaticPool
 
 from database import session as db_session
 from database.session import Base
-from model.models import ChatTraceSession, Conversation, Message, User
+from model.models import ChatAttachmentUpload, ChatTraceSession, Conversation, Message, User
 from router import chat as chat_router
 from router import user as user_router
 from schema.schemas import ChatRequest
@@ -162,6 +162,7 @@ def api(monkeypatch, tmp_path):
     # 会话删除链路读写的表都要建出来。chat_trace_sessions 是删会话时清学习轨迹用的
     # （crud/chat.py 的 delete_conversation），少了它，用例只会在这条链路合入后的
     # CI（跑的是与 develop 合并后的 merge ref）上红，本地分支上反倒看不出问题。
+    # chat_attachment_uploads 同理，是 issue #142 之后上传与发送链路都要写的登记表。
     Base.metadata.create_all(
         bind=engine,
         tables=[
@@ -169,6 +170,7 @@ def api(monkeypatch, tmp_path):
             Conversation.__table__,
             Message.__table__,
             ChatTraceSession.__table__,
+            ChatAttachmentUpload.__table__,
         ],
     )
     db = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)()

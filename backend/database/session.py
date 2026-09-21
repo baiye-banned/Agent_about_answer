@@ -147,6 +147,7 @@ def _ensure_mysql_utf8mb4():
         "messages",
         "knowledge_files",
         "chat_trace_sessions",
+        "chat_attachment_uploads",
     ):
         if table_name not in inspector.get_table_names():
             continue

@@ -102,6 +102,7 @@ Current files:
 - `test_memory_context.py`
 - `test_milvus_acceptance.py`
 - `test_milvus_client.py`
+- `test_orphan_attachment_cleanup_142.py`
 - `test_provider_smoke.py`
 - `test_ragas_eval.py`
 - `test_rerank.py`
