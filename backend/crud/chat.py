@@ -1,7 +1,12 @@
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from model.models import ChatTraceSession, Conversation, Message
 from service.json_utils import load_json_value
+
+
+# 消息历史默认页大小与单页上限：不传分页参数时也必须有上限，否则会话越长单次响应越大。
+CHAT_MESSAGE_DEFAULT_LIMIT = 50
+CHAT_MESSAGE_MAX_LIMIT = 200
 
 
 def serialize_message(message: Message) -> dict:
@@ -27,8 +32,10 @@ def serialize_message(message: Message) -> dict:
 
 
 def list_conversations(db: Session, user_id: int) -> list[Conversation]:
+    # 预加载知识库：序列化时每个会话都要读 conv.knowledge_base，逐行懒加载会让查询数随会话数增长。
     return (
         db.query(Conversation)
+        .options(selectinload(Conversation.knowledge_base))
         .filter_by(user_id=user_id)
         .order_by(Conversation.updated_at.desc())
         .all()
@@ -39,11 +46,28 @@ def get_conversation(db: Session, cid: str, user_id: int) -> Conversation | None
     return db.query(Conversation).filter_by(id=cid, user_id=user_id).first()
 
 
-def list_messages(db: Session, cid: str, user_id: int) -> list[Message] | None:
+def list_messages(
+    db: Session,
+    cid: str,
+    user_id: int,
+    *,
+    limit: int = CHAT_MESSAGE_DEFAULT_LIMIT,
+    before_id: int | None = None,
+) -> list[Message] | None:
+    """按会话取一页消息，返回「旧 -> 新」顺序，与旧接口的数组顺序一致。
+
+    游标用自增主键而不是 created_at：created_at 是秒级 DATETIME，同一秒内的消息按它排序
+    不稳定，翻页会重复或漏行。先倒序取下 limit 条再反转，取到的就是 cursor 之前最新的那页。
+    """
     conversation = get_conversation(db, cid, user_id)
     if not conversation:
         return None
-    return list(conversation.messages)
+    query = db.query(Message).filter(Message.conversation_id == cid)
+    if before_id is not None:
+        query = query.filter(Message.id < before_id)
+    rows = query.order_by(Message.id.desc()).limit(limit).all()
+    rows.reverse()
+    return rows
 
 
 def delete_conversation(db: Session, cid: str, user_id: int) -> Conversation | None:

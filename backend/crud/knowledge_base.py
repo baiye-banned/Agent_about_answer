@@ -1,16 +1,44 @@
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from model.models import Conversation, KnowledgeBase, KnowledgeFile
 
 
-def serialize_knowledge_base(item: KnowledgeBase) -> dict:
+def serialize_knowledge_base(item: KnowledgeBase, file_count: int) -> dict:
+    """序列化知识库；file_count 由调用方以聚合查询给出。
+
+    这里不再用 len(item.files)：关系属性会把该库下所有 KnowledgeFile 行整行实例化，
+    其中 content 是 LONGTEXT，列表接口为了一个计数字段把全部文件正文搬进内存。
+    """
     return {
         "id": item.id,
         "name": item.name,
-        "file_count": len(item.files),
+        "file_count": file_count,
         "created_at": item.created_at.isoformat() if item.created_at else "",
         "updated_at": item.updated_at.isoformat() if item.updated_at else "",
     }
+
+
+def count_knowledge_files(db: Session, kid: int) -> int:
+    """单个知识库的文件数：只查 COUNT，不取文件行。"""
+    return db.query(func.count(KnowledgeFile.id)).filter(KnowledgeFile.knowledge_base_id == kid).scalar() or 0
+
+
+def count_knowledge_files_by_base(db: Session, kids: list[int]) -> dict[int, int]:
+    """批量文件数：一条 GROUP BY 聚合替代「每个知识库查一次」。
+
+    返回 {knowledge_base_id: 文件数}，没有文件的知识库不出现在结果里，调用方按 0 兜底。
+    计数不叠加 user_id 过滤，与 len(item.files) 的旧语义一致（含回填前的历史行）。
+    """
+    if not kids:
+        return {}
+    rows = (
+        db.query(KnowledgeFile.knowledge_base_id, func.count(KnowledgeFile.id))
+        .filter(KnowledgeFile.knowledge_base_id.in_(kids))
+        .group_by(KnowledgeFile.knowledge_base_id)
+        .all()
+    )
+    return {base_id: count for base_id, count in rows}
 
 
 def get_default_knowledge_base(db: Session, user_id: int) -> KnowledgeBase | None:
