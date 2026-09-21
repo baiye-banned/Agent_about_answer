@@ -188,27 +188,29 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="detailVisible" :title="detailFile?.name || '文件详情'" width="760px" top="6vh">
-      <div v-if="detailFile" class="space-y-4">
+    <el-dialog v-model="detail.visible" :title="detail.file?.name || '文件详情'" width="760px" top="6vh">
+      <div v-if="detail.file" class="space-y-4">
         <div class="grid grid-cols-1 gap-3 text-sm md:grid-cols-2">
-          <div><span class="text-slate-500">文件名：</span>{{ detailFile.name }}</div>
-          <div><span class="text-slate-500">大小：</span>{{ formatSize(detailFile.size) }}</div>
-          <div><span class="text-slate-500">上传时间：</span>{{ formatTime(detailFile.created_at) }}</div>
-          <div><span class="text-slate-500">类型：</span>{{ getFileExt(detailFile.name) }}</div>
+          <div><span class="text-slate-500">文件名：</span>{{ detail.file.name }}</div>
+          <div><span class="text-slate-500">大小：</span>{{ formatSize(detail.file.size) }}</div>
+          <div><span class="text-slate-500">上传时间：</span>{{ formatTime(detail.file.created_at) }}</div>
+          <div><span class="text-slate-500">类型：</span>{{ getFileExt(detail.file.name) }}</div>
         </div>
 
         <el-divider />
 
         <div class="flex items-center justify-between">
           <span class="text-sm font-medium text-slate-700">内容预览</span>
-          <el-button size="small" :icon="CopyDocument" :disabled="!detailContent" @click="copyContent">
+          <el-button size="small" :icon="CopyDocument" :disabled="!detail.content" @click="copyContent">
             复制内容
           </el-button>
         </div>
 
         <div class="max-h-[420px] overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-4">
-          <el-skeleton v-if="contentLoading" :rows="6" animated />
-          <pre v-else class="m-0 whitespace-pre-wrap font-sans text-sm leading-6 text-slate-700">{{ detailContent || '暂无可预览内容' }}</pre>
+          <el-skeleton v-if="detail.loading" :rows="6" animated />
+          <!-- 读取失败与「真的没有内容」分开呈现：空态文案不能拿来解释一次失败的读取。 -->
+          <pre v-else-if="detail.error" class="m-0 whitespace-pre-wrap font-sans text-sm leading-6 text-red-600">{{ detail.error }}</pre>
+          <pre v-else class="m-0 whitespace-pre-wrap font-sans text-sm leading-6 text-slate-700">{{ detail.content || DETAIL_PREVIEW_EMPTY_TEXT }}</pre>
         </div>
       </div>
     </el-dialog>
@@ -235,6 +237,11 @@ import { knowledgeAPI } from '@/api/knowledge'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import { confirmCenteredDelete } from '@/utils/confirm'
 import { copyText } from '@/utils/clipboard'
+import {
+  DETAIL_PREVIEW_EMPTY_TEXT,
+  createDetailPreview,
+  createDetailPreviewState,
+} from '@/utils/detailPreview'
 import { getApiErrorMessage } from '@/utils/httpError'
 import {
   DELETE_SUCCEEDED,
@@ -264,10 +271,6 @@ const uploadPercent = ref(0)
 const uploadInputRef = ref(null)
 const selectedFiles = ref([])
 
-const detailVisible = ref(false)
-const detailFile = ref(null)
-const detailContent = ref('')
-const contentLoading = ref(false)
 const knowledgeBaseDialogVisible = ref(false)
 const knowledgeBaseSubmitting = ref(false)
 const knowledgeBaseDialogMode = ref('create')
@@ -276,6 +279,24 @@ const knowledgeBaseInputRef = ref(null)
 const knowledgeBaseForm = reactive({
   name: '',
 })
+
+// 详情预览的状态放响应式容器，请求时序保护在 createDetailPreview 里：
+// 标题是同步切换的、正文来自异步响应，迟到的旧响应必须被丢弃（#63）。
+const detail = reactive(createDetailPreviewState())
+const { open: showDetail, close: closeDetail } = createDetailPreview({
+  state: detail,
+  fetchContent: (id) => knowledgeAPI.getContent(id),
+})
+
+// 关闭弹窗（点 X / 按 ESC / 点遮罩，或任何把 visible 置回 false 的路径）都要作废在飞请求：
+// 关闭后到达的响应不得再写回正文。
+watch(
+  () => detail.visible,
+  (visible) => {
+    if (!visible) closeDetail()
+  }
+)
+
 const knowledgeStore = useKnowledgeStore()
 const knowledgeBases = computed(() => knowledgeStore.knowledgeBases)
 
@@ -646,22 +667,8 @@ async function refreshKnowledgeBaseAndFiles() {
   await fetchFiles()
 }
 
-async function showDetail(file) {
-  detailFile.value = file
-  detailContent.value = ''
-  detailVisible.value = true
-  contentLoading.value = true
-
-  try {
-    const response = await knowledgeAPI.getContent(file.id)
-    detailContent.value = response.content || ''
-  } finally {
-    contentLoading.value = false
-  }
-}
-
 async function copyContent() {
-  await copyText(detailContent.value, {
+  await copyText(detail.content, {
     successMessage: '已复制到剪贴板',
     failureMessage: '复制失败，请手动选择内容',
   })
