@@ -177,25 +177,76 @@ async def _rerank_chunks_with_llm(question: str, chunks: list[dict]) -> tuple[li
 
 
 def select_final_chunks(ranked_chunks: list[dict], keyword_chunks: list[dict]) -> list[dict]:
-    selected = list(ranked_chunks[:RETRIEVAL_RERANK_TOP_N])
+    # 先判重再截断：同文候选（不同分块方案产出同一段文本）若占着一个配额再被去掉，
+    # 会让排在 TOP_N 之后的那条真实候选白白落选。
+    selected = _dedupe_chunks(ranked_chunks)[:RETRIEVAL_RERANK_TOP_N]
     clean_keyword_chunks = [chunk for chunk in keyword_chunks if isinstance(chunk, dict)]
     if clean_keyword_chunks:
         best_keyword = clean_keyword_chunks[0]
         best_score = _to_number(best_keyword.get("keyword_score"))
-        already_selected = any(chunk_key(chunk) == chunk_key(best_keyword) for chunk in selected)
+        already_selected = any(_same_context(chunk, best_keyword) for chunk in selected)
         # 绝对分值只说明「它像自己文档里的关键字内容」，不说明「它跟本次提问有关」：
         # 插前还必须确认候选命中了查询关键词（issue #56），配额不被跑题候选挤占。
         if best_score >= 10 and _keyword_chunk_hits_query(best_keyword) and not already_selected:
             selected = [best_keyword, *selected]
-    deduped = []
-    seen = set()
-    for chunk in selected:
-        key = chunk_key(chunk)
-        if key in seen:
+    return _dedupe_chunks(selected)[:RETRIEVAL_RERANK_TOP_N]
+
+
+def _dedupe_chunks(chunks: list[dict]) -> list[dict]:
+    deduped: list[dict] = []
+    seen_keys = set()
+    seen_contents: dict[str, str] = {}
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
             continue
-        seen.add(key)
+        key = chunk_key(chunk)
+        if key in seen_keys:
+            continue
+        scheme = chunk_scheme(chunk)
+        content = chunk_content_key(chunk)
+        if content:
+            # 只并「两套分块方案给出同一段文本」这一种情形；同一套方案里的重复文本
+            # （页眉页脚、表格表头这类）维持原有「按 id 各算一条」的行为。
+            owner = seen_contents.get(content)
+            if owner is not None and owner != scheme:
+                continue
+            seen_contents.setdefault(content, scheme)
+        seen_keys.add(key)
         deduped.append(chunk)
-    return deduped[:RETRIEVAL_RERANK_TOP_N]
+    return deduped
+
+
+def _same_context(left: dict, right: dict) -> bool:
+    """两条候选是否是「同一段上下文」：同一条切片，或两套分块方案给出的同一段文本。
+
+    前者靠融合键判断（同一条切片被多路召回命中）；后者兜住分块方案不同、文本却完全
+    一样的情形（短文档整篇就是 offset=0 的那个窗口），那样两条候选进上下文只会重复
+    占用配额。
+    """
+    if chunk_key(left) == chunk_key(right):
+        return True
+    if chunk_scheme(left) == chunk_scheme(right):
+        return False
+    left_content = chunk_content_key(left)
+    return bool(left_content) and left_content == chunk_content_key(right)
+
+
+def chunk_scheme(chunk: dict) -> str:
+    """候选来自哪一套分块方案。
+
+    关键字窗口与入库切片各自从 0 编号，是两套方案；多路向量召回命中的都是同一条
+    入库切片，算同一套。
+    """
+    return KEYWORD_CHUNK_NAMESPACE if chunk.get("route") == "keyword" else INGEST_CHUNK_NAMESPACE
+
+
+def chunk_content_key(chunk: dict) -> str:
+    """「同一份文件里的同一段文本」这个身份；没有正文时返回空串，不参与判重。
+
+    空正文若也参与判重，同一份文件里两条没有正文的候选会被误判成同一条。
+    """
+    content = "".join(str(chunk.get("content") or "").split())
+    return f"{chunk.get('file_id', 0)}:{content}" if content else ""
 
 
 def _keyword_chunk_hits_query(chunk: dict) -> bool:
@@ -209,8 +260,26 @@ def _keyword_chunk_hits_query(chunk: dict) -> bool:
     return _to_number(chunk.get("keyword_hits")) > 0
 
 
+KEYWORD_CHUNK_NAMESPACE = "kw"
+INGEST_CHUNK_NAMESPACE = "ingest"
+
+
 def chunk_key(chunk: dict) -> str:
-    return f"{chunk.get('file_id', 0)}:{chunk.get('chunk_id') or chunk.get('id')}"
+    """候选在融合与去重时的身份键：``file_id`` + 分块方案 + 块位置。
+
+    关键字窗口（``_split_keyword_chunks``，id 是字符偏移）与入库切片（``chunk_text``，
+    id 是顺序序号）是两套互不相干的分块方案，两边的编号都从 0 开始，只看
+    ``file_id + chunk_id`` 会把 offset=0 的关键字窗口误判成「同一条入库切片」，
+    在 RRF 融合里被静默去重掉、连内容与 keyword_score 一并丢失（issue #55）。
+
+    这里区分的是**分块方案**，不是召回路由：多路向量召回（planned/simplified/
+    sub_question_*/hyde/rewrite_*）命中的是同一条入库切片，必须继续按
+    ``file_id + chunk_id`` 合并，RRF 排序才有意义，所以只有关键字窗口另起命名空间。
+    """
+    chunk_id = chunk.get("chunk_id") or chunk.get("id")
+    if chunk_scheme(chunk) == KEYWORD_CHUNK_NAMESPACE:
+        return f"{chunk.get('file_id', 0)}:{KEYWORD_CHUNK_NAMESPACE}:{chunk_id}"
+    return f"{chunk.get('file_id', 0)}:{chunk_id}"
 
 
 def trace_chunk(chunk: dict) -> dict:
