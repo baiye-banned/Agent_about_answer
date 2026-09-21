@@ -646,7 +646,8 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                         db.refresh(assistant_message)
                     except Exception as exc:
                         db.rollback()
-                        logger.warning("Assistant message save failed after stream finished: %s", exc, exc_info=True)
+                        logger.warning("Assistant message save failed after stream finished [trace_id=%s]: %s",
+                                       trace.trace_id, exc, exc_info=True)
                         _safe_trace_add(
                             trace,
                             "assistant_save_failed",
@@ -687,7 +688,8 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                                     note="RAGAS 在 assistant 保存后异步启动，不阻塞用户看到答案。",
                                 )
                             except Exception as exc:
-                                logger.warning("RAGAS schedule failed after stream finished: %s", exc, exc_info=True)
+                                logger.warning("RAGAS schedule failed after stream finished [trace_id=%s]: %s",
+                                               trace.trace_id, exc, exc_info=True)
                                 _safe_trace_add(
                                     trace,
                                     "ragas_schedule_failed",
@@ -713,7 +715,8 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                                 note="系统异步检查长期记忆是否超过上限，若超过则进行二次摘要。",
                             )
                         except Exception as exc:
-                            logger.warning("Memory summary schedule failed after stream finished: %s", exc, exc_info=True)
+                            logger.warning("Memory summary schedule failed after stream finished [trace_id=%s]: %s",
+                                           trace.trace_id, exc, exc_info=True)
                             _safe_trace_add(
                                 trace,
                                 "memory_summary_update_schedule_failed",

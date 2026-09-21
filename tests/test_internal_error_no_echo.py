@@ -238,6 +238,19 @@ def test_failure_branch_still_logs_exception_with_traceback(monkeypatch, fake_db
     assert "Assistant message save failed after stream finished" in caplog.text
 
 
+def test_sse_trace_id_is_greppable_in_server_log(monkeypatch, fake_db, real_trace, caplog):
+    """用户从帧里看到 trace_id 后，必须能在服务端日志中按它检索到这次失败。"""
+    _patch_stream_boundaries(monkeypatch, fake_db)
+    _fail_assistant_save(monkeypatch, fake_db)
+
+    with caplog.at_level(logging.WARNING):
+        _run_stream(fake_db)
+
+    trace_id = real_trace.instances[-1].trace_id
+    assert trace_id in caplog.text
+    assert f"[trace_id={trace_id}]" in caplog.text
+
+
 def test_normal_stream_still_succeeds(monkeypatch, fake_db, real_trace):
     """回归：不注入异常时，正常路径照旧产出回答，也不产生失败事件。"""
     _patch_stream_boundaries(monkeypatch, fake_db)
