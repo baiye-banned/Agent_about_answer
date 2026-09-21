@@ -74,6 +74,12 @@ class EmbeddingBackendError(RuntimeError):
     """
 
 
+# 用户可见轨迹里的向量化失败文案：`_embedding_failure` 拼出的原文含上游 embedding 服务
+# 地址与原始异常，进 `retrieval_trace` 后随消息历史响应体到达用户，因此只在写入轨迹的
+# 副本上收敛；「当前是否可用」由 `mode` 字段如实表达，排障靠服务端日志。
+EMBEDDING_UNAVAILABLE_MESSAGE = "向量化服务暂时不可用，本次未使用语义向量召回。"
+
+
 class _HashEmbeddingFunction:
     """Local development embedding used only when no embedding API is configured."""
 
@@ -271,6 +277,21 @@ def embedding_backend_status() -> dict:
         "last_error": _embedding_state["last_error"],
         "last_error_at": _embedding_state["last_error_at"],
     }
+
+
+def embedding_trace_status(status: dict) -> dict:
+    """把 `embedding_backend_status()` 的结果收敛成可进用户可见轨迹的副本。
+
+    `last_error` 是 `_embedding_failure()` 拼的原文（上游 embedding 地址 + 原始异常），
+    它会经 `retrieval_trace`（`retrieval.py` 与 `chat_service.py` 两处写入）落到 assistant
+    消息，再由 `GET /api/chat/conversations/{cid}` 原样返回给用户；`_embedding_state` 是
+    进程级状态，未命中该次失败的用户也会拿到它。这里只改副本，`embedding_backend_status()`
+    的返回值保持原文不变——那是状态接口的诊断面，且由 `tests/test_milvus_client.py` 锁定。
+    """
+    masked = dict(status)
+    if masked.get("last_error"):
+        masked["last_error"] = EMBEDDING_UNAVAILABLE_MESSAGE
+    return masked
 
 
 def _embedding_batches(texts: list[str]) -> Iterator[list[str]]:

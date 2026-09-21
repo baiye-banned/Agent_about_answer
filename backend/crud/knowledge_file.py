@@ -6,7 +6,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, load_only
 
 from model.models import KnowledgeFile
-from service.utils_service import KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE
+from service.utils_service import KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE, _internal_error_detail
+
+
+DOCX_PARSE_FAILED_MESSAGE = "DOCX 解析失败，请确认文件未损坏后重试"
+PDF_PARSE_FAILED_MESSAGE = "PDF 解析失败，请确认文件未损坏后重试"
 
 
 def serialize_knowledge_file(file_entry: KnowledgeFile) -> dict:
@@ -104,7 +108,7 @@ def extract_docx_text(content: bytes) -> str:
     try:
         document = Document(BytesIO(content))
     except Exception as exc:
-        raise HTTPException(400, f"DOCX 解析失败：{exc}")
+        raise HTTPException(400, _internal_error_detail(DOCX_PARSE_FAILED_MESSAGE, "docx_parse", exc))
     parts = [p.text.strip() for p in document.paragraphs if p.text.strip()]
 
     for table in document.tables:
@@ -131,7 +135,7 @@ def extract_pdf_text(content: bytes) -> str:
                 parts.append(f"第 {index} 页\n{page_text}")
         return "\n\n".join(parts)
     except Exception as exc:
-        raise HTTPException(400, f"PDF 解析失败：{exc}")
+        raise HTTPException(400, _internal_error_detail(PDF_PARSE_FAILED_MESSAGE, "pdf_parse", exc))
 
 
 def knowledge_file_save_error_message(exc: SQLAlchemyError) -> str:

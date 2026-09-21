@@ -6,10 +6,16 @@ import httpx
 
 from config import VISION_API_KEY, VISION_BASE_URL, VISION_MODEL
 from service.oss_service import _public_oss_url
+from service.utils_service import _internal_error_detail
 from rag.llm import openai_chat_url
 
 
 logger = logging.getLogger(__name__)
+
+# 视觉分析失败时回给用户的固定文案；异常原文（上游地址、响应体、httpx 报错）只进
+# logger，不进 SSE 帧——`_analyze_image_attachments` 的 error 字段会被 chat_service
+# 编成轨迹帧与 `{"type":"error"}` 事件，前端原样渲染。
+IMAGE_ANALYSIS_FAILED_MESSAGE = "图片内容提取失败，请检查 VISION_MODEL/VISION_API_KEY/OSS URL。"
 
 
 async def _build_effective_question(
@@ -43,7 +49,7 @@ async def _analyze_image_attachments(attachments: list[dict], question: str = ""
         return {
             "status": "failed",
             "description": "",
-            "error": "图片内容提取失败，请检查 VISION_MODEL/VISION_API_KEY/OSS URL。",
+            "error": IMAGE_ANALYSIS_FAILED_MESSAGE,
         }
 
     prompts = _image_analysis_prompts(question)
@@ -53,7 +59,8 @@ async def _analyze_image_attachments(attachments: list[dict], question: str = ""
         try:
             description = await _request_image_description(prompt, image_urls)
         except Exception as exc:
-            last_error = str(exc)
+            # 与本 PR 对 `rag/llm.py` 的判据一致：异常原文只落日志，帧里给固定文案 + 编号。
+            last_error = _internal_error_detail(IMAGE_ANALYSIS_FAILED_MESSAGE, "vision_analysis", exc)
             continue
 
         description = (description or "").strip()
@@ -140,12 +147,12 @@ async def _request_image_description(prompt: str, image_urls: list[str]) -> str:
         if response.status_code >= 400:
             detail = response.text[:300]
             logger.warning("Vision description failed: status=%s detail=%s", response.status_code, detail)
-            raise RuntimeError("图片内容提取失败，请检查 VISION_MODEL/VISION_API_KEY/OSS URL。")
+            raise RuntimeError(IMAGE_ANALYSIS_FAILED_MESSAGE)
         description = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
         return (description or "").strip()
     except httpx.HTTPError as exc:
         logger.warning("Vision description network request failed: %s", exc, exc_info=True)
-        raise RuntimeError("图片内容提取失败，请检查 VISION_MODEL/VISION_API_KEY/OSS URL。") from exc
+        raise RuntimeError(IMAGE_ANALYSIS_FAILED_MESSAGE) from exc
 
 
 def _classify_image_analysis(description: str) -> tuple[str, str]:

@@ -23,9 +23,16 @@ from database.session import SessionLocal
 from rag.learning_trace import append_trace_event, summarize_text
 from model.models import Message
 from rag.llm import normalize_deepseek_model, openai_base_url
+from service.utils_service import _internal_error_detail
 
 
 logger = logging.getLogger(__name__)
+
+# RAGAS 失败回给用户的固定文案：`_friendly_error` 的结果会经 `Message.ragas_error`
+# 渲染到前端，异常原文（驱动报错、文件路径、上游地址）只进 logger。
+RAGAS_EMBEDDING_FAILED_MESSAGE = "Embedding 调用失败，请检查 RAGAS 所用的 embedding 服务配置"
+RAGAS_LLM_FAILED_MESSAGE = "DeepSeek 调用失败，请检查 RAGAS 所用的模型服务配置"
+RAGAS_EVALUATION_FAILED_MESSAGE = "评测过程发生未预期的错误"
 
 
 async def evaluate_message_async(
@@ -116,13 +123,16 @@ async def evaluate_message_async(
             note="RAGAS 总耗时超过上限，系统将评估状态置为 failed。",
         )
     except Exception as exc:
+        # 算一次复用：`_friendly_error` 每次都生成新的错误编号，调用两次会让消息里
+        # 的编号与轨迹事件里的对不上，用户报了也没法在日志里定位。
+        friendly = _friendly_error(exc)
         logger.warning("RAGAS evaluation failed: message_id=%s error=%s", message_id, exc, exc_info=True)
-        _mark_message(message_id, "failed", {}, f"RAGAS 评测失败：{_friendly_error(exc)}")
+        _mark_message(message_id, "failed", {}, f"RAGAS 评测失败：{friendly}")
         append_trace_event(
             trace_id,
             "ragas_failed",
             "evaluate_message_async",
-            result={"error": _friendly_error(exc)},
+            result={"error": friendly},
             status="done",
             note="RAGAS 评估异常，错误信息已写回消息。",
         )
@@ -278,6 +288,12 @@ def _format_metric_errors(errors: dict) -> str:
 
 
 def _friendly_error(exc: Exception) -> str:
+    """把异常归类成用户可读的原因；异常原文只落日志，不拼进返回值。
+
+    返回值会写进 `Message.ragas_error`（`src/views/Chat.vue` 原样渲染），并进
+    `ragas_*` 轨迹事件供用户回查，所以与本 PR 对 SSE 帧 / HTTP detail 的判据一致：
+    驱动报错、文件路径、上游地址这类内部文本不外泄，改用固定文案 + 可上报的编号。
+    """
     text = str(exc) or exc.__class__.__name__
     lowered = text.lower()
     if "max_tokens" in text or "length limit" in lowered or "incomplete" in lowered:
@@ -285,10 +301,12 @@ def _friendly_error(exc: Exception) -> str:
     if "timed out" in lowered or "timeout" in lowered:
         return "RAGAS 评测超时"
     if "embedding" in lowered:
-        return f"Embedding 调用失败：{text}"
+        return _internal_error_detail(RAGAS_EMBEDDING_FAILED_MESSAGE, "ragas_embedding", exc)
     if "deepseek" in lowered or "connection" in lowered or "connect" in lowered:
-        return f"DeepSeek 调用失败：{text}"
-    return text
+        return _internal_error_detail(RAGAS_LLM_FAILED_MESSAGE, "ragas_llm", exc)
+    return _internal_error_detail(RAGAS_EVALUATION_FAILED_MESSAGE, "ragas_evaluation", exc)
+
+
 def _prepare_contexts(contexts: list[str]) -> list[str]:
     prepared = []
     for item in contexts or []:

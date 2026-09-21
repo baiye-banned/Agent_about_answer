@@ -13,7 +13,13 @@ from sqlalchemy.orm import Session
 from config import RETRIEVAL_ROUTE_TOP_K
 from model.models import KnowledgeFile
 from rag.llm import call_chat_json, call_router_json
-from rag.milvus_client import EmbeddingBackendError, embedding_backend_status, query_vectors
+from rag.milvus_client import (
+    EMBEDDING_UNAVAILABLE_MESSAGE,
+    EmbeddingBackendError,
+    embedding_backend_status,
+    embedding_trace_status,
+    query_vectors,
+)
 from rag.rerank import (
     chunk_content_key,
     chunk_key,
@@ -22,6 +28,7 @@ from rag.rerank import (
     select_final_chunks,
     trace_chunk,
 )
+from service.utils_service import _internal_error_detail
 
 
 ROUTE_CONFIDENCE_THRESHOLD = 0.55
@@ -83,7 +90,9 @@ async def decide_need_rag(
         data = await call_router_json(payload)
         return _normalize_decision(data)
     except Exception as exc:
-        return _fallback_decision(f"路由模型调用失败，保守进入 RAG：{exc}")
+        # reason 会进 SSE 轨迹帧、retrieval_trace 与消息负载，异常原文只落日志。
+        logger.warning("Route model call failed, falling back to RAG: %s", exc, exc_info=True)
+        return _fallback_decision("路由模型调用失败，保守进入 RAG。")
 
 
 async def build_query_plan(question: str) -> dict:
@@ -101,11 +110,13 @@ async def build_query_plan(question: str) -> dict:
     try:
         data = await call_chat_json(system_prompt, user_prompt)
     except Exception as exc:
+        # query_plan 会进 SSE 轨迹帧与 retrieval_trace；error 只作失败标记，不携带异常原文。
+        logger.warning("Query plan build failed: %s", exc, exc_info=True)
         return {
             "hyde_document": "",
             "rewrites": [],
             "keywords": _fallback_keywords(question),
-            "error": str(exc),
+            "error": "查询规划失败",
         }
     return {
         "hyde_document": str(data.get("hyde_document") or "").strip(),
@@ -131,7 +142,7 @@ async def retrieve_knowledge(
     )
     query_plan = _normalize_external_query_plan(query_plan, question) if query_plan else await build_query_plan(question)
     trace = {
-        "embedding": embedding_backend_status(),
+        "embedding": embedding_trace_status(embedding_backend_status()),
         "query_plan": query_plan,
         "routes": [],
         "rrf": [],
@@ -189,7 +200,12 @@ async def retrieve_knowledge(
             # 查询向量化失败时绝不退化为哈希向量（会造成跨空间检索），
             # 显式跳过该路并记录原因，后续仍可用关键词路由召回。
             logger.warning("Vector route skipped, embedding backend unavailable: route=%s error=%s", route, result)
-            trace["embedding_error"] = str(result)
+            # `embedding_error` 与 `embedding` 都会经 retrieval_trace 落到 assistant 消息，
+            # 再由消息历史接口原样返回给用户；原文（上游 embedding 地址 + 原始异常）只进
+            # 日志，用户侧给固定文案 + 可与日志对照的编号。
+            trace["embedding_error"] = _internal_error_detail(
+                EMBEDDING_UNAVAILABLE_MESSAGE, "retrieval_embedding", result
+            )
             result = []
         elif isinstance(result, BaseException):
             raise result
@@ -211,7 +227,7 @@ async def retrieve_knowledge(
         )
 
     if trace.get("embedding_error"):
-        trace["embedding"] = embedding_backend_status()
+        trace["embedding"] = embedding_trace_status(embedding_backend_status())
 
     fused = rrf_fuse(route_results)
     trace["rrf"] = [trace_chunk(item) for item in fused[:10]]
