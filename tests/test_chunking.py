@@ -1,3 +1,5 @@
+import pytest
+
 from crud.knowledge_file import (
     KNOWLEDGE_INDEX_MIN_COVERAGE_RATIO,
     _heading_level,
@@ -12,6 +14,13 @@ SENTENCES_PER_CLAUSE = 3
 CLAUSE_BODY = "本制度适用于全体员工，由人事部负责解释与修订。"
 CLAUSE_LINES = [f"第{i}条 {CLAUSE_BODY * SENTENCES_PER_CLAUSE}" for i in range(1, CLAUSE_COUNT + 1)]
 
+# issue #75 的语料：中文/括号/数字编号与正文同一行，行间不空行。
+ORDER_ROWS = 40
+ORDER_PREFIXES = ["三、", "（一）", "1、", "1. "]
+ORDER_BODY = CLAUSE_BODY
+LONG_ORDER_BODY_REPEATS = 6
+LONG_ORDER_BODY = ORDER_BODY * LONG_ORDER_BODY_REPEATS
+
 
 def _assert_clause_document_fully_indexed(source: str, chunks: list[dict]) -> None:
     """入库文本合计覆盖原文 ≥ 90%，且每条条款编号都真的进了库（无损）。"""
@@ -20,6 +29,13 @@ def _assert_clause_document_fully_indexed(source: str, chunks: list[dict]) -> No
     for index in range(1, CLAUSE_COUNT + 1):
         assert f"第{index}条" in joined
     assert joined.count(CLAUSE_BODY) >= CLAUSE_COUNT * SENTENCES_PER_CLAUSE
+
+
+def _assert_order_document_fully_indexed(source: str, chunks: list[dict], body_repeats: int = 1) -> None:
+    """入库文本合计覆盖原文 ≥ 90%，且每一行的正文都真的进了库（无损）。"""
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    assert joined.count(ORDER_BODY) >= ORDER_ROWS * body_repeats
 
 
 def test_chunk_text_tolerates_missing_text():
@@ -160,3 +176,53 @@ def test_chunk_text_keeps_clause_text_when_number_sits_on_its_own_line():
 
     _assert_clause_document_fully_indexed(source, chunks)
     assert len(chunks) >= 20
+
+
+@pytest.mark.parametrize("prefix", ORDER_PREFIXES)
+def test_chunk_text_keeps_order_text_when_marker_shares_short_line(prefix):
+    """issue #75：「三、」「（一）」「1、」「1.」与短正文同行（每行 ≤48 字）时不能整行丢弃。"""
+    source = "\n".join(f"{prefix}{ORDER_BODY}" for _ in range(ORDER_ROWS))
+
+    chunks = chunk_text(source, file_id=1)
+
+    _assert_order_document_fully_indexed(source, chunks)
+
+
+@pytest.mark.parametrize("prefix", ORDER_PREFIXES)
+def test_chunk_text_keeps_order_text_when_marker_shares_long_line(prefix):
+    """issue #75：同样排版换成超长正文（每行 >48 字），同样要无损入库。
+
+    这几种前缀原本靠 _looks_like_long_list_item 的长度阈值侥幸兜住长行，
+    覆盖率高只是巧合；统一走「标记后是否跟正文」判定后不再依赖阈值。
+    """
+    source = "\n".join(f"{prefix}{LONG_ORDER_BODY}" for _ in range(ORDER_ROWS))
+
+    chunks = chunk_text(source, file_id=1)
+
+    _assert_order_document_fully_indexed(source, chunks, body_repeats=LONG_ORDER_BODY_REPEATS)
+
+
+@pytest.mark.parametrize("prefix", ORDER_PREFIXES)
+def test_chunk_text_keeps_order_text_when_marker_sits_on_its_own_line(prefix):
+    """对照排版：编号单独占一行，四种前缀的覆盖率同样不能回退。"""
+    source = "\n".join(f"{prefix}\n{ORDER_BODY}" for _ in range(ORDER_ROWS))
+
+    chunks = chunk_text(source, file_id=1)
+
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+
+
+def test_heading_level_keeps_order_heading_without_inline_body():
+    """issue #75：标记后没有正文的行仍是标题，标题语义不被误判成正文。"""
+    assert _heading_level("三、总则") == 2
+    assert _heading_level("（一）总则") == 3
+    assert _heading_level("1、总则") == 3
+    # 「1.」前缀的层级沿用修复前的判定（2），本次只改「是否按正文处理」。
+    assert _heading_level("1. 总则") == 2
+
+
+@pytest.mark.parametrize("prefix", ORDER_PREFIXES)
+def test_heading_level_treats_order_line_with_inline_body_as_body(prefix):
+    """issue #75：标记后跟成句正文时按正文处理（短行靠句末标点，长行靠长度阈值）。"""
+    assert _heading_level(f"{prefix}{ORDER_BODY}") is None
+    assert _heading_level(f"{prefix}{LONG_ORDER_BODY}") is None

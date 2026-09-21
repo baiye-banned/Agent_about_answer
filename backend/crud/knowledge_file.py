@@ -148,11 +148,22 @@ _CHAPTER_HEADING_RE = re.compile(
 _CHINESE_ORDER_HEADING_RE = re.compile(rf"^[{_CHINESE_NUMERAL}]+、\S+")
 _PAREN_ORDER_HEADING_RE = re.compile(rf"^[（(][{_CHINESE_NUMERAL}0-9]+[）)]\S+")
 _DECIMAL_HEADING_RE = re.compile(r"^\d+(?:\.\d+)*[\.．、)]\s*\S+")
+# 只匹配编号标记本身（不含标记之后的文本），用于区分「纯标题」与「标记后跟正文」。
+_CHINESE_ORDER_MARKER_RE = re.compile(rf"^[{_CHINESE_NUMERAL}]+、")
+_PAREN_ORDER_MARKER_RE = re.compile(rf"^[（(][{_CHINESE_NUMERAL}0-9]+[）)]")
+_DECIMAL_MARKER_RE = re.compile(r"^\d+(?:\.\d+)*[\.．、)]")
+# 四类编号标记：「第N条」「三、」「（一）」「1、/1.」，标记后是否跟正文共用同一套判定。
+_ORDER_MARKER_RES = (
+    _CHAPTER_MARKER_RE,
+    _CHINESE_ORDER_MARKER_RE,
+    _PAREN_ORDER_MARKER_RE,
+    _DECIMAL_MARKER_RE,
+)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？；;])")
 _CLAUSE_SPLIT_RE = re.compile(r"(?<=[，,、：:])")
 # 标题行不会是一整句话，出现句末标点说明标记后面跟的是正文。
 _SENTENCE_END_RE = re.compile(r"[。！？；;]")
-# 超过该长度的编号行即使没有句末标点也按正文处理，与小数编号的长度保护保持一致。
+# 超过该长度的编号行即使没有句末标点也按正文处理：标题不会这么长。
 _LONG_HEADING_MAX_LEN = 48
 
 
@@ -160,24 +171,24 @@ def _normalize_line(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _looks_like_long_list_item(line: str) -> bool:
-    stripped = _normalize_line(line)
-    return len(stripped) > _LONG_HEADING_MAX_LEN and bool(_DECIMAL_HEADING_RE.match(stripped))
+def _order_heading_tail(line: str) -> str:
+    """取编号标记（第N条 / 三、 / （一） / 1、）之后的剩余文本；为空说明是纯标题行。"""
+    for marker_re in _ORDER_MARKER_RES:
+        marker = marker_re.match(line)
+        if marker:
+            return line[marker.end():].strip()
+    return ""
 
 
-def _clause_heading_tail(line: str) -> str:
-    """取「第X条」这类条款标记之后的剩余文本；为空说明是纯标题行。"""
-    marker = _CHAPTER_MARKER_RE.match(line)
-    return line[marker.end():].strip() if marker else ""
+def _looks_like_order_heading_with_body(line: str) -> bool:
+    """「编号 + 正文同行」排版：标记后跟着成句正文或整行过长时，不能整行当标题丢弃。
 
-
-def _looks_like_clause_heading_with_body(line: str) -> bool:
-    """「第N条 正文同行」排版：标记后跟着成句正文或整行过长时，不能整行当标题丢弃。
-
-    制度/法规类文档常把条款编号与正文写在同一行，这类行一旦被当成标题，
+    制度/法规类文档常把编号与正文写在同一行，这类行一旦被当成标题，
     正文就永远进不了 current_body，最终整篇只剩兜底的最后一行标题。
+    issue #53 只挂进了「第N条」，这里把「三、」「（一）」「1、」「1.」四种前缀
+    并入同一套判定，避免它们各自依赖长度阈值兜底。
     """
-    tail = _clause_heading_tail(line)
+    tail = _order_heading_tail(line)
     if not tail:
         return False
     if len(line) > _LONG_HEADING_MAX_LEN:
@@ -187,7 +198,7 @@ def _looks_like_clause_heading_with_body(line: str) -> bool:
 
 def _heading_level(line: str) -> int | None:
     stripped = _normalize_line(line)
-    if not stripped or _looks_like_long_list_item(stripped):
+    if not stripped:
         return None
     if _PDF_PAGE_HEADING_RE.match(stripped):
         return 0
@@ -196,9 +207,11 @@ def _heading_level(line: str) -> int | None:
     if markdown_match:
         return min(len(markdown_match.group(1)), 4)
 
+    # 编号标记后跟正文的行按正文处理：整行当标题会让正文整段进不了分块。
+    if _looks_like_order_heading_with_body(stripped):
+        return None
+
     if _CHAPTER_HEADING_RE.match(stripped):
-        if _looks_like_clause_heading_with_body(stripped):
-            return None
         if re.match(rf"^第[{_CHINESE_NUMERAL}0-9]+\s*(?:章|篇|部|部分|卷|编)", stripped):
             return 1
         return 2
