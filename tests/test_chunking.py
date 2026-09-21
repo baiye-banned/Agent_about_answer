@@ -3,6 +3,7 @@ import pytest
 from crud.knowledge_file import (
     KNOWLEDGE_INDEX_MIN_COVERAGE_RATIO,
     _LONG_HEADING_MAX_LEN,
+    _ORDER_HEADING_TAIL_MAX_LEN,
     _heading_level,
     chunk_coverage_ratio,
     chunk_text,
@@ -21,10 +22,25 @@ ORDER_PREFIXES = ["三、", "（一）", "1、", "1. "]
 ORDER_BODY = CLAUSE_BODY
 LONG_ORDER_BODY_REPEATS = 6
 LONG_ORDER_BODY = ORDER_BODY * LONG_ORDER_BODY_REPEATS
-# 长度边界语料：45 字正文配上最长的 3 字标记「（一）」后整行恰好 48 字，
-# 卡在 _LONG_HEADING_MAX_LEN 上，四种前缀都只能靠句末标点被判定为正文。
+# 长度边界语料：44 字正文配上最长的 3 字标记「（一）」后整行恰好 48 字。
+# issue #83 之后长度信号量在「标记之后的文本」上，本语料由 44 > _ORDER_HEADING_TAIL_MAX_LEN
+# 判为正文，整行长度不再参与判定。
 BOUNDARY_SENTENCE = "本制度适用于全体员工，由人事部门解释与修订。"
 BOUNDARY_BODY = f"{BOUNDARY_SENTENCE}{ORDER_BODY}"
+
+# issue #83 第 1 项语料：编号与正文同行、正文**不带句末标点**，行间不空行。
+# 整篇都是这种行——单行判定拿它没办法（长度不够阈值、又没有句末标点），
+# 靠的是 chunk_text 的「整篇没有一行进正文」结构兜底。
+PHRASE_BODY = "员工迟到30分钟以内罚款50元，由人事部汇总"
+PHRASE_PREFIXES = ["三、", "（一）", "1、", "1. "]
+# 返工轮 major-1 的混合形状语料：编号与短语正文同行的整行。
+PHRASE_HEADLINE = f"三、{PHRASE_BODY}"
+# 兜底语料直接压到最短：标记后只有 10 字，长度阈值（48）与句末标点都够不着，
+# 单行判定必然是标题——兜底与阈值、标点都无关，这种输入也要整段入库。
+SHORT_PHRASE_BODY = "员工迟到罚款50元"
+
+# issue #83 第 2 项：八种前缀（标记长度 2~4 字）的「标题 ↔ 正文」边界必须落在同一处。
+TAIL_BOUNDARY_PREFIXES = ["三、", "十、", "1、", "（一）", "(一)", "十一、", "1. ", "第三条 "]
 
 
 def _assert_clause_document_fully_indexed(source: str, chunks: list[dict]) -> None:
@@ -211,15 +227,276 @@ def test_chunk_text_keeps_order_text_when_marker_shares_long_line(prefix):
 
 @pytest.mark.parametrize("prefix", ORDER_PREFIXES)
 def test_chunk_text_keeps_order_text_at_heading_length_boundary(prefix):
-    """issue #75 边界：整行最多 48 字，长度阈值救不了场，四种前缀都要靠句末标点判定为正文。"""
+    """issue #75 边界语料：整行不超过 48 字，四种前缀同样要无损入库。
+
+    issue #83 第 2 项之后长度信号量在「标记之后的文本」上，44 字的正文够不着 48，
+    本语料靠句末标点（正文里有「。」）判为正文。整行长度不再参与判定，
+    所以这里不再断言整行恰好 48 字——那是旧口径下的边界。
+    """
     line = f"{prefix}{BOUNDARY_BODY}"
-    assert len(f"（一）{BOUNDARY_BODY}") == _LONG_HEADING_MAX_LEN
     assert len(line) <= _LONG_HEADING_MAX_LEN
+    assert len(BOUNDARY_BODY) <= _LONG_HEADING_MAX_LEN
+    assert "。" in BOUNDARY_BODY
     source = "\n".join(line for _ in range(ORDER_ROWS))
 
     chunks = chunk_text(source, file_id=1)
 
     _assert_order_document_fully_indexed(source, chunks, BOUNDARY_SENTENCE, ORDER_ROWS)
+
+
+@pytest.mark.parametrize("prefix", PHRASE_PREFIXES)
+def test_chunk_text_keeps_order_text_when_inline_body_has_no_sentence_punctuation(prefix):
+    """issue #83 第 1 项：标记后跟不带句末标点的短语正文时，整行不能被当标题丢掉。
+
+    先证红：修复前这 40 行全部命中标题分支，chunk_text 只剩兜底的最后一行，
+    覆盖率 2.4%（1 个 chunk / 24 字 / 原文 999 字）；补一个句末标点就回到 100%。
+    修复后必须 ≥ 90%，且每一行的正文都要真的进库（覆盖率高不能靠重复行凑）。
+    """
+    line = f"{prefix}{PHRASE_BODY}"
+    source = "\n".join(line for _ in range(ORDER_ROWS))
+
+    chunks = chunk_text(source, file_id=1)
+
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    assert joined.count(PHRASE_BODY) >= ORDER_ROWS
+
+
+@pytest.mark.parametrize("prefix", PHRASE_PREFIXES)
+def test_chunk_text_keeps_every_distinct_phrase_row(prefix):
+    """同上语料但逐行互不相同：每一行的正文都要单独进库，不能靠重复行拉高覆盖率。"""
+    rows = [f"{prefix}员工迟到{index}分钟以内罚款50元，由人事部汇总" for index in range(1, ORDER_ROWS + 1)]
+    source = "\n".join(rows)
+
+    chunks = chunk_text(source, file_id=1)
+
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    for index in range(1, ORDER_ROWS + 1):
+        assert f"员工迟到{index}分钟以内罚款50元" in joined
+
+
+@pytest.mark.parametrize("prefix", TAIL_BOUNDARY_PREFIXES)
+def test_heading_level_uses_one_tail_boundary_for_every_prefix(prefix):
+    """issue #83 第 2 项：八种前缀的有效截断点统一在「标记之后的文本」长度上。
+
+    修复前阈值量在整行上，标记本身的 2~4 字被一起计入，边界随前缀漂移
+    （正文 46 字时「三、」已判正文而「（一）」仍被丢弃）；现在标记长度不再影响判定，
+    同一段正文换任何前缀都在同一个字符数上翻转。
+    """
+    heading_tail = "甲" * _ORDER_HEADING_TAIL_MAX_LEN
+    body_tail = "甲" * (_ORDER_HEADING_TAIL_MAX_LEN + 1)
+
+    assert _heading_level(f"{prefix}{heading_tail}") is not None
+    assert _heading_level(f"{prefix}{body_tail}") is None
+
+
+# 统一边界只在标记不超过 _MAX_ORDER_MARKER_LEN 时成立；超出这个长度的编号
+# （中文序数写满、深层小数号）必须回落到旧口径，绝不能比它更严。
+LONG_MARKER_PREFIXES = TAIL_BOUNDARY_PREFIXES + [
+    "第一百二十三条 ",
+    "第一百二十三条",
+    "一二三四五六七八九十、",
+    "第1234567条 ",
+    "（1234567）",
+    "1.2.3.4. ",
+    "1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17.18.19.20. ",
+]
+
+
+@pytest.mark.parametrize("prefix", LONG_MARKER_PREFIXES)
+def test_unified_tail_bound_is_never_stricter_than_the_old_line_rule(prefix):
+    """统一边界不得比旧口径（量整行、阈值 48）更严——包括标记很长的编号。
+
+    量到「标记之后」总会把边界提前，提前量取决于标记长度，而标记长度没有上界。
+    只要统一边界单独生效，长标记的行就会比旧口径更严：旧口径判正文的行被重新判回
+    标题、正文丢掉（对抗评审实测「第一百二十三条 + 41 字」一例；更长的标记还要更多）。
+    所以这里逐长度核对每个前缀：旧口径判正文的行，新口径必须也是正文。
+    """
+    for tail_len in range(1, 80):
+        line = f"{prefix}{'甲' * tail_len}"
+        if len(line) > _LONG_HEADING_MAX_LEN:
+            assert _heading_level(line) is None, f"{line!r} 旧口径是正文，新口径又判成了标题"
+
+
+def test_heading_level_keeps_short_inline_tail_as_heading():
+    """边界另一侧：标记后的短文本（≤ 阈值且无句末标点）仍是标题，层级语义不被破坏。"""
+    assert _heading_level("三、考勤管理") == 2
+    assert _heading_level("（一）适用范围") == 3
+    assert _heading_level("第三条 罚款标准") == 2
+
+
+def test_heading_level_keeps_long_numbered_heading_that_fits_the_tail_bound():
+    """量到标记之后之后，长标题不再被标记本身的字数挤过阈值。
+
+    「（一）中华人民共和国境内依法设立的法人或者其他组织」标记后 21 字，
+    旧口径下「整行 24 字」还够不着 48；这条用例钉的是它现在仍被判为标题，
+    不会因为换前缀（标记字多）就掉进正文分支。
+    """
+    line = "（一）中华人民共和国境内依法设立的法人或者其他组织"
+    assert _heading_level(line) == 3
+    assert _heading_level(f"第三条 {line[3:]}") == 2
+
+
+@pytest.mark.parametrize("prefix", PHRASE_PREFIXES)
+def test_chunk_text_falls_back_to_body_when_every_line_looks_like_a_heading(prefix):
+    """issue #83 第 1 项的结构兜底：短到阈值与句末标点都够不着的编号行，整篇都是时也要入库。
+
+    先证红：修复前 40 行这类语料全部命中标题分支，chunk_text 只剩兜底的最后一行，
+    覆盖率 2.3%（1 个 chunk / 11 字 / 原文 479 字）。兜底与阈值、标点都无关，
+    单行判定在这里仍然是标题（下一行断言钉住），救回正文靠的是「整篇没有一行进正文」
+    这个结构信号。
+    """
+    line = f"{prefix}{SHORT_PHRASE_BODY}"
+    assert _heading_level(line) is not None
+    source = "\n".join(line for _ in range(ORDER_ROWS))
+
+    chunks = chunk_text(source, file_id=1)
+
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    assert joined.count(SHORT_PHRASE_BODY) >= ORDER_ROWS
+
+
+def test_chunk_text_fallback_keeps_every_distinct_short_row():
+    """兜底语料逐行互不相同：每一行都要单独进库，不能靠重复行凑覆盖率。"""
+    rows = [f"三、员工迟到{index}分钟罚款50元" for index in range(1, ORDER_ROWS + 1)]
+    source = "\n".join(rows)
+
+    chunks = chunk_text(source, file_id=1)
+
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    for index in range(1, ORDER_ROWS + 1):
+        assert f"员工迟到{index}分钟罚款50元" in joined
+
+
+@pytest.mark.parametrize(
+    "sentence_position",
+    ["trailing", "leading", "none"],
+)
+def test_chunk_text_recovers_mixed_documents_with_short_numbered_rows(sentence_position):
+    """混合文档同样要救回来：编号行夹一两句正文，正是真实制度文档的形状。
+
+    先证红：兜底最初只在「一行正文都没有」时才触发，这种文档里确实有正文，
+    于是 40 行短编号行照旧被整段丢掉——实测覆盖率 4.9%/2.4%，与修复前持平。
+    触发条件改用已有的异常覆盖率口径后，整篇按正文重排。
+    """
+    rows = ["三、员工迟到罚款50元"] * 20 + ["四、由人事部负责解释"] * 20
+    sentence = "本制度自发布之日起施行。"
+    if sentence_position == "trailing":
+        source = "\n".join([*rows, sentence])
+    elif sentence_position == "leading":
+        source = "\n".join([sentence, *rows])
+    else:
+        source = "\n".join(rows)
+
+    chunks = chunk_text(source, file_id=1)
+
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    assert joined.count("员工迟到罚款50元") >= 20
+    assert joined.count("由人事部负责解释") >= 20
+    if sentence_position != "none":
+        # 正文句同样要留住：整篇按正文重排时不能把它挤掉。
+        assert sentence in joined
+
+
+def test_chunk_text_keeps_short_headings_as_headings_when_every_section_has_body():
+    """每一节都有正文的常规排版不受影响：短标题仍是标题，不进正文。
+
+    名称与 docstring 原先写成「兜底只在整篇没有一行进正文时生效」，与实现及同文件
+    另两条用例冲突（兜底早就改判覆盖率口径了）——返工轮 minor-5 改成与断言一致的说法：
+    断言真正钉的是「标题层级照旧进入 heading_path，正文并入所属小节」，对照 issue #75 的语料。
+    """
+    source = "\n".join(["三、考勤管理", "员工迟到30分钟以内罚款50元。"] * 5)
+
+    chunks = chunk_text(source, file_id=1)
+
+    assert chunks
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    # 标题作为标题进入 heading_path，跟着正文一起出现在切片里（而不是被兜底当正文）。
+    assert joined.count("三、考勤管理") >= 1
+    assert "员工迟到30分钟以内罚款50元。" in joined
+
+
+def _missing_line_occurrences(source: str, chunks: list[dict]) -> int:
+    """原文里有、入库文本里少掉的行**出现次数**。
+
+    按出现次数而不是「这一行在不在库里」计：制度文档大量重复同一句话，
+    只要有一行进过库，按存在性判会显示「没丢」，掩盖掉其余几十行。
+
+    比较前先去掉所有空白：_semantic_units 会把相邻的正文行用空格并成一个单元
+    （`" ".join(body_buffer)`），行是被重新折行、不是被丢；按原样逐行比会把
+    「折过行」误判成「丢了行」。去空白后这层差异消失，而一整行正文的去空白文本
+    足够长且互不相同，不会退化成随便就能命中的子串。
+    """
+    def squeeze(value: str) -> str:
+        return "".join(value.split())
+
+    emitted = squeeze("\n".join(chunk["text"] for chunk in chunks))
+    lines = [line for line in source.split("\n") if line.strip()]
+    return sum(max(0, lines.count(line) - emitted.count(squeeze(line))) for line in set(lines))
+
+
+# 返工轮 major-1 的四种混合形状。编号短语正文行都只占少数（丢字不到一半），
+# 整篇覆盖率因此够不到 0.5 的兜底线——兜底与告警双双哑火，行整行消失。
+MIXED_MINORITY_SHAPES = {
+    "正文夹在编号行之间": "\n".join(
+        [
+            PHRASE_HEADLINE,
+            PHRASE_HEADLINE,
+            f"第1段 {CLAUSE_BODY * 3}",
+            f"第2段 {CLAUSE_BODY * 3}",
+            *[PHRASE_HEADLINE] * 8,
+            f"第3段 {CLAUSE_BODY * 3}",
+            f"第4段 {CLAUSE_BODY * 3}",
+        ]
+    ),
+    "正文在前、编号行收尾": "\n".join([CLAUSE_BODY * 20, *[PHRASE_HEADLINE] * 10]),
+    "编号行在前、正文在后": "\n".join([*[PHRASE_HEADLINE] * 5, CLAUSE_BODY * 4]),
+    "第N条与编号行混排": "\n".join(
+        item
+        for index in range(1, 11)
+        for item in (f"第{index}条 {CLAUSE_BODY}", PHRASE_HEADLINE)
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", list(MIXED_MINORITY_SHAPES))
+def test_chunk_text_keeps_numbered_rows_that_are_the_minority_of_a_mixed_document(shape):
+    """返工轮 major-1：编号短语正文行只占少数时也一行都不能丢。
+
+    先证红（对抗评审实测 53.9%~80.9%、本仓复算同值）：这些行仍被判成标题，
+    连续同层标题在 heading_path 里互相覆盖，只有紧跟正文的那一行能作为前缀进切片，
+    其余整行消失；而兜底（chunk_text 结构兜底）与告警（_warn_on_low_chunk_coverage）
+    共用 0.5 这条线，丢字不到一半就都不触发。
+
+    修在局部而不是调低全局阈值：阈值调低会让正常文档整篇当正文重排、标题层级全丢。
+    判据改成「从没进过任何切片、又马上被同层标题覆盖」的标题行收回正文。
+    """
+    source = MIXED_MINORITY_SHAPES[shape]
+
+    chunks = chunk_text(source, file_id=1)
+
+    assert _missing_line_occurrences(source, chunks) == 0
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+
+
+def test_chunk_text_keeps_every_repeated_row_when_they_are_the_minority():
+    """同一行重复出现时逐次计数：回收判据不能按标题**文本**去重。
+
+    先证红（本仓实现过程中实测）：按文本记「这一行进过库」时，40 行同文语料里
+    第一行进库就把后 39 行判成「已进过库」，只剩一份——正是本文件反复强调的
+    「重复出现时去重等于静默丢正文」。判据按标题**层位**记，与文本是否重复无关。
+    """
+    source = "\n".join([PHRASE_HEADLINE] * ORDER_ROWS)
+
+    chunks = chunk_text(source, file_id=1)
+
+    joined = "\n".join(chunk["text"] for chunk in chunks)
+    assert joined.count(PHRASE_BODY) >= ORDER_ROWS
+    assert _missing_line_occurrences(source, chunks) == 0
 
 
 @pytest.mark.parametrize("prefix", ORDER_PREFIXES)

@@ -56,6 +56,30 @@ export function hasDeletedAnyFile(result) {
   return (Number(result?.succeeded) || 0) > 0
 }
 
+// 删除成功后的刷新有三条入口（删知识库、删单个文件、批量删），刷新都在成功分支里。
+// runConfirmedDelete 只覆盖到「确认 → 执行」，刷新这一段当时不在它的范围内，
+// 三处都是裸 await：刷新一失败就产生未捕获的 Promise 拒绝，用户还什么都看不到
+// （issue #83 第 7 项）。这里把刷新也收进同一个出口，并复用删除入口的 notifyError。
+export const DELETE_REFRESH_FAILED_HINT = '请手动刷新页面'
+
+// 文案要说清「删除已经成功」：刷新失败不等于删除失败，不能让用户以为没删掉、
+// 又去点一次删除，那第二次会以 404 收场。
+export function describeDeleteRefreshFailure(error) {
+  return `删除成功，但列表刷新失败：${getApiErrorMessage(error, DELETE_REFRESH_FAILED_HINT)}`
+}
+
+// 返回刷新是否成功，调用方一般不关心——存在的意义是保证「不抛出」：
+// 参数里传进来的是模板事件处理器，返回被拒 Promise 就是一条 unhandledrejection。
+export async function refreshAfterDelete({ refresh, notifyError }) {
+  try {
+    await refresh()
+    return true
+  } catch (error) {
+    notifyError?.(describeDeleteRefreshFailure(error))
+    return false
+  }
+}
+
 // 上传白名单：必须与 backend/service/utils_service.py 的 KNOWLEDGE_UPLOAD_TYPES 完全一致
 // （后端那份的注释写明扩展名还要与 crud.knowledge_file.extract_file_text 的抽取链一致）。
 // 顺序沿用后端，便于与后端的「仅支持 … 格式的文件」文案逐字对照。

@@ -8,12 +8,15 @@ import assert from 'node:assert/strict'
 import {
   DELETE_CANCELLED,
   DELETE_FAILED,
+  DELETE_REFRESH_FAILED_HINT,
   DELETE_SUCCEEDED,
   computeUploadPercent,
   describeBatchDeleteResult,
+  describeDeleteRefreshFailure,
   describeUploadSuccess,
   hasDeletedAnyFile,
   isConfirmCancellation,
+  refreshAfterDelete,
   runConfirmedDelete,
   uploadFilesInOrder,
 } from '../src/utils/knowledgeFeedback.js'
@@ -288,4 +291,63 @@ test('hasDeletedAnyFile keeps the selection when the batch deleted nothing', () 
   assert.equal(hasDeletedAnyFile({ total: 2, succeeded: 2, failed: 0 }), true)
   // 部分成功仍然清空选中并刷新（失败明细不在此函数语义内）。
   assert.equal(hasDeletedAnyFile({ total: 3, succeeded: 1, failed: 2 }), true)
+})
+
+// issue #83 第 7 项：删除成功之后的刷新调用不能没有错误分支。
+// 三个删除入口（deleteKnowledgeBase / confirmDelete / confirmBatchDelete）的刷新
+// 都改走 refreshAfterDelete，刷新失败时被捕获并复用 notifyDeleteError 出口。
+test('refreshAfterDelete returns true and stays silent when the refresh succeeds', async () => {
+  const notifications = []
+  let refreshed = 0
+
+  const result = await refreshAfterDelete({
+    refresh: async () => {
+      refreshed += 1
+    },
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(result, true)
+  assert.equal(refreshed, 1)
+  assert.deepEqual(notifications, [])
+})
+
+test('refreshAfterDelete captures a failed refresh instead of returning a rejected promise', async () => {
+  // 先证红：修复前三个入口是裸 await，刷新一失败事件处理器就返回被拒 Promise，
+  // 浏览器记一条 unhandledrejection，用户什么都看不到。
+  const notifications = []
+  const error = new Error('Request failed with status code 500')
+  error.response = { status: 500, data: { detail: '服务暂时不可用' } }
+
+  const result = await refreshAfterDelete({
+    refresh: () => Promise.reject(error),
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(result, false)
+  assert.deepEqual(notifications, ['删除成功，但列表刷新失败：服务暂时不可用'])
+})
+
+test('refreshAfterDelete also captures synchronous throws from the refresh closure', async () => {
+  const notifications = []
+
+  const result = await refreshAfterDelete({
+    refresh: () => {
+      throw new Error('同步炸了')
+    },
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(result, false)
+  assert.equal(notifications.length, 1)
+})
+
+test('describeDeleteRefreshFailure says the delete succeeded and falls back to the shared hint', () => {
+  // 刷新失败不等于删除失败：说成失败会让用户再点一次删除，第二次以 404 收场。
+  assert.match(describeDeleteRefreshFailure(new Error('boom')), /^删除成功，但列表刷新失败：/)
+  assert.ok(describeDeleteRefreshFailure({}).endsWith(DELETE_REFRESH_FAILED_HINT))
+  assert.equal(
+    describeDeleteRefreshFailure({}),
+    `删除成功，但列表刷新失败：${DELETE_REFRESH_FAILED_HINT}`
+  )
 })

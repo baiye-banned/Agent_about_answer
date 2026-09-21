@@ -83,7 +83,9 @@ class KnowledgeFile(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     # 归属用户；历史数据为 NULL（不可见），由 scripts/backfill_knowledge_owner.py 回填。
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
-    knowledge_base_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=True)
+    # 列表与删除链路都按该列过滤，计数聚合（count_knowledge_files_by_base）也按它
+    # GROUP BY：没有索引时这些查询对整个 knowledge_files 表扫一遍（issue #83 第 5 项）。
+    knowledge_base_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=True, index=True)
     name = Column(String(255), nullable=False)
     size = Column(Integer, nullable=False)
     content = Column(LONGTEXT, default="")

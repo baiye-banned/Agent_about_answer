@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,7 +16,7 @@ from router.chat import router as chat_router
 from router.checkpointer import router as checkpointer_router
 from router.knowledge import router as knowledge_router
 from router.user import router as user_router
-from service.knowledge_service import rebuild_existing_knowledge_index
+from service.knowledge_service import rebuild_existing_knowledge_index, run_ingest_step
 from service.user_service import seed_default_users
 
 
@@ -32,9 +31,11 @@ async def lifespan(_app: FastAPI):
     init_db()
     seed_default_users()
     if REBUILD_KNOWLEDGE_INDEX_ON_STARTUP:
-        # 重建对每个历史文件同步向量化并写库，跑在线程池上；启动顺序不变（重建完成才接流量），
-        # 但重建期间事件循环仍可调度其它协程。
-        await asyncio.to_thread(rebuild_existing_knowledge_index)
+        # 重建对每个历史文件同步向量化并写库，跑在**入库专用**线程池上；启动顺序不变
+        # （重建完成才接流量），但重建期间事件循环仍可调度其它协程。不设总时限：
+        # 重建按文件数逐个跑，没有「一份文档」的预算语义，逐文件的失败隔离已由
+        # rebuild_existing_knowledge_index 自己保证。
+        await run_ingest_step(rebuild_existing_knowledge_index)
     yield
 
 

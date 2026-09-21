@@ -218,7 +218,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   CopyDocument,
   Delete,
@@ -242,6 +242,7 @@ import {
   createDetailPreview,
   createDetailPreviewState,
 } from '@/utils/detailPreview'
+import { createFileListRequest } from '@/utils/fileListRequest'
 import { getApiErrorMessage } from '@/utils/httpError'
 import {
   DELETE_SUCCEEDED,
@@ -253,6 +254,7 @@ import {
   describeUploadSuccess,
   hasDeletedAnyFile,
   partitionUploadFiles,
+  refreshAfterDelete,
   runConfirmedDelete,
   uploadFilesInOrder,
 } from '@/utils/knowledgeFeedback'
@@ -285,7 +287,9 @@ const knowledgeBaseForm = reactive({
 const detail = reactive(createDetailPreviewState())
 const { open: showDetail, close: closeDetail } = createDetailPreview({
   state: detail,
-  fetchContent: (id) => knowledgeAPI.getContent(id),
+  // silent：详情读取失败只在预览区给出红字（模板里的 detail.error），
+  // 不再叠加 request.js 拦截器的顶部 toast。错误只提示一次（issue #83 第 9 项）。
+  fetchContent: (id) => knowledgeAPI.getContent(id, { silent: true }),
 })
 
 // 关闭弹窗（点 X / 按 ESC / 点遮罩，或任何把 visible 置回 false 的路径）都要作废在飞请求：
@@ -296,6 +300,9 @@ watch(
     if (!visible) closeDetail()
   }
 )
+
+// 卸载时同样要作废：离开页面后在飞的响应不得再写进已经卸载组件的状态对象（issue #83 第 9 项）。
+onBeforeUnmount(() => closeDetail())
 
 const knowledgeStore = useKnowledgeStore()
 const knowledgeBases = computed(() => knowledgeStore.knowledgeBases)
@@ -366,18 +373,24 @@ watch([filteredFiles, pageSize], () => {
   }
 })
 
+// 列表取数带请求时序守卫：切库时先发出、后返回的旧库响应不得覆盖当前库的列表
+// （issue #83 第 8 项）。守卫本体在 utils/fileListRequest.js，这里只负责接线。
+const fileList = createFileListRequest({
+  getKnowledgeBaseId: () => currentKnowledgeBaseId.value,
+  fetchList: (params) => knowledgeAPI.getList(params),
+  applyFiles: (files) => {
+    allFiles.value = files
+  },
+  applyLoading: (value) => {
+    loading.value = value
+  },
+})
+
+// 卸载时作废在飞的列表请求：响应不得再写进已卸载组件的状态对象（issue #83 第 9 项同款口径）。
+onBeforeUnmount(() => fileList.invalidate())
+
 async function fetchFiles() {
-  if (!currentKnowledgeBaseId.value) {
-    allFiles.value = []
-    return
-  }
-  loading.value = true
-  try {
-    const response = await knowledgeAPI.getList({ knowledge_base_id: currentKnowledgeBaseId.value })
-    allFiles.value = Array.isArray(response) ? response : []
-  } finally {
-    loading.value = false
-  }
+  return fileList.load()
 }
 
 async function initializeKnowledgeBases() {
@@ -529,9 +542,23 @@ async function deleteKnowledgeBase() {
   if (status !== DELETE_SUCCEEDED) return
 
   ElMessage.success('知识库已删除')
-  await fetchKnowledgeBases()
-  currentKnowledgeBaseId.value = result.fallback_knowledge_base_id || knowledgeBases.value[0]?.id || null
-  await fetchFiles()
+  // 刷新失败不能逃逸成未捕获拒绝，也不能让用户以为删除没成功。
+  await refreshAfterDelete({
+    refresh: async () => {
+      // 选中先落到删除响应给的 fallback 知识库，再刷侧栏列表（返工轮 minor-2）。
+      // 这个 id 来自**已成功的删除响应**（后端 delete_knowledge_base 必带 target.id），
+      // 不依赖这次刷新；放在 fetchKnowledgeBases() 之后就是整段等它——侧栏一失败，
+      // 选中仍停在刚被删掉的知识库上，后续上传/删除都会 404，提示却只说「请手动刷新页面」。
+      // 候选列表先剔掉刚删的那个：刷新没成功时手里的还是旧列表，不去掉就可能又选回它。
+      currentKnowledgeBaseId.value = resolveKnowledgeBaseId(
+        result.fallback_knowledge_base_id,
+        knowledgeBases.value.filter((item) => item.id !== current.id)
+      )
+      await fetchKnowledgeBases()
+      await fetchFiles()
+    },
+    notifyError: notifyDeleteError,
+  })
 }
 
 function handleSearch() {
@@ -635,7 +662,10 @@ async function confirmDelete(file) {
   if (status !== DELETE_SUCCEEDED) return
 
   ElMessage.success('删除成功')
-  await refreshKnowledgeBaseAndFiles()
+  await refreshAfterDelete({
+    refresh: refreshKnowledgeBaseAndFiles,
+    notifyError: notifyDeleteError,
+  })
 }
 
 async function confirmBatchDelete() {
@@ -659,7 +689,10 @@ async function confirmBatchDelete() {
   if (!hasDeletedAnyFile(result)) return
 
   selectedFiles.value = []
-  await refreshKnowledgeBaseAndFiles()
+  await refreshAfterDelete({
+    refresh: refreshKnowledgeBaseAndFiles,
+    notifyError: notifyDeleteError,
+  })
 }
 
 async function refreshKnowledgeBaseAndFiles() {
