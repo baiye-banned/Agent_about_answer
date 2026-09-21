@@ -850,19 +850,6 @@ def _score_from_hits(hits: list[tuple[str, str, float, int, int]]) -> tuple[floa
     return score, matched
 
 
-def _has_close_matches(content: str, keywords: list[str], window: int = KEYWORD_CLOSE_WINDOW) -> bool:
-    """一段（已归一化的）文本里，不同关键词的首次出现位置是否有 3 个落在同一窗口内。"""
-    positions = []
-    for keyword in keywords:
-        normalized_keyword = _normalize_for_match(keyword)
-        if len(normalized_keyword) < 2:
-            continue
-        pos = content.find(normalized_keyword)
-        if pos >= 0:
-            positions.append(pos)
-    return _has_close_positions(positions, window)
-
-
 def _has_close_positions(positions: list[int], window: int = KEYWORD_CLOSE_WINDOW) -> bool:
     if len(positions) < 3:
         return False
@@ -923,18 +910,6 @@ def _keyword_chunk_starts(
 ) -> range:
     """窗口起点（原始偏移），步长与旧的切块实现一致。"""
     return range(0, content_length, max(chunk_size - chunk_overlap, 1))
-
-
-def _split_keyword_chunks(
-    content: str, chunk_size: int = KEYWORD_CHUNK_SIZE, chunk_overlap: int = KEYWORD_CHUNK_OVERLAP
-) -> list[dict]:
-    """旧实现的窗口切分：保留给等价性基线与人工排查，召回路径不再整篇物化窗口。"""
-    chunks = []
-    for start in _keyword_chunk_starts(len(content), chunk_size, chunk_overlap):
-        text = content[start : start + chunk_size].strip()
-        if text:
-            chunks.append({"chunk_id": str(start), "content": text})
-    return chunks
 
 
 def _trace_add(trace_recorder: Any, *args, **kwargs) -> None:
