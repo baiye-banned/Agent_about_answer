@@ -463,6 +463,36 @@ def test_image_analysis_failure_keeps_user_facing_message_and_status(monkeypatch
     assert result["error"] == image_event["analysis"]["error"]
 
 
+def test_image_analysis_exception_hides_internal_error(monkeypatch, fake_db, real_trace, caplog):
+    """与 `test_llm_text_fallback_failure_hides_internal_error` 同形：在边界上注入任意内部异常，
+    用户侧负载只剩固定文案 + 可上报编号，原文仍进日志。
+
+    上面两条走的是真实 httpx 的两类具体报错（地址非法 / 响应非 JSON），本条的用意不同：
+    它锁定的是「外层 `except Exception` 这条兜底通路本身」，与异常类无关——将来任何新异常
+    类型从 `_request_image_description` 逃出来，都不该把原文带进帧里。
+    """
+    _patch_stream_boundaries(monkeypatch, fake_db)
+    _patch_real_vision(monkeypatch)
+    monkeypatch.setattr(vision_service, "_request_image_description", _async_boom)
+
+    with caplog.at_level(logging.WARNING):
+        body = _run_attachment_stream(fake_db)
+
+    _assert_sse_frames_clean(body, "图片分析失败 SSE 帧")
+    analysis = [
+        json.loads(frame[len("data: "):])
+        for frame in body.split("\n\n")
+        if frame.strip().startswith("data: {")
+    ]
+    events = [event for event in analysis if event.get("type") != "trace"]
+    error_event = next(event for event in events if event.get("type") == "error")
+    assert error_event["message"].startswith(vision_service.IMAGE_ANALYSIS_FAILED_MESSAGE)
+    # 原文仍可诊断：落日志，且与用户看到的编号对得上。
+    error_id = _error_id_in(body)
+    assert INTERNAL_ERROR_TEXT in caplog.text
+    assert f"error_id={error_id}" in caplog.text
+
+
 # --- 同一通路（LLM / 检索）里其余的 str(exc) 出口 ---------------------------
 #
 # 这几处不在 issue 点名的 6 处坐标内，但写的是同一条学习轨迹 / 同一个 SSE 流：
