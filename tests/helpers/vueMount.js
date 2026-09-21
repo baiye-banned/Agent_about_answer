@@ -37,16 +37,19 @@ const dom = new JSDOM('<!doctype html><html><body></body></html>', {
   pretendToBeVisual: true,
 })
 
-// 列表按需增长，**只补真的缺过的**：Element Plus 在 Node 下拿不到的元素类与事件构造器
-// 会以两种方式炸开——`instanceof HTMLInputElement` 抛 ReferenceError（focus-trap 的
-// isSelectable），`new FocusEvent(...)` 同样（el-input 的 blur 分支）。它们都挂在 jsdom 的
-// window 上，只有逐个搬过来才在 Node 全局里可见。凡是 jsdom 没有的名字这里的 `continue`
-// 会直接跳过，所以多写几个名字不会让别的用例变红。
+// 列表按需增长，**只补真的缺过的**：Element Plus 在事件回调里直接 new 的构造器、以及它做
+// 可聚焦性判断时直接 instanceof 的元素类，jsdom 的 window 上有、Node 全局没有，必须逐个
+// 搬过来才在 Node 全局里可见。打开 el-dialog 这条路径就会踩到 —— 输入框的 focus/blur
+// 处理器 new FocusEvent(...)，focus-trap 的 isSelectable 又 instanceof HTMLInputElement，
+// 缺哪个都会在回调里抛 ReferenceError（既有的挂载用例都不开对话框，所以这个缺口此前没被
+// 踩到），表现为「instanceof 抛 ReferenceError」与「new 构造器抛 ReferenceError」两种形态。
+// 凡是 jsdom 没有的名字这里的 `continue` 会直接跳过，所以多写几个名字不会让别的用例变红。
 for (const key of [
   'window',
   'document',
   'navigator',
   'HTMLElement',
+  'HTMLInputElement',
   'SVGElement',
   'Element',
   'Node',

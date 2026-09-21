@@ -284,6 +284,13 @@ const knowledgeBaseForm = reactive({
   name: '',
 })
 
+// 提交代次：对话框每打开一次、每关闭一次（取消 / ESC / 点遮罩 / 提交成功后的自动关闭）都自增。
+// 在飞的提交只有代次仍然匹配时才允许回写对话框状态，否则「取消后重新打开」时，
+// 上一笔提交的迟到响应会把用户刚打开的对话框关掉，并丢掉他已经输入的名称（#156）。
+// 与 utils/detailPreview.js 的 latestToken、utils/fileListRequest.js 的 invalidate 同款：
+// 响应回来时序号已过期就整条丢弃，一个字都不写。
+let knowledgeBaseSubmitToken = 0
+
 // 详情预览的状态放响应式容器，请求时序保护在 createDetailPreview 里：
 // 标题是同步切换的、正文来自异步响应，迟到的旧响应必须被丢弃（#63）。
 const detail = reactive(createDetailPreviewState())
@@ -415,6 +422,16 @@ function openKnowledgeBaseDialog(mode) {
   const current = knowledgeBases.value.find((item) => item.id === currentKnowledgeBaseId.value)
   if (mode === 'rename' && !current) return
 
+  // 新会话作废上一笔在飞提交：它的响应不得再改这个对话框的任何状态（#156）。
+  knowledgeBaseSubmitToken += 1
+  // 作废的同时必须把提交中状态一并复位：被作废那一笔的 finally 已经不再复位它
+  // （见 submitKnowledgeBaseDialog），而唯一会复位它的 resetKnowledgeBaseDialog 挂在
+  // `@closed` 上——「关闭过渡还没走完就重开」时那次关闭会被抵销、`@closed` 不触发，
+  // 于是新会话带着上一笔的 loading 开始：按钮停在 loading，提交又被上面的
+  // `knowledgeBaseSubmitting` 守卫挡住，对话框看着是开的却用不了。
+  // 新会话此刻还没有自己的在飞提交（同会话的重复提交由该守卫拦住，而对话框开着时
+  // 页面上的「新建知识库」点不到），所以这里复位不会误伤任何本会话的提交。
+  knowledgeBaseSubmitting.value = false
   knowledgeBaseDialogMode.value = mode
   knowledgeBaseForm.name = mode === 'rename' ? current.name : ''
   knowledgeBaseDialogVisible.value = true
@@ -446,9 +463,13 @@ async function submitKnowledgeBaseDialog() {
   }
 
   knowledgeBaseSubmitting.value = true
+  // 本笔提交所属的对话框会话。响应回来时用户可能已经取消并重开了对话框，
+  // 那时这一笔就不再拥有对话框，也不该再改写任何界面状态（#156）。
+  const token = knowledgeBaseSubmitToken
   try {
     if (knowledgeBaseDialogMode.value === 'create') {
       const created = await knowledgeAPI.createBase(name, { silent: true })
+      if (token !== knowledgeBaseSubmitToken) return
       knowledgeStore.upsertKnowledgeBase(created)
       currentKnowledgeBaseId.value = created.id
       selectedFiles.value = []
@@ -471,6 +492,7 @@ async function submitKnowledgeBaseDialog() {
       })
     } else if (current) {
       const renamed = await knowledgeAPI.renameBase(current.id, name, { silent: true })
+      if (token !== knowledgeBaseSubmitToken) return
       knowledgeStore.upsertKnowledgeBase(renamed)
       ElMessage.success('知识库已重命名')
       // 同样上移到刷新之前。重命名这条链的刷新只有 refreshKnowledgeBasesPreserving 一次，
@@ -480,6 +502,8 @@ async function submitKnowledgeBaseDialog() {
       await refreshKnowledgeBasesPreserving(renamed)
     }
   } catch (error) {
+    // 迟到的失败同上：它属于用户已经放弃的那次提交，不该把错误提示落到新会话上。
+    if (token !== knowledgeBaseSubmitToken) return
     const message = getApiErrorMessage(error, '操作失败，请稍后重试')
     if (isDuplicateKnowledgeBaseError(error, message)) {
       try {
@@ -497,7 +521,9 @@ async function submitKnowledgeBaseDialog() {
     }
     ElMessage.error(message)
   } finally {
-    knowledgeBaseSubmitting.value = false
+    // 代次过期时不能复位 loading：那份状态已经属于新的对话框会话，
+    // 复位会把新会话正在跑的那笔提交的 loading 一起抹掉。
+    if (token === knowledgeBaseSubmitToken) knowledgeBaseSubmitting.value = false
   }
 }
 
@@ -529,6 +555,8 @@ async function refreshKnowledgeBasesPreserving(preferredBase) {
 }
 
 function resetKnowledgeBaseDialog() {
+  // 关闭同样作废在飞提交（取消 / ESC / 点遮罩走的都是这条路，#156）。
+  knowledgeBaseSubmitToken += 1
   knowledgeBaseSubmitting.value = false
   knowledgeBaseForm.name = ''
   knowledgeBaseFormRef.value?.resetFields?.()

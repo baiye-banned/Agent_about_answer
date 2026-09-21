@@ -597,12 +597,12 @@ npm run build
 | `.github/workflows/python-tests.yml` | 后端测试 pytest (Python 3.10) | 版本对齐 `runtime.txt`（`python-3.10.11`），`pip install -r backend/requirements.txt` + `pytest`，跑 `python -m pytest -q tests` |
 | `.github/workflows/frontend-tests.yml` | 前端测试 node --test (Node 22) | `npm ci` 后跑 `npm test` |
 | `.github/workflows/build.yml` | 前端构建 vite build (Node 22) | `npm run build`，产物 `dist/` 上传为 artifact |
-| `.github/workflows/static-checks.yml` | 静态检查 (最低档) | 后端 `python -m compileall` + `ruff check --select E9,F63,F7,F82`；前端 `node --check src/**/*.js` |
+| `.github/workflows/static-checks.yml` | 静态检查 (最低档) | 后端 `python -m compileall -q backend` + `ruff check --select E4,E7,E9,F backend`；前端 `node --check src/**/*.js` + `npx eslint src` |
 | `.github/workflows/e2e.yml` | 端到端验收 Playwright e2e (chromium) | 起 MySQL 8.0 服务容器 + 本地模型桩（`tests/e2e/stub_llm_server.py`，替掉全部模型上游）→ 构建前端并以 `vite preview` 托管 → 真实浏览器跑 `tests/e2e/chat.spec.mjs` → 用桩的请求日志确认检索链路真被走到（`tests/e2e/check_stub_calls.py`）→ 截图与各服务日志上传为 artifact |
 
 说明：
 
-- 静态检查目前只拦语法错误、未定义名等确定性错误，**不是**完整规范；为什么不直接开 `ruff --select E,F` 以及后续怎么加严，写在 `static-checks.yml` 顶部注释里。
+- 静态检查是最低档，拦语法错误、未定义名、未使用导入这类确定性错误，**不是**完整规范；为什么不直接开 `ruff --select E,F` 以及后续怎么加严，写在 `static-checks.yml` 顶部注释里。
 - 五个 workflow 都是 `permissions: contents: read`，不配置任何密钥，也不使用 `continue-on-error`：失败就是失败。
 - 后端测试只需 `backend/requirements.txt` + `pytest`；RAGAS 等可选评估依赖是延迟导入，CI 不安装。
 - e2e 不需要任何真实密钥：模型上游由仓库内的桩服务顶替，元数据库是一次性容器，`SECRET_KEY` 每次运行现场生成（写进仓库等于提交一个可用密钥）。审批用的占位口令只对本次运行的临时容器有效。
