@@ -62,7 +62,7 @@ Commands run from the repository root:
 ## Residual Risks
 
 - Node and Python test discovery have been made explicit in `package.json` and `pytest.ini`; future nested Node tests and Python `test_*.py` files under `tests/` should stay inside the baseline.
-- Milvus migration is the largest backend risk. Existing Chroma data is not automatically migrated, and the upload/query/delete loop still deserves a focused runtime acceptance pass.
+- Milvus migration is the largest backend risk. Existing Chroma data is not automatically migrated. The upload/query/delete loop has since had its runtime acceptance pass: `tests/test_milvus_acceptance.py` ran green on `2026-09-22` (`7 passed` in `13.10s` locally) against a real Milvus Lite database created in a temporary directory, covering upload and re-upload replace, cosine query, delete, knowledge-base isolation, index rebuild, and the `top_k` / missing-collection window; the same module is part of the `507 passed` backend suite on the Python 3.10 CI runner. The boundary of that run is embedded Milvus Lite: a deployed Milvus server is still unverified, and the embedding function is a deterministic stand-in, so the real provider path is not covered here.
 - Several external providers are mocked in tests. DeepSeek, DashScope embedding, DashScope rerank, OSS, and RAGAS runtime behavior still need real-environment smoke checks.
 - Some terminal output showed mojibake for Chinese strings. Prior tests passed, but the final UI text should be checked in a browser or by reading files with confirmed UTF-8 handling.
 - `Knowledge.vue` batch delete/upload feedback and `chat store` RAGAS polling/message merge are now covered by narrow behavior-level Node tests (`tests/knowledgeFeedback.test.js`, `tests/chatStore.test.js`). The view-side logic was extracted into `src/utils/knowledgeFeedback.js` to make it testable in plain Node, so the Vue SFC glue itself (which helper it calls, the toast level, `uploading`/`uploadPercent` reset) is still only verified by reading, not executed by tests.
@@ -75,7 +75,7 @@ Immediate next step:
 
 Next batch:
 
-2. Milvus acceptance goal: verify index rebuild, upload, query, knowledge-base isolation, and deletion cleanup end to end.
+2. Done: the Milvus acceptance goal verified index rebuild, upload, query, knowledge-base isolation, and deletion cleanup end to end on `2026-09-22`; what remains open is the deployed-server and real-embedding-provider boundary (see [Residual Risks](#residual-risks)).
    - Acceptance tests: `tests/test_milvus_acceptance.py` (see [Acceptance Test Index](#acceptance-test-index)).
 3. Retrieval acceptance goal: verify query planning, vector recall, keyword recall, RRF fusion, and rerank with focused behavior tests.
    - Acceptance tests: `tests/test_retrieval_acceptance.py` (see [Acceptance Test Index](#acceptance-test-index)).
