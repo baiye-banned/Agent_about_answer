@@ -18,6 +18,7 @@ SSE 用例跑真实的 `TraceRecorder` + 真实的 `sanitize_trace_value` + 真�
 """
 
 import asyncio
+import json
 import logging
 
 import docx
@@ -29,8 +30,9 @@ import rag.learning_trace as learning_trace
 import rag.llm as llm
 from conftest import FakeKnowledgeBase
 from crud import knowledge_file
+from rag import vision_service
 from schema.schemas import ChatRequest
-from service import chat_service
+from service import chat_service, oss_service
 
 
 # 与 issue 复现步骤同形的内部异常文本：数据库驱动报错 + 表列名。
@@ -54,17 +56,17 @@ class _StubUploadFile:
         return self._content
 
 
-def _assert_no_leak(text: str, where: str) -> None:
-    for marker in LEAK_MARKERS:
+def _assert_no_leak(text: str, where: str, markers=LEAK_MARKERS) -> None:
+    for marker in markers:
         assert marker not in text, f"{where} 回显了内部异常文本片段 {marker!r}：{text}"
 
 
-def _assert_sse_frames_clean(body: str, where: str) -> None:
+def _assert_sse_frames_clean(body: str, where: str, markers=LEAK_MARKERS) -> None:
     """逐帧断言，失败时只回显泄漏的那一帧，不把整条流倒进测试输出。"""
     leaked = [
         frame.strip()
         for frame in body.split("\n\n")
-        if any(marker in frame for marker in LEAK_MARKERS)
+        if any(marker in frame for marker in markers)
     ]
     assert not leaked, f"{where} 回显了内部异常文本：{leaked[0]}"
 
@@ -328,6 +330,137 @@ def test_parse_failure_still_logs_original_exception(monkeypatch, caplog):
 
     assert INTERNAL_ERROR_TEXT in caplog.text
     assert "docx_parse failed" in caplog.text
+
+
+# --- 图片分析：SSE 帧（vision_service 的失败分支） ---------------------------
+#
+# 同一判据、同一条通路：`_analyze_image_attachments` 的 `error` 字段被 `chat_service`
+# 写进三段用户可见负载——`effective_question_built` 的 result、`image_failed_directly`
+# 的 result、以及 `{"type":"error"}` 事件的 message，前端对两者都原样渲染。传输出错时
+# 旧实现写的是 `str(exc)`，其中「上游服务地址」正是 issue #96 点名的一类文本。
+#
+# 两条复现都**不替换被测函数**：只驱动真实的 `stream_chat`，并让真实的 httpx 去处理
+# 真实的 URL/响应，避免替身把要验证的那段逻辑一并替换掉。
+
+OSS_CONFIG = {
+    "OSS_ACCESS_KEY_ID": "test-id",
+    "OSS_ACCESS_KEY_SECRET": "test-secret",
+    "OSS_BUCKET": "demo",
+    "OSS_ENDPOINT": "https://oss-cn-hangzhou.aliyuncs.com",
+}
+IMAGE_ATTACHMENT = {"object_key": "uploads/考勤.png", "file_name": "考勤.png", "content_type": "image/png"}
+
+
+def _patch_real_vision(monkeypatch):
+    """让 stream_chat 走真实的 `vision_service._build_effective_question`。"""
+    for name, value in OSS_CONFIG.items():
+        monkeypatch.setattr(oss_service, name, value)
+    monkeypatch.setattr(chat_service, "_build_effective_question", vision_service._build_effective_question)
+    monkeypatch.setattr(vision_service, "VISION_API_KEY", "sk-vision")
+
+
+def _run_attachment_stream(fake_db) -> str:
+    """只发一张图、不带文字问题：走 `image_failed_directly` 那条失败流。"""
+
+    async def _run():
+        response = await chat_service.stream_chat(
+            ChatRequest(question="", attachments=[dict(IMAGE_ATTACHMENT)]), authorization="Bearer token"
+        )
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+        return "".join(chunks)
+
+    return asyncio.run(_run())
+
+
+def _error_id_in(body: str) -> str:
+    assert "错误编号：" in body, f"用户侧负载里没有可上报的错误编号：{body}"
+    return body.split("错误编号：", 1)[1].split("）", 1)[0]
+
+
+def test_image_analysis_invalid_url_sse_frames_hide_internal_error(monkeypatch, fake_db, real_trace, caplog):
+    """视觉接口地址非法：帧里不得出现由该地址派生的异常文本。
+
+    `httpx.InvalidURL` 不是 `httpx.HTTPError` 子类（`InvalidURL(Exception)` vs
+    `HTTPError(TransportError)`），因此它逃出 `_request_image_description` 的窄
+    `except httpx.HTTPError`，落到 `_analyze_image_attachments` 的 `except Exception`。
+    """
+    _patch_stream_boundaries(monkeypatch, fake_db)
+    _patch_real_vision(monkeypatch)
+    # 端口非数字：httpx 在解析阶段就抛 InvalidURL，不做任何网络 I/O。
+    monkeypatch.setattr(vision_service, "VISION_BASE_URL", "https://vision.example.com:abc/v1")
+
+    with caplog.at_level(logging.WARNING):
+        body = _run_attachment_stream(fake_db)
+
+    _assert_sse_frames_clean(body, "图片分析失败 SSE 帧", markers=("Invalid port", "InvalidURL", "httpx"))
+    error_id = _error_id_in(body)
+    # 可诊断性不降级：原文仍进日志，且用户看到的编号能在日志里对上。
+    assert "Invalid port" in caplog.text
+    assert f"error_id={error_id}" in caplog.text
+
+
+def test_image_analysis_non_json_response_hides_internal_error(monkeypatch, fake_db, real_trace, caplog):
+    """视觉接口返回 200 但响应体不是 JSON：`JSONDecodeError` 原文不得出现在帧里。"""
+    _patch_stream_boundaries(monkeypatch, fake_db)
+    _patch_real_vision(monkeypatch)
+    monkeypatch.setattr(vision_service, "VISION_BASE_URL", "https://vision.example.com/v1")
+
+    class _NonJsonResponse:
+        status_code = 200
+        text = "<html>502 Bad Gateway</html>"
+
+        @staticmethod
+        def json():
+            raise json.JSONDecodeError("Expecting value", _NonJsonResponse.text, 0)
+
+    class _NonJsonClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            return _NonJsonResponse()
+
+    monkeypatch.setattr(vision_service.httpx, "AsyncClient", _NonJsonClient)
+
+    with caplog.at_level(logging.WARNING):
+        body = _run_attachment_stream(fake_db)
+
+    _assert_sse_frames_clean(body, "图片分析失败 SSE 帧", markers=("Expecting value", "JSONDecodeError"))
+    error_id = _error_id_in(body)
+    assert "Expecting value" in caplog.text
+    assert f"error_id={error_id}" in caplog.text
+
+
+def test_image_analysis_failure_keeps_user_facing_message_and_status(monkeypatch, fake_db, real_trace):
+    """回归：失败仍是 failed 状态、仍给出可读文案，只是不再附异常原文。"""
+    _patch_stream_boundaries(monkeypatch, fake_db)
+    _patch_real_vision(monkeypatch)
+    monkeypatch.setattr(vision_service, "VISION_BASE_URL", "https://vision.example.com:abc/v1")
+
+    body = _run_attachment_stream(fake_db)
+
+    analysis = [
+        json.loads(frame[len("data: "):])
+        for frame in body.split("\n\n")
+        if frame.strip().startswith("data: {")
+    ]
+    events = [event for event in analysis if event.get("type") != "trace"]
+    image_event = next(event for event in events if event.get("type") == "image_analysis")
+    error_event = next(event for event in events if event.get("type") == "error")
+
+    assert image_event["analysis"]["status"] == "failed"
+    assert image_event["analysis"]["error"].startswith(vision_service.IMAGE_ANALYSIS_FAILED_MESSAGE)
+    assert error_event["message"].startswith(vision_service.IMAGE_ANALYSIS_FAILED_MESSAGE)
+    result = _stage_result(real_trace.events, "image_failed_directly")
+    assert result["error"] == image_event["analysis"]["error"]
 
 
 # --- 同一通路（LLM / 检索）里其余的 str(exc) 出口 ---------------------------
