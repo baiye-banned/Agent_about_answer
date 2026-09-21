@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出默认分支（校验脚本来源）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 校验 issue 结构
         uses: actions/github-script@v7
