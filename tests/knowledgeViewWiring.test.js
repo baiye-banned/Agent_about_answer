@@ -47,6 +47,28 @@ test('三个删除入口的刷新都经 refreshAfterDelete 收口（第 7 项）
   assert.equal((VIEW.match(/refreshAfterDelete\(\{/g) || []).length, 3)
 })
 
+test('删除知识库：选中在刷新侧栏之前就落到 fallback 上（返工轮 minor-2）', () => {
+  const body = functionBody('deleteKnowledgeBase')
+  // 用最宽的赋值形态定位（而不是钉住具体写法）：修复前的
+  // `currentKnowledgeBaseId.value = result.fallback_… || …` 同样能命中，
+  // 于是判红的是**顺序**本身，不是「代码被改写过」。
+  const assignIndex = body.indexOf('currentKnowledgeBaseId.value =')
+  const refreshIndex = body.indexOf('await fetchKnowledgeBases()')
+  assert.ok(assignIndex > -1, 'deleteKnowledgeBase 没有设置当前选中的知识库')
+  assert.ok(refreshIndex > -1, 'deleteKnowledgeBase 没有刷新侧栏知识库列表')
+  // fallback id 来自已成功的删除响应，不依赖这次刷新。排在 await fetchKnowledgeBases()
+  // 之后时侧栏一失败就整段中断，选中仍停在刚被删掉的知识库上，后续上传/删除 404。
+  assert.ok(
+    assignIndex < refreshIndex,
+    '选中的赋值排在 await fetchKnowledgeBases() 之后：刷新失败时选中会停在已被删除的知识库上'
+  )
+  // 候选列表必须剔掉刚删的那个：刷新失败时手里的还是旧列表，不剔就可能又选回它。
+  assert.ok(
+    body.includes('item.id !== current.id'),
+    'fallback 的候选列表没有剔除刚被删除的知识库'
+  )
+})
+
 test('文件列表取数接在带时序守卫的 loader 上（第 8 项）', () => {
   assert.ok(VIEW.includes('createFileListRequest({'))
   assert.ok(VIEW.includes('return fileList.load()'))

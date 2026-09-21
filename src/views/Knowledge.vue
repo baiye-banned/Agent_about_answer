@@ -545,8 +545,16 @@ async function deleteKnowledgeBase() {
   // 刷新失败不能逃逸成未捕获拒绝，也不能让用户以为删除没成功。
   await refreshAfterDelete({
     refresh: async () => {
+      // 选中先落到删除响应给的 fallback 知识库，再刷侧栏列表（返工轮 minor-2）。
+      // 这个 id 来自**已成功的删除响应**（后端 delete_knowledge_base 必带 target.id），
+      // 不依赖这次刷新；放在 fetchKnowledgeBases() 之后就是整段等它——侧栏一失败，
+      // 选中仍停在刚被删掉的知识库上，后续上传/删除都会 404，提示却只说「请手动刷新页面」。
+      // 候选列表先剔掉刚删的那个：刷新没成功时手里的还是旧列表，不去掉就可能又选回它。
+      currentKnowledgeBaseId.value = resolveKnowledgeBaseId(
+        result.fallback_knowledge_base_id,
+        knowledgeBases.value.filter((item) => item.id !== current.id)
+      )
       await fetchKnowledgeBases()
-      currentKnowledgeBaseId.value = result.fallback_knowledge_base_id || knowledgeBases.value[0]?.id || null
       await fetchFiles()
     },
     notifyError: notifyDeleteError,
