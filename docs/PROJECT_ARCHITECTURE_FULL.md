@@ -80,7 +80,7 @@ flowchart LR
   Retrieval --> Milvus
   Retrieval --> DeepSeek
   RerankSvc -->|"qwen3-rerank"| DashScope
-  RerankSvc -.->|"RERANK_LLM_FALLBACK_ENABLED=true 且主链路异常"| DeepSeek
+  RerankSvc -.->|"RERANK_LLM_FALLBACK_ENABLED=true（默认 true，无需手动开启）且主链路异常"| DeepSeek
   MilvusClient --> DashScope
   ChatSvc --> OSS
   VisionSvc --> OSS
@@ -195,7 +195,7 @@ flowchart LR
   Retrieval --> MilvusClient
   Retrieval --> RerankSvc
   RerankSvc -->|"qwen3-rerank"| DashScope
-  RerankSvc -.->|"RERANK_LLM_FALLBACK_ENABLED=true 且主链路异常"| DeepSeek
+  RerankSvc -.->|"RERANK_LLM_FALLBACK_ENABLED=true（默认 true，无需手动开启）且主链路异常"| DeepSeek
   Chat --> Trace
   Chat --> Ragas
   Chat --> DB
@@ -389,7 +389,7 @@ flowchart LR
 | Milvus | `MILVUS_URI / MILVUS_LITE_URI / MILVUS_COLLECTION_NAME` | 向量库连接与集合 |
 | DeepSeek | `DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL` | 规划、回答生成，以及 rerank 异常时的条件性回退 |
 | Embedding | `EMBEDDING_BASE_URL / EMBEDDING_API_KEY / EMBEDDING_MODEL / EMBEDDING_DIM` | DashScope 向量化 |
-| Rerank | `RERANK_PROVIDER / RERANK_MODEL / RERANK_BASE_URL / RERANK_API_KEY / RERANK_TIMEOUT_SECONDS / RERANK_LLM_FALLBACK_ENABLED` | DashScope `qwen3-rerank` 重排主链路；开关为真且主链路异常时才回退 DeepSeek |
+| Rerank | `RERANK_PROVIDER / RERANK_MODEL / RERANK_BASE_URL / RERANK_API_KEY / RERANK_TIMEOUT_SECONDS / RERANK_LLM_FALLBACK_ENABLED` | DashScope `qwen3-rerank` 重排主链路；开关为真（默认 `true`，`backend/config.py`）且主链路异常时才回退 DeepSeek |
 | RAGAS | `RAGAS_ENABLED / RAGAS_LLM_MODEL / RAGAS_TIMEOUT_SECONDS` 等 | 在线评估 |
 | OSS | `OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET / OSS_BUCKET / OSS_ENDPOINT` | 图片附件和头像 |
 | Trace | `LEARNING_TRACE_ENABLED / LEARNING_TRACE_MAX_TEXT_CHARS` | Chat 页面 Trace 回放 |

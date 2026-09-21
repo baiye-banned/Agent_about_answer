@@ -11,7 +11,9 @@
   且输出按 `文件:行号 [匹配类型]` 点名对应文件；
 - 同样的五个文件替换为普通文本后，退出码回到 0（判绿样本）；
 - 豁免标记的边界：带非空理由的 `# scan-secrets:allow <理由>` 豁免该行赋值命中，
-  只有标记而无理由时不豁免；
+  只有标记而无理由时不豁免；而形态命中在**标记确实被咨询过**的前提下依然豁免不了——
+  这一条由双路径夹具（大写键名 + `sk-` 形态同行）钉住，否则「标记对形态无效」与
+  「标记压根没被咨询」这两种失效不可区分，断言会退化成恒真的空话；
 - 变异测试：把任一条正则改成永不匹配的形态后，针对该规则的判红样本必须不再报红。
   换句话说，「删掉某条规则」这件事会让上面至少一条断言转红——这正是 issue #54 要求的
   「先红后绿」证据，且每次 CI 都会重新验证一遍，而不是只留在 PR 描述里。
@@ -24,9 +26,11 @@
 - 只调用 `--patterns-only`：本文件验证的是 Layer 1，gitleaks（Layer 2）缺失时必须是被明确
   标注的跳过而不是失败。脚本会打印 `--patterns-only - gitleaks skipped ...`，用例断言这行
   说明存在，避免「静默跳过」被误读成「扫过了」；
-- 每个夹具文件只命中一条规则（赋值启发式区分大小写，故夹具的变量名用小写），这样变异测试
-  里「某条规则失效」与「某个夹具不再报红」是一一对应的，不会互相掩护；
-- 八次子进程调用（五条规则的样本合并到同一目录、豁免边界三侧合并到同一次扫描，减少进程启动
+- 判红样本里每个夹具文件只命中一条规则（赋值启发式区分大小写，故夹具的变量名用小写），这样
+  变异测试里「某条规则失效」与「某个夹具不再报红」是一一对应的，不会互相掩护；豁免边界那组
+  有一个刻意的例外——双路径夹具同行命中两条规则，且不登记进 `SHAPES`，因此不参与上面那张
+  映射表，它存在的意义是让标记先被咨询、再证明它的效力到此为止；
+- 八次子进程调用（五条规则的样本合并到同一目录、豁免边界四侧合并到同一次扫描，减少进程启动
   开销），无网络、无凭据依赖；
 - 需要的是脚本头部声明的那个运行环境：git-bash / POSIX 的 bash。Windows 上
   `shutil.which("bash")` 若优先命中 WSL 的 `System32\bash.exe`，那种 bash 读不了 `C:/…`
@@ -115,6 +119,17 @@ def _assignment_line():
     return "%s=%s" % ("PASSWORD", _body(ALNUM, 24, SAFE_HEAD))
 
 
+def _sk_assignment_line():
+    """一行同时命中赋值启发式与 `sk-` 形态：键名大写，所以这行进得了豁免判定分支。
+
+    这一点是它存在的全部理由。脚本把豁免标记的判定嵌在 `[[ $content =~ $RE_PREFIX ]]`
+    分支**内部**，而 `RE_PREFIX` 只认大写键名并区分大小写——所以拿小写键名（如 `_sk_line`
+    的 `client_key`）去断言「标记没能豁免形态命中」，得到的是一条恒真断言：那行压根没走到
+    豁免判定。要证明「标记对形态命中无效」，先得让标记有机会对它生效。
+    """
+    return '%s = "%s"' % ("API_KEY", "sk-" + _body(ALNUM, 24, SAFE_HEAD))
+
+
 # (匹配类型标签, 夹具文件名, 生成判红内容的函数)
 SHAPES = [
     ("sk- token", "planted_sk.py", _sk_line),
@@ -181,25 +196,35 @@ def test_every_builtin_shape_is_green_once_the_fixtures_are_benign(tmp_path):
 
 
 def test_allow_marker_exempts_only_when_a_reason_follows(tmp_path):
-    """豁免标记的三条边界：带理由的赋值行豁免、只有标记的赋值行不豁免、形态命中永不豁免。
+    """豁免标记的四条边界。
 
-    三个文件放在同一次扫描里：带理由的赋值行进豁免清单（stdout），只有标记的赋值行仍按命中
-    报红（stderr），带完整标记的 `sk-` 形态命中同样按命中报红（stderr）且不进豁免清单。
-    一次运行同时给出三侧结论——豁免既没有被静默，也没有被放大到形态命中上。
+    四个文件放在同一次扫描里，一次运行同时给出四侧结论——豁免既没有被静默，也没有被放大到
+    形态命中上：
+
+    - 带理由的赋值行：进豁免清单（stdout），不再报红；
+    - 只有标记、没有理由的赋值行：不豁免，仍按命中报红（stderr）；
+    - 形态命中 + 完整标记：标记对它无效，照常报红（stderr）且不进豁免清单；
+    - 双路径（大写键名 + `sk-` 形态同行）：赋值命中被豁免（stdout）、形态命中照常报红
+      （stderr）。前三侧各自只钉一头，这一侧把「标记生效过」与「效力到此为止」钉在同一行
+      上；它独有的判别力边界见下面断言的注释（不主张覆盖更粗的退化）。
     """
     allowed = "planted_allowed.py"
     bare = "planted_bare_allow.py"
     shape = "planted_shape_allow.py"
+    dual = "planted_shape_and_assignment_allow.py"
     reason = "%s real fixture value, not a credential\n" % ALLOW_MARK
     _write_all(
         tmp_path,
         {
             allowed: _assignment_line() + "  " + reason,
             bare: _assignment_line() + "  " + ALLOW_MARK + "\n",
-            # 第三侧是这套规则里最要紧的一条：脚本承诺标记只豁免赋值启发式，`sk-` 这类形态
-            # 命中永远豁免不了（见脚本头部与 DEVELOPING.md）。一旦这里失效，一个标记就能把
-            # 真正的密钥藏起来——门禁会从「兜底」变成「帮凶」，所以必须有断言盯着它。
+            # 形态命中这一侧是这套规则里最要紧的承诺：脚本保证标记只豁免赋值启发式，`sk-`
+            # 这类形态命中永远豁免不了（见脚本头部与 DEVELOPING.md）。一旦失效，一个标记就能
+            # 把真正的密钥藏起来——门禁会从「兜底」变成「帮凶」，所以必须有断言盯着它。
+            # 但只凭这一侧盯不住：小写键名进不了 RE_PREFIX 分支，标记从未被咨询，断言恒真。
             shape: _sk_line() + "  " + reason,
+            # 所以再补一条双路径夹具，把承诺钉实（理由见该断言的注释）。
+            dual: _sk_assignment_line() + "  " + reason,
         },
     )
 
@@ -214,6 +239,19 @@ def test_allow_marker_exempts_only_when_a_reason_follows(tmp_path):
     # 形态命中 + 完整标记：标记对它无效，必须照常报红，也不得出现在豁免清单里。
     assert "%s:1 [sk- token]" % shape in stderr, stderr
     assert "%s:1" % shape not in stdout, stdout
+    # 双路径夹具：「标记藏不住真密钥」这条属性的正面证据。同一行里赋值命中与形态命中并存，
+    # 四条断言把「标记生效过」与「效力到此为止」钉在同一行上：
+    #   前两条——赋值命中进豁免清单、不进命中列表——证明标记**确实被咨询且生效**；
+    #   后两条——形态命中进命中列表、不进豁免清单——证明它的效力**不覆盖**同一行的形态命中。
+    # 它相对前三侧独有的判别力是这一种退化：把形态命中的豁免条件写成「该行既是赋值命中、
+    # 又带标记」（即在形态分支里也去查 RE_PREFIX）。那样小写键名的 `shape` 侧仍照常报红、
+    # 前三侧全绿，这一侧却会把真密钥连同赋值一起放过——只有这几条断言会转红。
+    # 不声称覆盖更多：「有标记就整行放过」「RE_ALLOW 取不到」这类更粗的退化，`allowed` 与
+    # `shape` 两侧本来就会转红。
+    assert "%s:1 [credential assignment]" % dual in stdout, stdout
+    assert "%s:1 [credential assignment]" % dual not in stderr, stderr
+    assert "%s:1 [sk- token]" % dual in stderr, stderr
+    assert "%s:1 [sk- token]" % dual not in stdout, stdout
 
 
 # ---------------------------------------------------------------------------

@@ -501,7 +501,7 @@ sequenceDiagram
   R->>R: keyword_recall()
   R->>R: rrf_fuse()
   R->>P: rerank_chunks()（qwen3-rerank）
-  R->>L: rerank_chunks() 回退（仅 RERANK_LLM_FALLBACK_ENABLED=true 且主链路异常）
+  R->>L: rerank_chunks() 回退（RERANK_LLM_FALLBACK_ENABLED 为真且主链路异常；该开关默认即为 true）
   B->>L: stream_rag_answer()
   B->>DB: 保存 user / assistant messages
 ```

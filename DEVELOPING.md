@@ -65,8 +65,9 @@ bash scripts/scan_secrets.sh
   标记必须带非空理由（`# scan-secrets:allow <理由>`），且**只**豁免该行的
   `[credential assignment]`（赋值启发式）命中：`sk-` 长串、`AKIA`+16 位大写、
   `ghp_` 长串、`-----BEGIN ... PRIVATE KEY-----` 头都是按**形态**匹配的，任何标记都
-  豁免不了，所以标记无法用来藏起这些形态的凭据。扫描每次都会打印被豁免的行清单
-  （`N line(s) exempted ...` 后面跟着 `文件:行号`），豁免在 CI 日志里可见而非静默，
+  豁免不了，所以标记无法用来藏起这些形态的凭据。扫描会把被豁免的行清单打印出来
+  （`N line(s) exempted ...` 后面跟着 `文件:行号`；仅当至少有一条豁免时才打印，
+  一条都没有时不会出现这一行），豁免在 CI 日志里可见而非静默，
   评审时与它豁免的代码在同一份 diff 里一起审。标记的识别只要求行内出现 `#`、标记名与
   非空理由，因此标记文本若被拼进**数据字符串**同样会生效；不要在字符串或文档里随手
   粘贴标记文本，每次打印的豁免清单就是为了让这种情况可见。**禁止**用标记掩盖真密钥或
@@ -86,9 +87,14 @@ bash scripts/scan_secrets.sh
   `tests/test_scan_secrets_selftest.py` 对临时目录里的夹具用 `--patterns-only`，扫的不是
   仓库，且用例会断言脚本确实打印了跳过说明（跳过始终显式可见，不会变成一次假绿）；
 
-- 当前仓库没有 `.gitleaks.toml`，有 6 行使用上面的内联标记：
-  `backend/config.py` 的 3 个来源标签常量、`tests/test_knowledge_ownership.py` 的
-  3 行内存测试夹具（见 issue #36）；再有新增时按本节约定处理。
+- 当前仓库没有 `.gitleaks.toml`，内联标记的使用情况**以扫描输出为准**：在仓库根目录跑
+  `bash scripts/scan_secrets.sh --patterns-only`，上面说的那份逐行豁免清单即当前全量，
+  评审时以它为准。本节只记一个**会过期的读数**、方便快速对照，不构成权威：
+  **7 行 / 3 个文件**——`backend/config.py` 的 3 个来源标签常量、
+  `scripts/smoke_providers.py` 的 1 行（还原被临时置空的 key，非凭据）、
+  `tests/test_knowledge_ownership.py` 的 3 行内存测试夹具（见 issue #36）。
+  再有新增时按本节约定处理，并顺手更新这个读数——数字一旦过期，后来人就会按错的范围判断
+  豁免是否合理。
 
 ## 提交信息
 
