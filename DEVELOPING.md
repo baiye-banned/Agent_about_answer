@@ -86,15 +86,14 @@ bash scripts/scan_secrets.sh
   `tests/test_scan_secrets_selftest.py` 对临时目录里的夹具用 `--patterns-only`，扫的不是
   仓库，且用例会断言脚本确实打印了跳过说明（跳过始终显式可见，不会变成一次假绿）；
 
-- 当前仓库没有 `.gitleaks.toml`，内联标记的**当前全量清单以扫描输出为准**：在仓库根目录跑
-  `bash scripts/scan_secrets.sh --patterns-only`，脚本每次都会在末尾打印
-  `N line(s) exempted by an inline '# scan-secrets:allow' marker` 及其逐行明细，
-  那份输出就是权威答案——本节不再维护一份容易过期的副本，只记当前读数：
+- 当前仓库没有 `.gitleaks.toml`，内联标记的使用情况**以扫描输出为准**：在仓库根目录跑
+  `bash scripts/scan_secrets.sh --patterns-only`，上面说的那份逐行豁免清单即当前全量，
+  评审时以它为准。本节只记一个**会过期的读数**、方便快速对照，不构成权威：
   **7 行 / 3 个文件**——`backend/config.py` 的 3 个来源标签常量、
   `scripts/smoke_providers.py` 的 1 行（还原被临时置空的 key，非凭据）、
   `tests/test_knowledge_ownership.py` 的 3 行内存测试夹具（见 issue #36）。
-  再有新增时按本节约定处理，**并顺手更新这里的读数**：这行数字一旦过期，后来人就会按错的
-  范围判断豁免是否合理。
+  再有新增时按本节约定处理，并顺手更新这个读数——数字一旦过期，后来人就会按错的范围判断
+  豁免是否合理。
 
 ## 提交信息
 
