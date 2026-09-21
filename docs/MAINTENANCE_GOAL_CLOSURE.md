@@ -77,7 +77,7 @@ Next batch:
 
 2. Done: the Milvus acceptance goal verified index rebuild, upload, query, knowledge-base isolation, and deletion cleanup end to end on `2026-09-22`; what remains open is the deployed-server and real-embedding-provider boundary (see [Residual Risks](#residual-risks)).
    - Acceptance tests: `tests/test_milvus_acceptance.py` (see [Acceptance Test Index](#acceptance-test-index)).
-3. Retrieval acceptance goal: verify query planning, vector recall, keyword recall, RRF fusion, and rerank with focused behavior tests.
+3. Done: the retrieval acceptance goal verified query planning, vector recall, keyword recall, RRF fusion, and rerank with focused behavior tests on `2026-09-22`; what remains open is the provider boundary - the planner model call, the embedding backend, and the rerank HTTP provider are stubbed in the offline cases (live provider behavior is goal 4).
    - Acceptance tests: `tests/test_retrieval_acceptance.py` (see [Acceptance Test Index](#acceptance-test-index)).
 4. Rerank and provider goal: smoke-test DashScope rerank, LLM fallback, embedding, and DeepSeek connectivity in the target environment.
    - Acceptance tests: `tests/test_provider_smoke.py` plus the offline smoke entry point `scripts/smoke_providers.py` (`--live` for the real endpoints); see [Acceptance Test Index](#acceptance-test-index).
@@ -104,11 +104,13 @@ embedding function is replaced, with a deterministic offline implementation).
 
 ### Goal 3 - Retrieval acceptance (`tests/test_retrieval_acceptance.py`)
 
-Drives the full `retrieve_knowledge` chain: multi-route recall, RRF fusion, rerank, and
-final context selection. Only the marginal recall and the rerank HTTP transport are
-replaced; the real fusion, truncation and selection logic runs. Keyword recall reads the
-relational store rather than Milvus, so the last three cases call that implementation
-unpatched against real `KnowledgeFile` rows in a real SQLite database.
+Drives the full `retrieve_knowledge` chain: query planning, multi-route recall, RRF fusion,
+rerank, and final context selection. Only the marginal recall, the rerank HTTP transport and
+the planner's model call are replaced; the real plan normalization, fusion, truncation and
+selection logic runs. Keyword recall reads the relational store rather than Milvus, so the
+last three cases call that implementation unpatched against real `KnowledgeFile` rows in a
+real SQLite database. The vector-recall implementation is covered against a real Milvus Lite
+store by the goal 2 cases, so this file only pins the per-route call contract.
 
 - `test_acceptance_multi_route_rrf_rerank_final_order` - one path from plan to final context: route order and `top_k`, RRF order and scores, rerank request payload, and a final order that follows the rerank scores.
 - `test_acceptance_rerank_failure_falls_back_to_fused_order` - a failed rerank keeps the fused order and reports a failed rerank trace.
@@ -120,6 +122,11 @@ unpatched against real `KnowledgeFile` rows in a real SQLite database.
 - `test_acceptance_single_route_failure_is_not_swallowed` - a failing recall route aborts the retrieval instead of returning partial context.
 - `test_acceptance_route_plan_is_deduplicated_and_capped` - the route plan is deduplicated and capped before recall.
 - `test_acceptance_rerank_candidate_window_is_capped` - the candidate window sent to the reranker and the returned context are capped by the configured limits.
+- `test_acceptance_query_plan_normalizes_and_caps_the_planner_output` - the planner's hypothesis document is stripped, its rewrite list is cleaned and capped at three, and its keywords are merged with the question's own, deduplicated and capped at 24.
+- `test_acceptance_query_plan_failure_still_yields_usable_keywords` - a failed planner still returns deterministic query terms, so the keyword route survives it.
+- `test_acceptance_fallback_keywords_extract_numeric_phrases_and_terms` - numeric policy phrases are matched whole and ahead of the single policy terms.
+- `test_acceptance_fallback_keywords_expand_short_chinese_tokens` - short Chinese tokens also contribute their adjacent bigrams, not just the whole token.
+- `test_acceptance_plan_keywords_reach_the_keyword_route` - the plan's keywords, the question's own deterministic keywords and the plan's required evidence are exactly the terms the keyword route searches for, deduplicated in that order.
 - `test_acceptance_real_keyword_recall_reads_the_relational_store` - the unpatched `keyword_recall` returns only matching rows of the requested knowledge base, with the stored row identity and the real keyword scores in descending order.
 - `test_acceptance_real_keyword_recall_chunks_long_text_and_caps_results` - the unpatched `keyword_recall` splits long stored text at the real character offsets, drops chunks without a keyword hit, and caps the result at `top_k`.
 - `test_acceptance_retrieve_knowledge_uses_the_real_keyword_recall` - the real keyword chunk travels through fusion and rerank into the final context.
