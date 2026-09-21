@@ -146,6 +146,26 @@ def rebuild_existing_knowledge_index():
         db.close()
 
 
+# 知识库重名唯一键在三类后端上的报错特征。模型侧的名字是 uq_knowledge_bases_user_name；
+# SQLite 没有具名唯一键，只能从「哪几列冲突」反推。
+_KNOWLEDGE_BASE_NAME_UNIQUE_MARKERS = (
+    "uq_knowledge_bases_user_name",
+    "knowledge_bases.user_id, knowledge_bases.name",
+)
+
+
+def _is_knowledge_base_name_conflict(exc: IntegrityError) -> bool:
+    """这个 IntegrityError 是不是「同一用户已有同名知识库」这条唯一键引起的。
+
+    issue #83 第 6 项：`knowledge_bases` 上不止这一条约束（user_id 外键同样会抛
+    IntegrityError）。不区分来源就一律报「知识库名称已存在」，用户拿到的是与真实
+    原因无关的诊断——提示改名会继续失败——同时让 main.py 新增的全局 409 兜底在这两条
+    写路径上永远不可达。
+    """
+    detail = str(getattr(exc, "orig", None) or exc)
+    return any(marker in detail for marker in _KNOWLEDGE_BASE_NAME_UNIQUE_MARKERS)
+
+
 def _index_failure_detail(exc: Exception) -> str:
     """向量化失败时把可读原因透出给前端，其余写入异常保持原有提示。"""
     if isinstance(exc, EmbeddingBackendError):
@@ -198,10 +218,19 @@ def create_knowledge_base(body: KnowledgeBaseRequest, user: User = Depends(get_c
         raise HTTPException(400, "知识库名称已存在")
     try:
         entry = crud_knowledge_base.create_knowledge_base(db, name, user.id)
-    except IntegrityError:
-        # 预检查与写入之间被并发请求抢先提交了同名知识库，唯一约束兜底：
-        # 先回滚失败事务再翻译成与串行一致的 400，避免该 Session 残留失败事务状态。
+    except IntegrityError as exc:
+        # 先回滚失败事务，避免该 Session 残留失败事务状态。
         db.rollback()
+        if not _is_knowledge_base_name_conflict(exc):
+            # 非重名冲突（例如请求在途时该 user 行被并发删除，user_id 外键失效）：
+            # 不能谎称重名——提示改名会一直失败。重新抛出交给全局兜底回 409。
+            logger.warning(
+                "Knowledge base create failed on a non-name constraint: name=%s user_id=%s",
+                name, user.id, exc_info=True,
+            )
+            raise
+        # 预检查与写入之间被并发请求抢先提交了同名知识库，唯一约束兜底：
+        # 翻译成与串行一致的 400。
         logger.warning("Knowledge base create conflict: name=%s user_id=%s", name, user.id, exc_info=True)
         raise HTTPException(400, "知识库名称已存在")
     # 刚落库的知识库名下不可能已有文件，直接给 0，省一次计数查询。
@@ -219,9 +248,16 @@ def rename_knowledge_base(kid: int, body: KnowledgeBaseRequest, user: User = Dep
         raise HTTPException(400, "知识库名称已存在")
     try:
         entry = crud_knowledge_base.rename_knowledge_base(db, kid, name, user.id)
-    except IntegrityError:
-        # 两个知识库同时被改成同一个名字时同样只有一方能提交成功，后到者按同名处理。
+    except IntegrityError as exc:
         db.rollback()
+        if not _is_knowledge_base_name_conflict(exc):
+            # 与 create 同源：只把重名唯一键翻译成 400，其余交给全局 409 兜底。
+            logger.warning(
+                "Knowledge base rename failed on a non-name constraint: kid=%s name=%s user_id=%s",
+                kid, name, user.id, exc_info=True,
+            )
+            raise
+        # 两个知识库同时被改成同一个名字时同样只有一方能提交成功，后到者按同名处理。
         logger.warning("Knowledge base rename conflict: kid=%s name=%s user_id=%s", kid, name, user.id, exc_info=True)
         raise HTTPException(400, "知识库名称已存在")
     return crud_knowledge_base.serialize_knowledge_base(entry, crud_knowledge_base.count_knowledge_files(db, kid))
