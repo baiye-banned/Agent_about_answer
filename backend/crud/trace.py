@@ -32,18 +32,32 @@ def persist_trace_session(
         db.close()
 
 
-def append_trace_event(trace_id: str, event: dict, status: str | None = None):
+def append_trace_event(trace_id: str, event: dict, status: str | None = None) -> dict | None:
+    """把一条事件追加到该行自身的 `events` 上，`index` 在写事务内按行上已有条数分配。
+
+    `index` 只能由「这行实际存了什么」决定，不能经 `get_trace_snapshot` 去取：那条是读取面，
+    带会话存活守卫（issue #127），会话被删后它对被写回的行返回 None；调用方把 None 当成
+    「这行没有事件」，就会把序号从 1 重算，写进一个已经有 N 条事件的行（issue #141）。
+
+    读长度与追加还必须落在同一个事务里，否则两个补写者（RAGAS 在工作线程、长期记忆摘要在
+    事件循环，共用同一个 trace_id）会各自读到同一个旧长度，写出两条同号事件。
+    `with_for_update()` 在 MySQL 上是行级锁；SQLite 不支持该语法，SQLAlchemy 会省略它。
+    """
     db = SessionLocal()
     try:
-        session = db.query(ChatTraceSession).filter_by(id=trace_id).first()
+        session = db.query(ChatTraceSession).filter_by(id=trace_id).with_for_update().first()
         if not session:
-            return
+            return None
         events = _load_events(session.events)
+        # 写号的权威在落库这一侧：调用方带进来的 index 一律不作数。
+        payload = {key: value for key, value in event.items() if key != "index"}
+        event = {"index": len(events) + 1, **payload}
         events.append(event)
         session.events = json.dumps(events, ensure_ascii=False)
         if status:
             session.status = status
         db.commit()
+        return event
     finally:
         db.close()
 
