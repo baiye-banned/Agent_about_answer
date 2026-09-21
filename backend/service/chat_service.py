@@ -24,6 +24,7 @@ from service.utils_service import (
     CHAT_ATTACHMENT_MAX_BYTES,
     _build_sources,
     _check_answer_grounding,
+    _internal_error_detail,
     resolve_image_upload_type,
 )
 from service.knowledge_service import resolve_knowledge_base
@@ -40,6 +41,13 @@ from rag.retrieval import decide_need_rag, retrieve_knowledge
 
 
 logger = logging.getLogger(__name__)
+
+# 失败分支回给用户的固定文案：异常原文（驱动报错、路径、上游地址）只进 logger，不进 SSE 帧
+# 或 HTTP detail。学习轨迹事件同时带上 trace_id，用户报错时可直接与日志里的 trace 对上。
+ASSISTANT_SAVE_FAILED_MESSAGE = "保存回答失败"
+RAGAS_SCHEDULE_FAILED_MESSAGE = "RAGAS 评估调度失败"
+MEMORY_SUMMARY_SCHEDULE_FAILED_MESSAGE = "长期记忆压缩调度失败"
+OSS_UPLOAD_FAILED_MESSAGE = "图片上传失败，请稍后重试"
 
 
 def _serialize_conversation(conv: Conversation, user_id: int) -> dict:
@@ -169,7 +177,7 @@ async def upload_chat_attachment(file: UploadFile = File(...),
     try:
         await _put_oss_object(object_key, content, content_type)
     except Exception as exc:
-        raise HTTPException(500, f"OSS 上传失败：{exc}")
+        raise HTTPException(500, _internal_error_detail(OSS_UPLOAD_FAILED_MESSAGE, "oss_upload", exc))
 
     return {
         "name": file.filename or f"image{ext}",
@@ -643,7 +651,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                             trace,
                             "assistant_save_failed",
                             "Message",
-                            result={"error": str(exc)},
+                            result={"error": ASSISTANT_SAVE_FAILED_MESSAGE, "trace_id": trace.trace_id},
                             note="模型回答已经生成完毕，但保存 assistant 消息失败。系统仍会结束流，避免前端误报 network error。",
                         )
 
@@ -684,7 +692,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                                     trace,
                                     "ragas_schedule_failed",
                                     "schedule_ragas_evaluation",
-                                    result={"error": str(exc)},
+                                    result={"error": RAGAS_SCHEDULE_FAILED_MESSAGE, "trace_id": trace.trace_id},
                                     note="RAGAS 调度失败，但不影响主回答完成。",
                                 )
                         else:
@@ -710,7 +718,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                                 trace,
                                 "memory_summary_update_schedule_failed",
                                 "_schedule_memory_summary_update",
-                                result={"error": str(exc)},
+                                result={"error": MEMORY_SUMMARY_SCHEDULE_FAILED_MESSAGE, "trace_id": trace.trace_id},
                                 note="长期记忆压缩调度失败，但不影响主回答完成。",
                             )
                         try:

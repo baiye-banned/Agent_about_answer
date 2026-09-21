@@ -1,9 +1,14 @@
 
+import logging
 import mimetypes
 import re
 from pathlib import Path
+from uuid import uuid4
 
 from config import KNOWLEDGE_UPLOAD_MAX_MB
+
+
+logger = logging.getLogger(__name__)
 
 IMAGE_UPLOAD_TYPES = {
     "image/png": ".png",
@@ -74,6 +79,18 @@ def resolve_knowledge_upload_type(content_type: str | None, filename: str | None
 
 def knowledge_upload_too_large_message() -> str:
     return f"文件不能超过 {KNOWLEDGE_UPLOAD_MAX_MB}MB"
+
+
+def _internal_error_detail(user_message: str, scope: str, exc: Exception) -> str:
+    """内部异常只落服务端日志，回给用户的是固定文案 + 可与日志对照的编号。
+
+    异常原文（数据库/驱动报错、文件路径、上游服务地址）对用户没有价值，却能给后续
+    针对性攻击提供信息，因此一律不回显；排障靠这条 warning 的 exc_info 与用户报出的
+    error_id 对照。与 main.py 兜底 IntegrityError 的判据一致。
+    """
+    error_id = uuid4().hex[:8]
+    logger.warning("%s failed [error_id=%s]: %s", scope, error_id, exc, exc_info=True)
+    return f"{user_message}（错误编号：{error_id}）"
 
 
 def _normalize_content_type(content_type: str | None) -> str:
