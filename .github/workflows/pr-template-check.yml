@@ -25,10 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出 PR 合并结果（脚本兜底来源）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 检出 base 分支（校验脚本首选来源）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         # base 的提交可能已被 rebase / 回收而取不到；此时退回当前分支的脚本，不要因此把校验判红。
         continue-on-error: true
         with:

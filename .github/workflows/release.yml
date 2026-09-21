@@ -58,7 +58,7 @@ jobs:
           echo "版本号校验通过：$VERSION"
 
       - name: Checkout the source ref
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
           # 需要与 origin/main 做比较来生成变更分类，浅克隆取不到共同祖先。

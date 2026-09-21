@@ -46,7 +46,7 @@ jobs:
       SYNC_BRANCH: sync/main-into-develop
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # 需要一个带 origin 凭据的完整仓库：下面要把 main 的 tip 推到 bot 分支。
           # 取全量历史而不是浅克隆，避免推送对象是否齐备依赖浅克隆的边界行为。
