@@ -57,6 +57,7 @@ Current files:
 - `clipboard.test.js`
 - `detailPreview.test.js`
 - `fileListRequest.test.js`
+- `knowledgeCreateCallSiteMount.test.js`
 - `knowledgeCreateDialogStaleSubmitMount.test.js`
 - `knowledgeDeleteCallSiteMount.test.js`
 - `knowledgeFeedback.test.js`
