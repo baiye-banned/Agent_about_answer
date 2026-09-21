@@ -54,8 +54,8 @@ test('stripComments leaves no comment start marker behind', () => {
   for (const input of crafted) {
     const stripped = stripComments(input)
     assert.equal(stripped.includes(START), false, `消毒后仍有起始符：${JSON.stringify(stripped)}`)
-    // 只拔起始符可能让两侧重新拼出新的起始符，所以消毒必须跑到不动点。
-    assert.equal(stripComments(stripped), stripped, '消毒没有到不动点')
+    // 结果必须是稳定的：再消毒一次不该再变（判据不能在两次消毒之间漂移）。
+    assert.equal(stripComments(stripped), stripped, '再消毒一次结果又变了')
   }
 })
 
@@ -71,10 +71,25 @@ test('an unpaired comment start marker never deletes a section heading', () => {
   const stray = ISSUE_FIXTURE.split('\n').find((line) => line.includes(START) && !line.includes(END))
   assert.ok(stray, '夹具里应当有一行只含未闭合的起始符')
 
-  // 起始符在行首、结束符在很后面时，删掉整段就会连标题一起删，所以这条分支只拔起始符。
-  const lineStart = stripComments([START, '', '## 环境', '', '正文', '', END].join('\n'))
-  assert.equal(lineStart.includes(START), false)
-  assert.equal(lineStart.includes('## 环境'), true, '小节标题被删掉了')
+  // 行内起始符只要跨了空行或整行标题，渲染时 `<` 就是普通文本（后面的正文都看得见），
+  // 所以标记只被拔掉，标题一律留下。
+  for (const input of [
+    ['正文提到 ' + START, '', '## 环境', '', '正文', '', END].join('\n'),
+    ['正文提到 ' + START, '## 环境', '', '正文', '', END].join('\n'),
+  ]) {
+    const stripped = stripComments(input)
+    assert.equal(stripped.includes(START), false)
+    assert.equal(stripped.includes('## 环境'), true, '小节标题被删掉了')
+  }
+})
+
+test('a heading line inside a line-start comment is not a section heading', () => {
+  // 行首起始符是 HTML 块注释，块里的 `##` 行渲染时也不是标题，所以跟着注释一起删掉：
+  // 注释掉的标题既不该被当成真标题（否则正文里没写的小节也能通过校验），
+  // 也不该把所属小节截断（否则正常正文会被判成缺内容）。
+  const hidden = stripComments([START, '', '## 测试情况', '', END, '', '真实内容'].join('\n'))
+  assert.equal(hidden.includes('测试情况'), false, '注释掉的标题仍然留在正文里')
+  assert.equal(hidden.includes('真实内容'), true)
 })
 
 test('a real multi-line comment is still removed when a stray marker precedes it', () => {
@@ -125,16 +140,54 @@ test('check_pr_body.mjs rejects a section of one visible character plus a crafte
   }
 })
 
+test('text hidden inside a comment does not count as section content', () => {
+  // 起点只有 1 个可见字符，其余都在注释里——渲染出来根本看不见，不能算进长度判据。
+  const hiddenShapes = [
+    ['-', START, '', '隐藏内容 abcdefgh', END].join('\n'), // 行首起始符：整段注释删掉
+    '-' + START + '\n隐藏内容 abcdefgh\n' + END, // 行内起始符、同一段落里闭合：同样整段删掉
+  ]
+  for (const hidden of hiddenShapes) {
+    const { code, output } = runGate('check_pr_body.mjs', prBody(hidden))
+    assert.equal(code, 1, `注释里的内容被算成了正文：${output}`)
+    assert.match(output, /「变更内容」节内容过短/)
+  }
+
+  // 勾选项、关联 issue 的原因同理：藏在注释里的不算数。
+  const forgedCheckbox = runGate(
+    'check_pr_body.mjs',
+    prBody('把消毒改成单趟扫描。').replace('- [x] 🔧 其他', [START, '- [x] 🔧 其他', END].join('\n'))
+  )
+  assert.equal(forgedCheckbox.code, 1, forgedCheckbox.output)
+  assert.match(forgedCheckbox.output, /「类型」节未勾选任何一项/)
+})
+
+test('a commented-out heading neither forges nor splits a section', () => {
+  // 伪造：整节只有标题被写在注释里，正文里没有这一节。
+  const forged = runGate(
+    'check_pr_body.mjs',
+    prBody('把消毒改成单趟扫描。').replace(/^## 测试情况$/m, [START, '## 测试情况', END].join('\n'))
+  )
+  assert.equal(forged.code, 1, forged.output)
+  assert.match(forged.output, /缺少「测试情况」节/)
+
+  // 误伤：注释掉的同名标题不该把「变更内容」截断，让真实内容落到别处去。
+  const split = runGate(
+    'check_pr_body.mjs',
+    prBody([START, '## 变更内容', END, '', '真实可见内容 abcdef'].join('\n'))
+  )
+  assert.equal(split.code, 0, split.output)
+})
+
 test('comment markers inside a code fence are stripped by design, not by oversight', () => {
-  // scripts/lib/markdown_sanitize.mjs 顶部写明这是有意为之：不变式要求返回值里不残留起始符，
-  // 围着围栏开例外就等于给这条不变式开口子（方向偏严，不会放松判据）。这组用例把行为钉住，
-  // 免得以后有人把它当成 bug 顺手改掉——改之前请先读那段注释并同步这里。
-  const onlyComment = runGate('check_pr_body.mjs', prBody(['```', START + ' 说明 ' + END, '```'].join('\n')))
+  // scripts/lib/markdown_sanitize.mjs 顶部写明这是有意为之：不变式 1 要求返回值里不残留起始符，
+  // 围着围栏开例外就等于给这条不变式开口子（方向偏严，不会放松判据）。围栏里特意只留一段
+  // 带实质字符的注释：围栏一旦被当成例外，这里就会多出 3 个实质字符、由不通过变成通过。
+  const onlyComment = runGate('check_pr_body.mjs', prBody(['```', START + ' abc ' + END, '```'].join('\n')))
   assert.equal(onlyComment.code, 1, onlyComment.output)
 
   const commentPlusText = runGate(
     'check_pr_body.mjs',
-    prBody(['```', START + ' 说明 ' + END, '新增回归测试。', '```'].join('\n'))
+    prBody(['```', START + ' abc ' + END, '新增回归测试。', '```'].join('\n'))
   )
   assert.equal(commentPlusText.code, 0, commentPlusText.output)
 })

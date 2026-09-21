@@ -107,8 +107,9 @@ function usage(message) {
   process.exit(2);
 }
 
-// 注释消毒与字符计数都在 scripts/lib/markdown_sanitize.mjs：消毒要迭代到不动点，
-// 否则残留的起始符既能吃掉小节标题，又能把下面的长度判据骗过去（issue #97）。
+// 注释消毒与字符计数都在 scripts/lib/markdown_sanitize.mjs：消毒只删「渲染时真的看不见」
+// 的注释，其余起始符只拔掉标记本身，长度也只数实质字符——两个方向都不会被构造文本
+// 糊弄（issue #97）。
 const normalizeTitle = (text) =>
   text
     .toLowerCase()
