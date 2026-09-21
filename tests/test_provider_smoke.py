@@ -496,3 +496,31 @@ def test_smoke_script_live_without_credentials_reports_skips_not_passes():
     assert "5 checks: 0 passed, 5 skipped, 0 failed" in result.stdout
     assert "no check executed" in result.stdout
     assert "checks passed" not in result.stdout
+
+
+@pytest.mark.parametrize("abbreviation", ["--li", "--l"])
+def test_smoke_script_rejects_an_abbreviated_live_flag(abbreviation):
+    # issue #149: argparse used to accept `--li` as `--live` while the module-level scan that
+    # prepares the environment matched the flag literally, so the run printed the LIVE banner
+    # on top of the offline stub credentials and reported five provider failures that never
+    # touched a provider. The entry point must reject the spelling instead of running.
+    env = {key: value for key, value in os.environ.items() if not key.endswith("API_KEY")}
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "smoke_providers.py"), abbreviation],
+        cwd=str(ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    # argparse exits 2 on an argument it does not know; both readings of the flag agree
+    # because neither of them sees a live run.
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert abbreviation in result.stderr
+    assert "LIVE MODE" not in result.stdout
+    # Nothing may run at all: a check line would mean the offline stub environment decided
+    # the run while the banner said otherwise.
+    for marker in ("[PASS]", "[FAIL]", "[SKIP]", "offline-stub.invalid", "checks:"):
+        assert marker not in result.stdout

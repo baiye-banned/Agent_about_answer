@@ -9,6 +9,10 @@ a half-stubbed call can never carry a real key to the network.
 
 Pass ``--live`` to talk to the real endpoints. That requires configured credentials,
 consumes quota and reaches the internet, so it is never the default and prints a banner.
+The flag is matched literally and abbreviations are rejected (``--li`` exits 2): the
+module-level scan below reads ``sys.argv`` before argparse runs, so the two have to accept
+exactly the same spellings, or a run would announce live requests while its credentials and
+base URLs had already been rewritten to the offline stub.
 
 Checks: deepseek, embedding, rerank, rerank-fallback, text-fallback.
 
@@ -277,7 +281,14 @@ CHECKS = [
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    # allow_abbrev=False keeps this parser and the module-level `LIVE` scan above accepting
+    # the same spellings: an abbreviation such as `--li` must fail here (exit 2) rather than
+    # be accepted, because the environment was already prepared for the offline stub.
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
+    )
     parser.add_argument("--live", action="store_true", help="send real requests to the providers")
     args = parser.parse_args()
 
