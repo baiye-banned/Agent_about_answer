@@ -486,6 +486,45 @@ def test_foreign_object_key_is_never_signed_for_delete(api, oss_requests, caplog
     assert "finance-archive" not in response.text
 
 
+def test_guard_accepts_the_key_the_upload_path_actually_mints(api, monkeypatch, oss_requests):
+    """两端对齐：上传接口真铸出来的键必须过得了删除侧的护栏。
+
+    上面几条用的键是字面量（写得跟铸造结果一样），但字面量锁不住「铸造形态改了、护栏没跟」
+    这种漂移——那会让回收静默停止，而用例全绿。这条从真实上传接口取一个键（只把 OSS 出口
+    换成替身），再拿它走一遍删除链路，漂移就会在这里变红。
+    """
+    uploads = []
+
+    class _AsyncRecorder:
+        """`_put_oss_object` 的出口替身：只记请求，不联网。"""
+
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def put(self, url, content=None, headers=None, **_kwargs):
+            uploads.append(url)
+            return _FakeResponse(200)
+
+    monkeypatch.setattr(oss_service.httpx, "AsyncClient", lambda **kwargs: _AsyncRecorder(**kwargs))
+
+    response = api.client.post("/api/chat/attachments", files={"file": ("a.png", PNG_BYTES, "image/png")})
+
+    assert response.status_code == 200
+    minted_key = response.json()["object_key"]
+    # 确实走的是真实铸造代码，而不是被替身整个换掉的一段。
+    assert uploads == [f"https://{OSS_HOST}/{minted_key}"]
+
+    _add_conversation(api, "c-minted", [_attachments_column(minted_key)])
+    assert api.client.delete("/api/chat/conversations/c-minted").status_code == 200
+    assert oss_requests.deleted_urls() == [f"https://{OSS_HOST}/{minted_key}"]
+
+
 def test_foreign_object_key_is_not_stored_by_the_chat_route(api, monkeypatch, oss_requests):
     """端到端：客户端回带的外来键既不落库，也不会变成服务端签发的 DELETE。
 
