@@ -59,12 +59,36 @@ async function mountKnowledge({ world = createWorld(), remove } = {}) {
 
   const view = await mountSfc('views/Knowledge.vue', { modules: MODULES })
   await settle(view)
+  // 挂载期有两次 GET（知识库列表 + 文件列表）。等它们都落地再让调用方划水位线，
+  // 否则迟到的挂载请求会混进「点击之后发了什么」里。
+  await until(view, () => calls.filter((entry) => entry.method === 'get').length >= 2)
   return view
 }
 
 // 删除链路的 await 层数是「确认 -> 执行删除 -> 刷新 -> 取数 -> 响应」，
 // vueMount 默认的 3 轮不够深：浅了断言会看到「还没发生」的假绿（尤其是负向断言）。
-const settle = (view) => view.flush(8)
+//
+// 光加轮数不够，还得给真实时间：flush 的每一轮都是 microtask + setTimeout(0)，
+// 整段在快机器上几毫秒就跑完了，而 jsdom 的 requestAnimationFrame 约 16ms 才触发，
+// 被 rAF 推迟的那次更新（el-table 的勾选状态就在这条路径上）会整个错过。
+// 这个缺口的表现是**机器越快越容易红**：本地（慢）绿、CI（快）红，
+// 用 CPU 满载把本地压慢反而复现不出来。所以这里补一段跨得过 rAF 的真实时间。
+const settle = async (view) => {
+  await view.flush(8)
+  await new Promise((resolve) => setTimeout(resolve, 40))
+}
+
+// 等一个可观测条件成立，超时就把当前状态原样交给后面的断言去报。
+// 比定长 flush 可靠：条件什么时候成立由实现决定，不由轮数决定。
+async function until(view, predicate, budgetMs = 1000) {
+  const deadline = Date.now() + budgetMs
+  for (;;) {
+    if (predicate()) return true
+    if (Date.now() > deadline) return false
+    await view.flush(1)
+    await new Promise((resolve) => setTimeout(resolve, 2))
+  }
+}
 
 // 只看水位线之后的请求，形如 ['delete /knowledge/f1', 'get /knowledge-bases']。
 // 挂载本身会打两次 GET，不划水位线就分不清「刷新」与「启动」。
@@ -89,8 +113,21 @@ const ENTRIES = [
 
 async function hitEntry(view, entry) {
   if (entry.selectAll) {
-    view.queryAll('.el-checkbox__input')[0].click()
-    await settle(view)
+    // 表头全选框存在 = 文件列表已经从空态切到 el-table。点它之前先确认拿到的是
+    // 真元素，否则后面的失败会伪装成「删除请求数为 0」，看不出是勾选没生效。
+    const box = view.queryAll('.el-checkbox__input')[0]
+    assert.ok(box, '应当渲染出表头全选框')
+    box.click()
+
+    // 勾选要经 el-table 的 selection-change 回流到 selectedFiles 才会让按钮可用。
+    // 这一步单独断言：一旦它没生效，报的是「选中没生效」而不是「没有删除请求」——
+    // 后者会把人往短路/刷新的方向带偏（CI 上第一版就是这么红的）。
+    await until(view, () => view.buttonByText('删除选中').disabled === false)
+    assert.equal(
+      view.buttonByText('删除选中').disabled,
+      false,
+      '勾选全部资料后，批量删除按钮应当可用（否则后续「0 个删除请求」只是勾选没生效）'
+    )
   }
   const mark = calls.length
   view.buttonByText(entry.label).click()
