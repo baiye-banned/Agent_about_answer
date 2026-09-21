@@ -1,0 +1,87 @@
+# Dependabot 版本更新配置。
+#
+# 目标：让 npm / pip / GitHub Actions 三个生态的依赖过期与已知漏洞在仓库里可见、可处理。
+# 设计取舍：
+#   - 每个生态每周一次、统一在周一，避免每天开 PR 造成的评审噪音；
+#   - 按 semver 语义分组：minor + patch 合批（向后兼容，可整批过 CI 后合并），
+#     major 不分组、单独开 PR（可能破坏兼容，需要逐个判断）；
+#   - open-pull-requests-limit 兜底，单个生态同时最多开 5 个版本更新 PR；
+#   - 分组只作用于版本更新（applies-to: version-updates），安全更新仍逐个单独开 PR，
+#     保证漏洞修复能立刻被看见、快速合入，不被批次拖住；
+#   - commit-message 带 chore(deps) 前缀，使 PR 标题符合仓库的 Conventional Commits 门禁
+#     （否则 Dependabot 默认标题 “Bump x from a to b” 会被 PR 标题校验判红）。
+#
+# 注意：本文件只控制“版本更新”。安全告警与安全更新由仓库 Security 设置控制，不依赖本文件。
+version: 2
+updates:
+  # 前端依赖：package.json / package-lock.json 位于仓库根目录。
+  - package-ecosystem: npm
+    directory: "/"
+    target-branch: develop
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    labels:
+      - dependencies
+    groups:
+      npm-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # 后端依赖：requirements.txt 位于 /backend。
+  - package-ecosystem: pip
+    directory: "/backend"
+    target-branch: develop
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    labels:
+      - dependencies
+    groups:
+      pip-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # CI 依赖：.github/workflows/ 下各 action 的 uses 引用。
+  - package-ecosystem: github-actions
+    directory: "/"
+    target-branch: develop
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    labels:
+      - dependencies
+    groups:
+      actions-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
