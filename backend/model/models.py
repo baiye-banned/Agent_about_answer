@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 
 from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.mysql import LONGTEXT
@@ -92,6 +93,23 @@ class KnowledgeFile(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     knowledge_base = relationship("KnowledgeBase", back_populates="files")
+
+
+class ChatAttachmentUpload(Base):
+    """上传接口铸出的对象键的登记行：发送成功即被消费，超期未消费的由清扫任务回收。
+
+    这张表同时是「桶里有、库里没有」的对账入口——issue #142 里完全缺失的那块：上传只把
+    对象写进 OSS 就返回键，未发送的对象不在任何消息里，没有任何路径能看见它。
+    """
+
+    __tablename__ = "chat_attachment_uploads"
+
+    # 键的形态由 oss_service.SERVICE_MINTED_KEY_PATTERN 定死（约 90 个字符），255 是余量。
+    object_key = Column(String(255), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # 时间戳走应用时钟（而不是 server_default=func.now()）：清扫任务按 Python 的
+    # datetime.now() 算保留窗口，两边同一个时钟才能让「超过 TTL」这个判据可预期。
+    created_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
 
 
 class ChatTraceSession(Base):

@@ -174,6 +174,19 @@ OSS_ACCESS_KEY_SECRET = os.getenv("oss_access_key_secret") or os.getenv("OSS_ACC
 OSS_BUCKET = os.getenv("oss_bucket") or os.getenv("OSS_BUCKET", "")
 OSS_ENDPOINT = os.getenv("oss_endpoint") or os.getenv("OSS_ENDPOINT", "")
 
+# 聊天附件回收（issue #142）。上传即登记一条「待确认」行，发送成功时与消息行**同一次提交**
+# 被消费；超过这个时长仍未被消费的登记行，由清扫任务实际删除对应对象。
+# 取 24 小时是为了让「挑好图先放在输入框里、过一会儿再发」远在窗口之内：清扫一旦提前动手，
+# 删掉的就是一条马上要发出去的消息所引用的对象，而对象存储没有回收站。
+CHAT_ATTACHMENT_PENDING_TTL_SECONDS = _env_int("CHAT_ATTACHMENT_PENDING_TTL_SECONDS", 24 * 60 * 60)
+# 单次清扫最多处理多少个对象。DELETE 是串行外呼、每个最坏要等到连接超时，不设上限时
+# 一次积压就能让清扫一直占着线程（清扫挂在后台线程上，但也该有明确的工作量上界）。
+CHAT_ATTACHMENT_SWEEP_BATCH_LIMIT = _env_int("CHAT_ATTACHMENT_SWEEP_BATCH_LIMIT", 200)
+# 两轮清扫之间的间隔。只在启动时扫一次是不够的：一个跑几个月不重启的进程永远等不到第二轮，
+# 孤儿会一直攒着，那正是 issue #142 要消灭的形态。默认 6 小时——回收是尽力而为的维护动作，
+# 迟一点没有正确性代价，而每轮都要串行外呼 OSS。
+CHAT_ATTACHMENT_SWEEP_INTERVAL_SECONDS = _env_int("CHAT_ATTACHMENT_SWEEP_INTERVAL_SECONDS", 6 * 60 * 60)
+
 # JWT
 # The literal below is a public placeholder shipped with the repository; anyone can
 # read it, so it must never be used as an actual HS256 signing key.

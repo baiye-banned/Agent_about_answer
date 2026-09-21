@@ -1,7 +1,8 @@
 
 import json
 import logging
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from typing import Annotated
 from uuid import uuid4
 
@@ -10,7 +11,12 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from database.checkpointer import delete_thread_checkpoints
-from config import MEMORY_WINDOW_TURNS
+from config import (
+    CHAT_ATTACHMENT_PENDING_TTL_SECONDS,
+    CHAT_ATTACHMENT_SWEEP_BATCH_LIMIT,
+    CHAT_ATTACHMENT_SWEEP_INTERVAL_SECONDS,
+    MEMORY_WINDOW_TURNS,
+)
 from crud import chat as crud_chat
 from database.session import SessionLocal, get_db
 from rag.learning_trace import TraceRecorder, compact_trace_reference
@@ -18,7 +24,13 @@ from model.models import Conversation, Message, User, _new_id
 from rag.ragas_eval import schedule_ragas_evaluation
 from schema.schemas import ChatRequest, RenameRequest
 from service.auth_service import decode_token, get_current_user
-from service.oss_service import _delete_oss_object, _public_oss_url, _put_oss_object, is_service_minted_key
+from service.oss_service import (
+    ForeignObjectKeyError,
+    _delete_oss_object,
+    _public_oss_url,
+    _put_oss_object,
+    is_service_minted_key,
+)
 from service.trace_service import _safe_trace_add, _safe_trace_attach, _safe_trace_finish, _trace_sse_payloads
 from service.utils_service import (
     CHAT_ATTACHMENT_MAX_BYTES,
@@ -48,6 +60,10 @@ ASSISTANT_SAVE_FAILED_MESSAGE = "保存回答失败"
 RAGAS_SCHEDULE_FAILED_MESSAGE = "RAGAS 评估调度失败"
 MEMORY_SUMMARY_SCHEDULE_FAILED_MESSAGE = "长期记忆压缩调度失败"
 OSS_UPLOAD_FAILED_MESSAGE = "图片上传失败，请稍后重试"
+
+# 保留窗口的下限（不可配置）：一次上传从登记到写对象只需要秒级，把窗口压到它之下就会让
+# 清扫去删一条正在写入的对象。见 reclaim_orphan_chat_attachments 的说明。
+CHAT_ATTACHMENT_MIN_PENDING_TTL_SECONDS = 60
 
 
 def _serialize_conversation(conv: Conversation, user_id: int) -> dict:
@@ -161,6 +177,146 @@ def _reclaim_chat_attachments(object_keys: list[str]) -> None:
             )
 
 
+def reclaim_orphan_chat_attachments(db: Session, *, now: datetime | None = None,
+                                    ttl_seconds: int | None = None,
+                                    batch_limit: int | None = None) -> dict:
+    """回收「上传了但从未被发送」的附件对象，返回这次的处置统计。
+
+    这是 issue #142 补的那条路径。删会话驱动的 `_reclaim_chat_attachments` 只看得见消息里
+    引用到的键，未发送的对象不在任何消息里，必须由**登记表**驱动：上传时先落一条「待确认」
+    行，发送成功时被消费掉，超过保留窗口还没被消费的才轮到删对象。
+
+    四条顺序/边界，每条都对应一种不可逆的损失：
+
+    ① **逐行「先领行、再删对象」**，而不是按一份先前的快照直接动手。发送侧的消费与清扫侧的
+       领取是同一行的条件删除，数据库保证只有一个能赢；领不到就跳过，不去碰对象——否则
+       「清扫取到候选之后、动手之前用户正好发送成功」会删掉一条已落库消息引用的对象。
+       领行把这条判定从「整批一份快照」收窄到「每个对象各判一次」，窗口从分钟级降到一次
+       外呼的时间。
+    ② **删对象失败时把领走的行按原时间戳放回**（`restore_attachment_upload`）。不留回队列
+       的话，这个对象就再没有任何线索了——既不在消息里、也不在登记表里，等于回到 #142。
+       代价是这次删除没有生效，下一轮重扫再试，方向是「宁可多留一轮，不可删错」。
+    ③ **删除前仍然过一遍铸造形态护栏**（`_delete_oss_object` 自己会拒）。登记行是服务端
+       写的、理论上只可能是本服务铸的键，但这里是全仓唯一一处用服务端凭据签 DELETE 的
+       地方，护栏必须在下手那一刻再判一次：`rag-chat/.../../../finance-archive/x` 这种键会
+       被 httpx 规范化成桶里另一个对象的 URL。判不出来的行（`ForeignObjectKeyError`）永远
+       签不出 DELETE，留着只会每轮重复告警、白占批次名额，因此丢弃并留一条可按对象对账的
+       warning。
+    ④ **失败只记 warning、不上抛**。单对象删不掉（403/网络）时其余对象照删，失败的那行
+       放回队列留给下一轮。`_ensure_oss_config` 抛的 HTTPException 也走这条：一次没配 OSS
+       的进程不该把登记行清空。
+    """
+    ttl = CHAT_ATTACHMENT_PENDING_TTL_SECONDS if ttl_seconds is None else ttl_seconds
+    # 保留窗口的下限：TTL 配成 0（或负数）时窗口会退化成「比此刻更早的都算超期」，那会把
+    # 一条**上传请求自己刚登记、对象还在写**的行也扫进来，删完留下一个桶里有、库里没有的
+    # 对象——正是 #142 的形态，而且是这次修复自己造出来的。一分钟远大于一次上传的耗时。
+    ttl = max(CHAT_ATTACHMENT_MIN_PENDING_TTL_SECONDS, ttl)
+    limit = CHAT_ATTACHMENT_SWEEP_BATCH_LIMIT if batch_limit is None else batch_limit
+    cutoff = (now or datetime.now()) - timedelta(seconds=ttl)
+
+    # 先把候选键取成普通字符串列表，之后每处理一行都要提交：会话是 expire_on_commit=True 的，
+    # 留着 ORM 行对象会在下一次读属性时触发刷新，而并发的另一条清扫可能已经把那一行删掉了，
+    # 刷新会抛 ObjectDeletedError 把整批打断——后面的候选一个都处理不到。
+    candidates = [
+        row.object_key
+        for row in crud_chat.list_pending_attachment_uploads(db, older_than=cutoff, limit=limit)
+    ]
+    reclaimed = 0
+    failed = 0
+    unclaimable = 0
+    skipped = 0
+    for object_key in candidates:
+        claimed = crud_chat.claim_attachment_upload(db, object_key, cutoff)
+        if claimed is None:
+            # 已经被发送消费（或另一条清扫领走）：这个对象已经归别人管，绝不能删。
+            skipped += 1
+            continue
+        try:
+            _delete_oss_object(object_key)
+        except ForeignObjectKeyError as exc:
+            logger.warning(
+                "chat attachment orphan sweep: refusing to delete an object key this service "
+                "never minted, dropping the pending row: object_key=%s error=%s",
+                object_key,
+                exc,
+            )
+            unclaimable += 1
+            continue
+        except Exception as exc:
+            logger.warning(
+                "chat attachment orphan reclaim failed, putting the pending row back for the "
+                "next sweep: object_key=%s error=%s",
+                object_key,
+                exc,
+                exc_info=exc,
+            )
+            crud_chat.restore_attachment_upload(db, **claimed)
+            failed += 1
+            continue
+        reclaimed += 1
+
+    return {"candidates": len(candidates), "reclaimed": reclaimed, "failed": failed,
+            "unclaimable": unclaimable, "skipped": skipped}
+
+
+def run_orphan_attachment_sweep() -> dict | None:
+    """后台/启动期入口：自己开会话、自己吞异常，绝不把失败带回调用方。
+
+    跑在启动路径或守护线程上，抛出去只会变成一个没人接的栈：清扫是尽力而为的维护动作，
+    漏扫一轮的代价是对象多留一会儿，而启动失败是服务起不来。
+    """
+    db = SessionLocal()
+    try:
+        report = reclaim_orphan_chat_attachments(db)
+        if report["candidates"]:
+            logger.info(
+                "chat attachment orphan sweep: candidates=%d reclaimed=%d failed=%d "
+                "unclaimable=%d skipped=%d",
+                report["candidates"], report["reclaimed"], report["failed"],
+                report["unclaimable"], report["skipped"],
+            )
+        return report
+    except Exception as exc:
+        logger.warning("chat attachment orphan sweep failed: %s", exc, exc_info=exc)
+        return None
+    finally:
+        db.close()
+
+
+def sweep_orphan_attachments_forever(stop: threading.Event, interval_seconds: float) -> None:
+    """先扫一轮，之后每 interval_seconds 再扫一轮，直到 stop 被置位。
+
+    **首轮跑在循环里**（而不是只在启动时扫一次）是必须的：只扫启动那一轮时，一个跑几个月
+    不重启的进程永远等不到下一轮，用户上传后不发送的对象会一直攒在桶里——那正是 issue #142
+    要消灭的形态，不能因为「服务一直没重启」就复活。
+    """
+    while True:
+        run_orphan_attachment_sweep()
+        if stop.wait(interval_seconds):
+            return
+
+
+def schedule_orphan_attachment_sweep(interval_seconds: float | None = None,
+                                     stop_event: threading.Event | None = None) -> threading.Thread:
+    """把清扫循环挂到后台守护线程上，返回该线程（不阻塞启动）。
+
+    不进启动路径同步跑：DELETE 是串行外呼、单个最坏要等到连接超时，积压一批就能把就绪
+    时间拖成分钟级。守护线程是为了不在进程退出时被它挂住——清扫随时可以中断，重跑幂等。
+    多个 worker 各自起一条也无妨：领行是条件删除、对象删除幂等，两条清扫不会互相删错。
+
+    stop_event 只给用例用（跑完把线程停干净）；生产路径不传，循环随守护线程一起结束。
+    """
+    interval = CHAT_ATTACHMENT_SWEEP_INTERVAL_SECONDS if interval_seconds is None else interval_seconds
+    thread = threading.Thread(
+        target=sweep_orphan_attachments_forever,
+        args=(stop_event or threading.Event(), max(1.0, interval)),
+        name="chat-attachment-sweep",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def delete_conversation(cid: str, user: User = Depends(get_current_user),
                         db: Session = Depends(get_db)):
     # 对象键必须在删行之前取：messages 随会话级联删除，删完就再也读不到引用了哪些对象。
@@ -214,7 +370,8 @@ def _attach_grounding_trace(
 
 
 async def upload_chat_attachment(file: UploadFile = File(...),
-                                 _user: User = Depends(get_current_user)):
+                                 user: User = Depends(get_current_user),
+                                 db: Session = Depends(get_db)):
     image_type = resolve_image_upload_type(
         file.content_type,
         file.filename,
@@ -229,9 +386,21 @@ async def upload_chat_attachment(file: UploadFile = File(...),
         raise HTTPException(400, "图片不能超过 5MB")
 
     object_key = f"rag-chat/{datetime.now().strftime('%Y/%m/%d')}/{uuid4().hex}{ext}"
+    # 先落库、后写对象（issue #142）：顺序反过来时，一次「对象已经进桶、进程随即退出」就
+    # 留下一个库里没有任何痕迹的对象，既无法对账也没有任何回收入口能看见它——而它的 ACL
+    # 是 public-read。先登记之后，写失败最坏只是一条指向不存在对象的行，清扫任务顺手抹掉。
+    #
+    # 写失败时**不删**这条登记行：PUT 超时的那个分支里，服务端并不知道对象到底有没有落桶，
+    # 留着才能让清扫任务去重试删除；顺手删行等于把「桶里可能有这个对象」的唯一线索丢掉。
+    crud_chat.register_attachment_upload(db, object_key, user.id)
     try:
         await _put_oss_object(object_key, content, content_type)
     except Exception as exc:
+        logger.warning(
+            "chat attachment object write failed, pending row kept for the sweep: object_key=%s",
+            object_key,
+            exc_info=exc,
+        )
         raise HTTPException(500, _internal_error_detail(OSS_UPLOAD_FAILED_MESSAGE, "oss_upload", exc))
 
     return {
@@ -371,13 +540,24 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
         trace.attach(conversation_id=cid)
 
         # save user message
+        accepted_attachments = _service_minted_attachments(body.attachments, cid)
         user_message = Message(
             conversation_id=cid,
             role="user",
             content=display_question,
-            attachments=json.dumps(_service_minted_attachments(body.attachments, cid), ensure_ascii=False),
+            attachments=json.dumps(accepted_attachments, ensure_ascii=False),
         )
         db.add(user_message)
+        # 附件从「待确认」转为「正式引用」：这次消费必须与消息行同一次提交。两者分开时，
+        # 「消息已落库、登记行还在」的中间态会让清扫任务把这条活消息引用的对象当成孤儿
+        # 删掉（对象存储没有回收站），反过来则是消息没落库却把对象永久钉在登记表里。
+        # 早于本次修复就存在的键没有登记行，消费不到是正常的——它们由消息驱动那条既有的
+        # 回收路径负责，与这里无关。
+        crud_chat.confirm_attachment_uploads(
+            db,
+            [item.get("object_key") for item in accepted_attachments],
+            user.id,
+        )
         db.commit()
         db.refresh(user_message)
         trace.add(
