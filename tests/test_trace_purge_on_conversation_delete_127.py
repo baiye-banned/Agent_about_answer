@@ -34,6 +34,7 @@ from database.session import Base
 from model.models import ChatTraceSession, Conversation, KnowledgeBase, Message, User
 from rag.learning_trace import TraceRecorder
 from router import chat as chat_router
+from router import checkpointer as checkpointer_router
 from service import auth_service
 
 
@@ -44,10 +45,10 @@ def _compile_longtext_as_text(_type, _compiler, **_kwargs):
 
 
 CONVERSATION_ID = "conv-127"
-OTHER_CONVERSATION_ID = "conv-127-other"
+OTHER_CONVERSATION_ID = "conv-other-127"
 TRACE_ID = "trace-127"
-OTHER_TRACE_ID = "trace-127-other"
-ORPHAN_TRACE_ID = "trace-127-orphan"
+OTHER_TRACE_ID = "trace-other-127"
+ORPHAN_TRACE_ID = "trace-orphan-127"
 # 提问原文：轨迹里落库的就是这种不该在会话删除后还留下的内容。
 QUESTION = "2026 年差旅报销标准与住宿上限分别是多少？"
 OTHER_QUESTION = "另一个会话的问题，删别的会话时不该被波及。"
@@ -150,6 +151,7 @@ def api(monkeypatch, tmp_path):
 
     app = FastAPI()
     app.include_router(chat_router.router)
+    app.include_router(checkpointer_router.router)
     app.dependency_overrides[db_session.get_db] = lambda: db
     app.dependency_overrides[auth_service.get_current_user] = lambda: alice
 
@@ -161,6 +163,7 @@ def api(monkeypatch, tmp_path):
             bob=bob,
             user_message_id=user_message.id,
             assistant_message_id=assistant_message.id,
+            other_message_id=other_message.id,
         )
     finally:
         db.close()
@@ -195,7 +198,7 @@ def test_trace_written_by_real_recorder_is_purged_with_conversation(api):
     上一条用例直接 INSERT 出行，这里改用真实的 TraceRecorder（只固定 trace_id 以拿到句柄，
     不跑模型调用），避免「夹具造的行形状与生产写入不一致」造成的假绿。
     """
-    trace_id = "trace-127-recorder"
+    trace_id = "trace-recorder-127"
     recorder = TraceRecorder(user_id=api.alice.id)
     recorder.trace_id = trace_id
     recorder.attach(conversation_id=CONVERSATION_ID)
@@ -248,6 +251,38 @@ def test_message_trace_endpoint_does_not_serve_trace_of_deleted_conversation(api
             f"消息已随会话级联删除，该路径仍返回内容：{response.status_code} {response.text}"
         )
         assert QUESTION not in response.text
+
+
+def test_no_read_endpoint_serves_deleted_conversation_content(api):
+    """对抗面穷举：删除会话后把所有相关读取入口扫一遍，任何一处都不能再吐回原文。
+
+    覆盖前端实际调用的两条轨迹入口，加上会话列表、消息历史与 checkpointer 线程列表——
+    「删会话」这条链路要一起清掉的东西都要扫到。最后一条断言是**阳性对照**：另一个会话的
+    内容必须照常读得到，否则「全都 404」也能让本用例通过。
+    """
+    _delete_conversation(api)
+
+    must_404 = [
+        f"/api/chat/traces/{TRACE_ID}",
+        f"/api/chat/messages/{api.assistant_message_id}/trace",
+        f"/api/chat/conversations/{CONVERSATION_ID}",
+    ]
+    for path in must_404:
+        response = api.client.get(path)
+        assert response.status_code == 404, f"{path} 期望 404，实际 {response.status_code}"
+        assert QUESTION not in response.text, f"{path} 仍能读出已删会话的提问原文"
+
+    # 列表类入口返回 200，这里断言的是「内容不在响应里」。
+    for path in ("/api/chat/conversations", "/api/checkpointer/threads"):
+        response = api.client.get(path)
+        assert response.status_code == 200, f"{path} 期望 200，实际 {response.status_code}"
+        assert QUESTION not in response.text, f"{path} 仍能读出已删会话的提问原文"
+        assert CONVERSATION_ID not in response.text, f"{path} 仍暴露已删会话的 id"
+
+    # 阳性对照：没被删的会话照常可读，证明上面的断言不是「整个读取面都读不到」。
+    survivor = api.client.get(f"/api/chat/conversations/{OTHER_CONVERSATION_ID}")
+    assert survivor.status_code == 200, survivor.text
+    assert OTHER_QUESTION in survivor.text, "阳性对照失败：幸存会话的内容也读不到了"
 
 
 def test_trace_endpoint_hides_trace_orphaned_before_this_fix(api):
