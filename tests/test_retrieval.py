@@ -3,6 +3,7 @@ import threading
 import time
 
 import pytest
+from sqlalchemy.sql import operators
 
 from rag import retrieval
 
@@ -431,31 +432,73 @@ def test_rrf_fuse_skips_non_dict_chunks():
 
 
 class _FakeFileQuery:
-    def __init__(self, files):
-        self.files = files
+    """只实现 keyword_recall 用到的那部分查询：列投影、filter/order_by/limit 和 all()。
 
-    def filter_by(self, **_kwargs):
+    issue #59 之后取数层改成「按主键游标分批 + 带 LIMIT」，条件里既有等值也有 ``id >``，
+    所以这里真的按条件过滤并切片，避免 fake 比真实查询宽松（宽松会让分页死循环）。
+    """
+
+    def __init__(self, files, columns):
+        self._files = list(files)
+        self._columns = columns or (retrieval.KnowledgeFile.id, retrieval.KnowledgeFile.name, retrieval.KnowledgeFile.content)
+        self._criteria = []
+        self._limit = None
+
+    def filter(self, *criteria):
+        self._criteria.extend(criteria)
+        return self
+
+    def order_by(self, *columns):
+        keys = [column.key for column in columns]
+        self._files.sort(key=lambda item: tuple(getattr(item, key) for key in keys))
+        return self
+
+    def limit(self, count):
+        self._limit = count
         return self
 
     def all(self):
-        return self.files
+        rows = [item for item in self._files if all(_matches_file(item, criterion) for criterion in self._criteria)]
+        if self._limit is not None:
+            rows = rows[: self._limit]
+        return [tuple(getattr(item, column.key) for column in self._columns) for item in rows]
+
+
+def _matches_file(file, criterion):
+    """只判定 ``列 == 值`` / ``列 > 值``（分页游标必须生效，否则会一直取到同一批）。
+
+    LIKE 预筛等表达式在这里按「一律通过」处理：这个 fake 只关心「给一批文件，召回结果
+    是什么」；SQL 谓词本身（预筛、知识库归属、LIMIT）由 tests/test_retrieval_acceptance.py
+    的真实 SQLite 数据库和 test_keyword_recall_memory_59.py 的语句断言覆盖。
+    """
+    left = getattr(criterion, "left", None)
+    if left is None or not hasattr(left, "key"):
+        return True
+    value = getattr(file, left.key)
+    expected = getattr(criterion.right, "value", criterion.right)
+    if criterion.operator is operators.eq:
+        return value == expected
+    if criterion.operator is operators.gt:
+        return value > expected
+    return True
 
 
 class _FakeFileDb:
-    """keyword_recall 只需要 db.query(KnowledgeFile).filter_by(...).all()。"""
+    """keyword_recall 只需要 db.query(KnowledgeFile.id, .name, .content) + 分批查询。"""
 
     def __init__(self, files):
         self.files = files
 
-    def query(self, _model):
-        return _FakeFileQuery(self.files)
+    def query(self, *columns):
+        return _FakeFileQuery(self.files, columns)
 
 
 class _FakeKnowledgeFile:
-    def __init__(self, file_id, name, content):
+    def __init__(self, file_id, name, content, knowledge_base_id=1):
         self.id = file_id
         self.name = name
         self.content = content
+        self.knowledge_base_id = knowledge_base_id
 
 
 def test_keyword_recall_drops_window_that_misses_the_query(monkeypatch):
