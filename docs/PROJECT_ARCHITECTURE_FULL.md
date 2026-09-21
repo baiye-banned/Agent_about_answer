@@ -64,8 +64,8 @@ flowchart LR
 
   subgraph External["外部服务"]
     direction TB
-    DeepSeek["DeepSeek<br/>chat completions / rerank / JSON plan"]
-    DashScope["DashScope<br/>text-embedding-v4"]
+    DeepSeek["DeepSeek<br/>chat completions / JSON plan"]
+    DashScope["DashScope<br/>text-embedding-v4 / qwen3-rerank"]
     OSS["Aliyun OSS<br/>头像 / 图片附件"]
   end
 
@@ -79,7 +79,8 @@ flowchart LR
   KnowledgeSvc --> MilvusClient
   Retrieval --> Milvus
   Retrieval --> DeepSeek
-  RerankSvc --> DeepSeek
+  RerankSvc -->|"qwen3-rerank"| DashScope
+  RerankSvc -.->|"RERANK_LLM_FALLBACK_ENABLED=true（默认 true，无需手动开启）且主链路异常"| DeepSeek
   MilvusClient --> DashScope
   ChatSvc --> OSS
   VisionSvc --> OSS
@@ -178,7 +179,7 @@ flowchart LR
     Milvus["Milvus / Milvus Lite"]
     OSS["OSS"]
     DeepSeek["DeepSeek"]
-    DashScope["DashScope embeddings"]
+    DashScope["DashScope embeddings / qwen3-rerank"]
     SQLite["SQLite checkpointer.db"]
   end
 
@@ -193,6 +194,8 @@ flowchart LR
   KnowledgeSvc --> DB
   Retrieval --> MilvusClient
   Retrieval --> RerankSvc
+  RerankSvc -->|"qwen3-rerank"| DashScope
+  RerankSvc -.->|"RERANK_LLM_FALLBACK_ENABLED=true（默认 true，无需手动开启）且主链路异常"| DeepSeek
   Chat --> Trace
   Chat --> Ragas
   Chat --> DB
@@ -384,8 +387,9 @@ flowchart LR
 | 前端 | `VITE_API_BASE_URL` | 前端请求后端 API 的基础路径 |
 | MySQL | `MYSQL_USER / MYSQL_PASSWORD / MYSQL_HOST / MYSQL_PORT / MYSQL_DATABASE` | 业务主库 |
 | Milvus | `MILVUS_URI / MILVUS_LITE_URI / MILVUS_COLLECTION_NAME` | 向量库连接与集合 |
-| DeepSeek | `DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL` | 规划、重排、回答生成 |
+| DeepSeek | `DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL` | 规划、回答生成，以及 rerank 异常时的条件性回退 |
 | Embedding | `EMBEDDING_BASE_URL / EMBEDDING_API_KEY / EMBEDDING_MODEL / EMBEDDING_DIM` | DashScope 向量化 |
+| Rerank | `RERANK_PROVIDER / RERANK_MODEL / RERANK_BASE_URL / RERANK_API_KEY / RERANK_TIMEOUT_SECONDS / RERANK_LLM_FALLBACK_ENABLED` | DashScope `qwen3-rerank` 重排主链路；开关为真（默认 `true`，`backend/config.py`）且主链路异常时才回退 DeepSeek |
 | RAGAS | `RAGAS_ENABLED / RAGAS_LLM_MODEL / RAGAS_TIMEOUT_SECONDS` 等 | 在线评估 |
 | OSS | `OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET / OSS_BUCKET / OSS_ENDPOINT` | 图片附件和头像 |
 | Trace | `LEARNING_TRACE_ENABLED / LEARNING_TRACE_MAX_TEXT_CHARS` | Chat 页面 Trace 回放 |
@@ -561,7 +565,7 @@ flowchart LR
 | `loading` / `uploading` / `uploadPercent` | `ref` | 页面加载与上传状态 |
 | `keyword` / `sortField` / `sortOrder` / `page` / `pageSize` | `ref` | 搜索和分页 |
 | `selectedFiles` | `ref` | 批量选择文件 |
-| `detailVisible` / `detailFile` / `detailContent` / `contentLoading` | `ref` | 文件详情抽屉/弹层 |
+| `detail` | `reactive` | 文件详情弹层状态（`src/utils/detailPreview.js` 的状态容器：`visible` / `file` / `content` / `loading` / `error`） |
 | `knowledgeBaseDialogVisible` / `knowledgeBaseSubmitting` / `knowledgeBaseDialogMode` | `ref` | 新建/重命名知识库弹层 |
 | `knowledgeBaseFormRef` / `knowledgeBaseInputRef` / `knowledgeBaseForm` | `ref/reactive` | 表单状态 |
 | `knowledgeStore` / `knowledgeBases` | store/computed | 知识库列表 |
@@ -577,7 +581,7 @@ flowchart LR
 | `handleUploadInputChange()` / `handleUpload()` / `openUploadDialog()` | 方法 | 文件上传 |
 | `confirmDelete()` / `confirmBatchDelete()` / `confirmCentered()` | 方法 | 删除确认弹窗 |
 | `refreshKnowledgeBaseAndFiles()` | 方法 | 同步刷新 |
-| `showDetail()` / `copyContent()` | 方法 | 查看文件详情与复制内容 |
+| `showDetail()` / `copyContent()` | 方法 | 查看文件详情与复制内容（`showDetail` 即 `createDetailPreview()` 的 `open`，请求序号守卫保证迟到的旧响应不改写正文；弹窗关闭时作废在飞请求） |
 | `getFileIcon()` / `getFileExt()` / `formatSize()` / `formatTime()` | 方法 | 文件显示辅助 |
 
 ### `src/views/UserProfile.vue`
@@ -632,6 +636,7 @@ flowchart LR
 | `VISION_BASE_URL` / `VISION_API_KEY` / `VISION_MODEL` / `VISION_OSS_URL_EXPIRES_SECONDS` | 常量 | 图片分析配置 |
 | `TEXT_FALLBACK_*` | 常量 | DeepSeek 不可用时的文本兜底 |
 | `EMBEDDING_*` | 常量 | DashScope 向量化配置 |
+| `RERANK_PROVIDER` / `RERANK_MODEL` / `RERANK_BASE_URL` / `RERANK_API_KEY` / `RERANK_TIMEOUT_SECONDS` / `RERANK_LLM_FALLBACK_ENABLED` | 常量 | DashScope reranker 配置与 DeepSeek fallback 开关 |
 | `RAGAS_*` | 常量 | 在线评估参数 |
 | `RETRIEVAL_ROUTE_TOP_K` / `RETRIEVAL_RERANK_TOP_N` | 常量 | 检索参数 |
 | `MEMORY_*` | 常量 | 会话记忆摘要参数 |

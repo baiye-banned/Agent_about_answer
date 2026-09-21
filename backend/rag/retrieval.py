@@ -15,7 +15,9 @@ from model.models import KnowledgeFile
 from rag.llm import call_chat_json, call_router_json
 from rag.milvus_client import EmbeddingBackendError, embedding_backend_status, query_vectors
 from rag.rerank import (
+    chunk_content_key,
     chunk_key,
+    chunk_scheme,
     rerank_chunks,
     select_final_chunks,
     trace_chunk,
@@ -630,6 +632,10 @@ def _collect_file_keyword_candidates_exact(
 
 def rrf_fuse(route_results: list[tuple[str, list[dict]]], k: int = 60) -> list[dict]:
     fused: dict[str, dict] = {}
+    # 两套分块方案给出同一段文本时（短文档整篇就是 offset=0 的那个关键字窗口）也要并成
+    # 一条：否则同一段文字会以两条候选的身份走到重排，白占一个重排名额与上下文配额，
+    # 「两条路由都召回了它」这个 RRF 信号也随之丢掉。
+    content_owner: dict[str, tuple[str, str]] = {}
     for route_entry in route_results:
         if not isinstance(route_entry, (list, tuple)) or len(route_entry) != 2:
             continue
@@ -640,7 +646,15 @@ def rrf_fuse(route_results: list[tuple[str, list[dict]]], k: int = 60) -> list[d
             if not isinstance(chunk, dict):
                 continue
             key = chunk_key(chunk)
+            scheme = chunk_scheme(chunk)
+            content = chunk_content_key(chunk)
+            if content:
+                owner = content_owner.get(content)
+                if owner is not None and owner[0] != scheme:
+                    key = owner[1]
             entry = fused.setdefault(key, {**chunk, "routes": [], "rrf_score": 0.0})
+            if content:
+                content_owner.setdefault(content, (scheme, key))
             entry["rrf_score"] += 1.0 / (k + rank)
             entry["routes"].append({"route": route, "rank": rank})
     return sorted(fused.values(), key=lambda item: item["rrf_score"], reverse=True)

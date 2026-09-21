@@ -126,7 +126,12 @@ def _delete_file_vectors_or_500(file_id: int, *, scope: str, detail: str) -> Non
 
 def list_knowledge_bases(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     rows = crud_knowledge_base.list_knowledge_bases(db, user.id)
-    return [crud_knowledge_base.serialize_knowledge_base(item) for item in rows]
+    # 文件数用一条 GROUP BY 聚合取回，避免逐库懒加载（那条语句会把 LONGTEXT content 整列读出来）。
+    file_counts = crud_knowledge_base.count_knowledge_files_by_base(db, [item.id for item in rows])
+    return [
+        crud_knowledge_base.serialize_knowledge_base(item, file_counts.get(item.id, 0))
+        for item in rows
+    ]
 
 
 def create_knowledge_base(body: KnowledgeBaseRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -143,7 +148,8 @@ def create_knowledge_base(body: KnowledgeBaseRequest, user: User = Depends(get_c
         db.rollback()
         logger.warning("Knowledge base create conflict: name=%s user_id=%s", name, user.id, exc_info=True)
         raise HTTPException(400, "知识库名称已存在")
-    return crud_knowledge_base.serialize_knowledge_base(entry)
+    # 刚落库的知识库名下不可能已有文件，直接给 0，省一次计数查询。
+    return crud_knowledge_base.serialize_knowledge_base(entry, 0)
 
 
 def rename_knowledge_base(kid: int, body: KnowledgeBaseRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -162,7 +168,7 @@ def rename_knowledge_base(kid: int, body: KnowledgeBaseRequest, user: User = Dep
         db.rollback()
         logger.warning("Knowledge base rename conflict: kid=%s name=%s user_id=%s", kid, name, user.id, exc_info=True)
         raise HTTPException(400, "知识库名称已存在")
-    return crud_knowledge_base.serialize_knowledge_base(entry)
+    return crud_knowledge_base.serialize_knowledge_base(entry, crud_knowledge_base.count_knowledge_files(db, kid))
 
 
 def delete_knowledge_base(kid: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
