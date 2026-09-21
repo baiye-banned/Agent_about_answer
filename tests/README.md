@@ -53,6 +53,7 @@ Current files:
 
 - `chatApi.test.js`
 - `chatStore.test.js`
+- `ciGateScripts.test.js`
 - `clipboard.test.js`
 - `detailPreview.test.js`
 - `knowledgeFeedback.test.js`
@@ -62,7 +63,7 @@ Current files:
 - `url.test.js`
 - `utils.test.js`
 
-These tests cover frontend stream parsing, stream response errors, chat store conversation switching, stale in-flight response handling and fallback reset events, knowledge file detail preview ordering (a late response from a previously opened file must not rewrite the current one, and closing the dialog discards in-flight requests), clipboard fallback behavior, knowledge batch delete and upload feedback helpers, the shared delete confirmation orchestration (user cancel, API rejection, and success outcomes), the upload-type whitelist staying in sync with the backend's accepted extensions (a static cross-check against `backend/service/utils_service.py`), HTML sanitization of rendered markdown (script/style/event-handler stripping, the element allowlist, and disallowed elements being dropped together with their content), URL normalization and link safety, display formatting, status helpers, image validation, and memory trace helpers.
+These tests cover frontend stream parsing, stream response errors, chat store conversation switching, stale in-flight response handling and fallback reset events, knowledge file detail preview ordering (a late response from a previously opened file must not rewrite the current one, and closing the dialog discards in-flight requests), clipboard fallback behavior, knowledge batch delete and upload feedback helpers, the shared delete confirmation orchestration (user cancel, API rejection, and success outcomes), the upload-type whitelist staying in sync with the backend's accepted extensions (a static cross-check against `backend/service/utils_service.py`), HTML sanitization of rendered markdown (script/style/event-handler stripping, the element allowlist, and disallowed elements being dropped together with their content), URL normalization and link safety, display formatting, status helpers, image validation, the CI gate scripts (`scripts/check_issue.mjs`, `scripts/check_pr_body.mjs` and their shared `scripts/lib/markdown_sanitize.mjs`: the comment sanitizer's invariants - no comment start marker left behind, no section heading deleted by an unpaired marker - plus both gates' pass/fail verdicts on the fixtures in `tests/fixtures/ci-gate/`, including the code-fence behaviour that is deliberate rather than an oversight), and memory trace helpers.
 
 ## Python Tests
 
