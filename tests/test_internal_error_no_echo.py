@@ -328,3 +328,133 @@ def test_parse_failure_still_logs_original_exception(monkeypatch, caplog):
 
     assert INTERNAL_ERROR_TEXT in caplog.text
     assert "docx_parse failed" in caplog.text
+
+
+# --- 同一通路（LLM / 检索）里其余的 str(exc) 出口 ---------------------------
+#
+# 这几处不在 issue 点名的 6 处坐标内，但写的是同一条学习轨迹 / 同一个 SSE 流：
+# `llm._trace_add()` 写的就是 `chat_service.stream_chat` 创建的那个 TraceRecorder，
+# 失败事件随后编成 SSE 帧推给浏览器；`generation_failed` 事件与 error 事件的 message
+# 更是被前端原样渲染（src/stores/chat.js 直接取 error.message）。
+# CodeQL 告警 #4 的污点汇点正是 `chat_service.py` 的 `StreamingResponse`，只修 6 处坐标
+# 不足以让该告警转为 fixed，所以这里按同一判据一并收敛。
+
+
+def _collect_llm_events(*args, **kwargs):
+    async def _run():
+        return [event async for event in llm.stream_answer_events(*args, **kwargs)]
+
+    return asyncio.run(_run())
+
+
+def _failing_stream(*, fail_on):
+    """_stream_model_chunks 替身：在第 fail_on 次调用（1=DeepSeek，2=后备）抛异常。"""
+    calls = {"count": 0}
+
+    async def fake_stream(model, messages):
+        calls["count"] += 1
+        if calls["count"] in fail_on:
+            raise RuntimeError(INTERNAL_ERROR_TEXT)
+        yield ""  # pragma: no cover - 本文件只走失败分支
+
+    return fake_stream
+
+
+def test_llm_generation_failure_trace_frame_hides_internal_error(monkeypatch, real_trace, caplog):
+    """DeepSeek 生成失败：轨迹帧里只给固定文案，原文进日志。"""
+    monkeypatch.setattr(llm, "_stream_model_chunks", _failing_stream(fail_on={1}))
+    monkeypatch.setattr(llm, "DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(llm, "TEXT_FALLBACK_ENABLED", False)
+
+    with caplog.at_level(logging.WARNING):
+        _collect_llm_events("问题", "上下文", "", learning_trace.TraceRecorder(user_id=1), use_rag=True)
+
+    result = _stage_result(real_trace.events, "langchain_generation_failed")
+    _assert_no_leak(str(result.get("error")), "langchain_generation_failed result")
+    assert result["error"] == llm.LLM_GENERATION_FAILED_MESSAGE
+    assert INTERNAL_ERROR_TEXT in caplog.text
+
+
+def test_llm_text_fallback_failure_hides_internal_error(monkeypatch, caplog):
+    """后备模型也失败：error 事件的 message（前端原样显示）不得含异常原文。"""
+    monkeypatch.setattr(llm, "_stream_model_chunks", _failing_stream(fail_on={1, 2}))
+    monkeypatch.setattr(llm, "DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(llm, "TEXT_FALLBACK_API_KEY", "sk-test")
+    monkeypatch.setattr(llm, "TEXT_FALLBACK_ENABLED", True)
+
+    with caplog.at_level(logging.WARNING):
+        events = _collect_llm_events("问题", "上下文", "", None, use_rag=True)
+
+    errors = [event for event in events if isinstance(event, dict) and event.get("type") == "error"]
+    assert errors, f"后备模型失败时应产出 error 事件：{events}"
+    for event in errors:
+        _assert_no_leak(str(event.get("message")), "SSE error 事件 message")
+    assert errors[0]["message"].startswith(llm.ANSWER_GENERATION_FAILED_MESSAGE)
+    # 原文仍可诊断：落日志，且与用户看到的编号对得上。
+    assert INTERNAL_ERROR_TEXT in caplog.text
+    error_id = errors[0]["message"].split("错误编号：", 1)[1].rstrip("）")
+    assert f"error_id={error_id}" in caplog.text
+
+
+def test_retrieval_router_failure_reason_hides_internal_error(monkeypatch, caplog):
+    """路由模型失败：reason 会进 SSE 轨迹帧与消息负载，不得含异常原文。"""
+    import rag.retrieval as retrieval
+
+    async def boom(_payload):
+        raise RuntimeError(INTERNAL_ERROR_TEXT)
+
+    monkeypatch.setattr(retrieval, "call_router_json", boom)
+
+    with caplog.at_level(logging.WARNING):
+        decision = asyncio.run(retrieval.decide_need_rag("问题"))
+
+    _assert_no_leak(str(decision.get("reason")), "rag_gate.reason")
+    assert INTERNAL_ERROR_TEXT in caplog.text
+
+
+def test_retrieval_query_plan_failure_hides_internal_error(monkeypatch, caplog):
+    """查询规划失败：query_plan 会进 SSE 轨迹帧与 retrieval_trace。"""
+    import rag.retrieval as retrieval
+
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError(INTERNAL_ERROR_TEXT)
+
+    monkeypatch.setattr(retrieval, "call_chat_json", boom)
+
+    with caplog.at_level(logging.WARNING):
+        plan = asyncio.run(retrieval.build_query_plan("问题"))
+
+    _assert_no_leak(str(plan.get("error")), "query_plan.error")
+    assert plan["error"], "失败标记必须保留，调用方靠它区分规划是否成功"
+    assert INTERNAL_ERROR_TEXT in caplog.text
+
+
+def test_memory_summary_update_failure_trace_hides_internal_error(monkeypatch, caplog):
+    """滑出窗口记忆更新失败：落库的轨迹事件会被回查给用户，不得含异常原文。"""
+    import rag.memory_service as memory_service
+
+    captured = []
+
+    class _BoomDb:
+        def query(self, *_args, **_kwargs):
+            raise RuntimeError(INTERNAL_ERROR_TEXT)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(memory_service, "SessionLocal", lambda: _BoomDb())
+    monkeypatch.setattr(
+        memory_service,
+        "append_trace_event",
+        lambda trace_id, stage, function, **kwargs: captured.append((stage, kwargs)),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(memory_service._update_memory_summary_from_sliding_window("conv-1", "trace-1"))
+
+    assert captured, "更新失败时必须留下轨迹事件"
+    stage, kwargs = captured[0]
+    assert stage == "memory_summary_update_failed"
+    _assert_no_leak(str(kwargs.get("result")), "memory_summary_update_failed result")
+    assert kwargs["result"]["error"] == memory_service.MEMORY_SUMMARY_UPDATE_FAILED_MESSAGE
+    assert INTERNAL_ERROR_TEXT in caplog.text

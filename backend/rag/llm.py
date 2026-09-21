@@ -14,9 +14,16 @@ from config import (
     TEXT_FALLBACK_ENABLED,
     TEXT_FALLBACK_MODEL,
 )
+from service.utils_service import _internal_error_detail
 
 
 logger = logging.getLogger(__name__)
+
+# 生成失败分支回给用户的固定文案：异常原文（上游地址、驱动报错、密钥配置）只进 logger。
+# 轨迹事件里的 error 同样是固定文案——它既编进 SSE 帧，也随 retrieval_trace 落库回查。
+LLM_GENERATION_FAILED_MESSAGE = "DeepSeek 生成失败"
+LLM_TEXT_FALLBACK_FAILED_MESSAGE = "文本后备模型生成失败"
+ANSWER_GENERATION_FAILED_MESSAGE = "回答生成失败，请稍后重试"
 
 
 def normalize_deepseek_model(model: str) -> str:
@@ -148,11 +155,12 @@ async def stream_answer_events(
             yield chunk
         return
     except Exception as exc:
+        logger.warning("DeepSeek stream generation failed: %s", exc, exc_info=True)
         _trace_add(
             trace,
             "langchain_generation_failed",
             "ChatOpenAI.astream",
-            result={"provider": "DeepSeek", "error": str(exc)},
+            result={"provider": "DeepSeek", "error": LLM_GENERATION_FAILED_MESSAGE},
             note="DeepSeek 流式生成失败；如果文本后备模型可用，LangChain 会切换到后备模型继续生成。",
         )
         if not TEXT_FALLBACK_ENABLED:
@@ -200,12 +208,14 @@ async def stream_answer_events(
             trace,
             "langchain_text_fallback_failed",
             "ChatOpenAI.astream",
-            result={"error": str(exc)},
+            result={"error": LLM_TEXT_FALLBACK_FAILED_MESSAGE},
             note="文本后备模型也生成失败，本轮回答返回错误事件。",
         )
+        # 这条 error 事件的 message 前端会原样显示（src/stores/chat.js 直接取 error.message），
+        # 因此只给固定文案 + 编号；原文由 _internal_error_detail 带 exc_info 落日志。
         yield {
             "type": "error",
-            "message": f"回答生成失败：{exc}",
+            "message": _internal_error_detail(ANSWER_GENERATION_FAILED_MESSAGE, "text_fallback", exc),
         }
 
 

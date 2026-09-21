@@ -44,7 +44,9 @@ async def decide_need_rag(
         data = await call_router_json(payload)
         return _normalize_decision(data)
     except Exception as exc:
-        return _fallback_decision(f"路由模型调用失败，保守进入 RAG：{exc}")
+        # reason 会进 SSE 轨迹帧、retrieval_trace 与消息负载，异常原文只落日志。
+        logger.warning("Route model call failed, falling back to RAG: %s", exc, exc_info=True)
+        return _fallback_decision("路由模型调用失败，保守进入 RAG。")
 
 
 async def build_query_plan(question: str) -> dict:
@@ -62,11 +64,13 @@ async def build_query_plan(question: str) -> dict:
     try:
         data = await call_chat_json(system_prompt, user_prompt)
     except Exception as exc:
+        # query_plan 会进 SSE 轨迹帧与 retrieval_trace；error 只作失败标记，不携带异常原文。
+        logger.warning("Query plan build failed: %s", exc, exc_info=True)
         return {
             "hyde_document": "",
             "rewrites": [],
             "keywords": _fallback_keywords(question),
-            "error": str(exc),
+            "error": "查询规划失败",
         }
     return {
         "hyde_document": str(data.get("hyde_document") or "").strip(),
