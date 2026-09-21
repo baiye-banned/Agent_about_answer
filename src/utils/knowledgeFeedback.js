@@ -68,16 +68,49 @@ export function describeDeleteRefreshFailure(error) {
   return `删除成功，但列表刷新失败：${getApiErrorMessage(error, DELETE_REFRESH_FAILED_HINT)}`
 }
 
-// 返回刷新是否成功，调用方一般不关心——存在的意义是保证「不抛出」：
-// 参数里传进来的是模板事件处理器，返回被拒 Promise 就是一条 unhandledrejection。
-export async function refreshAfterDelete({ refresh, notifyError }) {
+// 创建成功后的刷新出口（issue #157）。删除面那份收口当时只覆盖了删除的三条链，
+// 创建对话框的刷新仍是裸 await：它留在 `submitKnowledgeBaseDialog` 自己的 try 里，
+// 刷新一失败就被创建自己的 catch 接走、逐字弹「操作失败，请稍后重试」，而对话框还停在
+// 打开态 —— 后端已经建了库、store 里也已经是新知识库，两者互斥。用户照着重试必然撞上
+// 400「知识库已存在」：同一次操作给出两条互相矛盾的结论。
+export const CREATE_REFRESH_FAILED_HINT = '请手动刷新页面'
+
+// 与 describeDeleteRefreshFailure 同一条规则——先认下「创建成功」，再把刷新没跟上的
+// 责任单独说清。刷新失败不等于创建失败，不能让用户以为这个知识库没建出来、又去点一次创建。
+export function describeCreateRefreshFailure(error) {
+  return `知识库已创建，但列表刷新失败：${getApiErrorMessage(error, CREATE_REFRESH_FAILED_HINT)}`
+}
+
+// 刷新失败的处置在删除与创建两条链上完全一致（都不抛出、都交给调用方的 notifyError
+// 出口），只有文案里的操作名不同。收口的形态由这一份实现给出，两个具名出口各自绑定文案，
+// 免得两处各写一份 try/catch 后各自漂移 —— 创建面正是这么漂出来的（#157 与 #154 同族）。
+export async function refreshAfterMutation({ refresh, notifyError, describeFailure }) {
   try {
     await refresh()
     return true
   } catch (error) {
-    notifyError?.(describeDeleteRefreshFailure(error))
+    notifyError?.(describeFailure(error))
     return false
   }
+}
+
+// 返回刷新是否成功，调用方一般不关心——存在的意义是保证「不抛出」：
+// 参数里传进来的是模板事件处理器，返回被拒 Promise 就是一条 unhandledrejection。
+export async function refreshAfterDelete({ refresh, notifyError }) {
+  return refreshAfterMutation({
+    refresh,
+    notifyError,
+    describeFailure: describeDeleteRefreshFailure,
+  })
+}
+
+// 创建成功后的刷新出口，与删除侧同形：失败只报「列表刷新失败」，不回写创建失败态。
+export async function refreshAfterCreate({ refresh, notifyError }) {
+  return refreshAfterMutation({
+    refresh,
+    notifyError,
+    describeFailure: describeCreateRefreshFailure,
+  })
 }
 
 // 上传白名单：必须与 backend/service/utils_service.py 的 KNOWLEDGE_UPLOAD_TYPES 完全一致

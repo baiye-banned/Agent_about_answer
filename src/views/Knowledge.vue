@@ -254,6 +254,7 @@ import {
   describeUploadSuccess,
   hasDeletedAnyFile,
   partitionUploadFiles,
+  refreshAfterCreate,
   refreshAfterDelete,
   runConfirmedDelete,
   uploadFilesInOrder,
@@ -453,16 +454,30 @@ async function submitKnowledgeBaseDialog() {
       page.value = 1
       allFiles.value = []
       ElMessage.success('知识库已创建')
-      await refreshKnowledgeBasesPreserving(created)
-      await fetchFiles()
+      // 关窗上移到刷新之前：创建已经是既成事实，对话框的去留不该由随后那次副作用决定。
+      // 留在原来那个位置时（刷新之后），刷新一抛就跳去下面的 catch，这一行根本走不到 ——
+      // 对话框停在打开态，用户照着重试会撞上 400「知识库已存在」（issue #157）。
+      knowledgeBaseDialogVisible.value = false
+      // 侧栏与文件列表两步都留在同一个出口里，与删除路径的 refreshAfterDelete 同形：
+      // 侧栏那次由 refreshKnowledgeBasesPreserving 自己兜底，真正会抛的是文件列表这次，
+      // 失败只报「知识库已创建，但列表刷新失败」，不再被下面那个 catch 当成创建失败。
+      await refreshAfterCreate({
+        refresh: async () => {
+          await refreshKnowledgeBasesPreserving(created)
+          await fetchFiles()
+        },
+        notifyError: notifyCreateError,
+      })
     } else if (current) {
       const renamed = await knowledgeAPI.renameBase(current.id, name, { silent: true })
       knowledgeStore.upsertKnowledgeBase(renamed)
       ElMessage.success('知识库已重命名')
+      // 同样上移到刷新之前。重命名这条链的刷新只有 refreshKnowledgeBasesPreserving 一次，
+      // 它的取数失败在函数内部就被兜底（catch 里 upsert 回重命名后的对象），不往外抛，
+      // 所以这里没有创建链那种「刷新失败被当成操作失败」的可达路径。
+      knowledgeBaseDialogVisible.value = false
       await refreshKnowledgeBasesPreserving(renamed)
     }
-
-    knowledgeBaseDialogVisible.value = false
   } catch (error) {
     const message = getApiErrorMessage(error, '操作失败，请稍后重试')
     if (isDuplicateKnowledgeBaseError(error, message)) {
@@ -520,6 +535,12 @@ function resetKnowledgeBaseDialog() {
 
 // 三个删除入口的错误提示统一走这里，与上传路径的 ElMessage.error 保持同一形态。
 function notifyDeleteError(message) {
+  ElMessage.error(message)
+}
+
+// 创建路径的错误提示出口。刷新失败也走这里，但文案由 describeCreateRefreshFailure 给出，
+// 说的是「知识库已创建，但列表刷新失败」——上面那个 catch 只负责创建/重命名请求本身的失败。
+function notifyCreateError(message) {
   ElMessage.error(message)
 }
 
