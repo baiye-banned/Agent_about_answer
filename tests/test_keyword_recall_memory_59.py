@@ -319,6 +319,86 @@ def test_keyword_recall_matches_legacy_for_overlapping_and_repeated_keywords(tmp
         _assert_matches_legacy(db, keywords, 8)
 
 
+DOTTED_I_FILE = "İ" * 3 + "附" * 1394 + "abc"  # 长度 1400：窗口起点为 0 与 720
+SIGMA_BOUNDARY_FILE = "α" * 899 + "Σ" + "Α" * 50  # Σ 是窗口 0 的最后一个字符
+SIGMA_SPACED_FILE = "ΑΣ ΟΔΟΣ"  # Σ 后面紧跟空白
+
+
+def test_keyword_recall_matches_legacy_for_dotted_capital_i(tmp_path):
+    """İ（U+0130）是唯一一个 ``lower()`` 会变长的码位（1→2 字符）。
+
+    整篇归一化后文本变长，而窗口边界是按「非空白字符数」在原文上换算的：右边界整体
+    偏小，文件尾部「İ 的个数」个字符掉出所有窗口。旧实现逐窗口归一化，能召回它们。
+    """
+    _, db = _new_db(tmp_path)
+    _add_files(db, [("土耳其语.txt", DOTTED_I_FILE)])
+
+    chunks = _assert_matches_legacy(db, ["abc"], 8)
+
+    assert [chunk["chunk_id"] for chunk in chunks] == ["720"]
+
+
+def test_keyword_recall_matches_legacy_for_greek_sigma(tmp_path):
+    """Σ（U+03A3）是唯一一个 ``lower()`` 依赖上下文的码位：词尾折成 ς、其余折成 σ。
+
+    整篇归一化拿到的是全文上下文，窗口切片拿到的是窗口内上下文，两者在窗口边界处
+    分叉；「先去空白再 lower」还会在空白前后分叉（``'ΑΣ ΟΔΟΣ'`` 该折出 ς 而不是 σ）。
+    """
+    _, db = _new_db(tmp_path)
+    _add_files(db, [("边界.txt", SIGMA_BOUNDARY_FILE), ("空格.txt", SIGMA_SPACED_FILE)])
+
+    # 窗口 0 的最后一个字符是 Σ：窗口内它在词尾（→ ς），全文里它后面跟着 Α（→ σ）。
+    chunks = _assert_matches_legacy(db, ["ας", "ασ"], 8)
+    assert [(chunk["file_name"], chunk["chunk_id"], chunk["matched_keywords"]) for chunk in chunks] == [
+        ("边界.txt", "0", ["ας"]),
+        ("边界.txt", "720", ["ασ"]),
+        ("空格.txt", "0", ["ας"]),
+    ]
+
+    # 只有按旧实现的口径（先 lower、再去空白）才折得出 ς。
+    chunks = _assert_matches_legacy(db, ["ας"], 8)
+    assert [chunk["file_name"] for chunk in chunks] == ["空格.txt"]
+
+
+def _fold_divergent_corpus():
+    rng = random.Random(59)
+    words = [
+        "İzin", "izin", "Işık", "ısrar", "İŞLEM", "talep",
+        "ΑΣ", "ΑΣΑ", "ασ", "ας", "ΟΔΟΣ", "οδος",
+        "ПРИВЕТ", "привет", "ДОКУМЕНТ", "документ",
+        "Leave", "leave", "LEAVE", "迟到", "旷工",
+    ]
+    spacers = ["", " ", "\n", "\t", "　"]
+    documents = []
+    for index in range(4):
+        pieces = []
+        for _ in range(120):
+            pieces.append(rng.choice(words))
+            pieces.append(rng.choice(spacers))
+        documents.append((f"折叠{index}.txt", "".join(pieces)))
+    return documents
+
+
+def test_keyword_recall_matches_legacy_on_randomized_fold_divergent_corpus(tmp_path):
+    """把 İ/Σ/西里尔/拉丁/中文混在一份语料里随机差分（种子固定，可复现）。"""
+    _, db = _new_db(tmp_path)
+    _add_files(db, _fold_divergent_corpus())
+
+    for keywords in [
+        ["İzin"],
+        ["izin"],
+        ["ısr"],
+        ["ασ"],
+        ["ας"],
+        ["ΟΔΟΣ"],
+        ["привет"],
+        ["ПРИВЕТ"],
+        ["leave"],
+        ["İzin", "ας", "迟到"],
+    ]:
+        _assert_matches_legacy(db, keywords, 8)
+
+
 def test_keyword_recall_matches_legacy_across_window_boundaries(tmp_path):
     _, db = _new_db(tmp_path)
     filler = "本制度由行政部负责解释。"
@@ -422,6 +502,111 @@ def test_keyword_recall_fetch_layer_loads_only_matching_content(tmp_path):
 
     assert [name for _, name, _ in rows] == ["命中.txt", "命中2.txt"]
     assert sum(len(content) for _, _, content in rows) < 1000
+
+
+PREFILTER_CORPUS = [
+    ("感叹号.txt", "注意 !a 规则"),  # ! 是 LIKE 的转义符本身
+    ("百分号.txt", "报销比例 100% 以内"),
+    ("数字.txt", "100元补贴"),  # 只有 100、没有 %：不转义时会被预筛放进内存
+    ("下划线.txt", "字段 a_b 登记"),
+    ("近似.txt", "字段 axb 登记"),  # 不转义时 _ 会匹配任意单字符，把这一行放进来
+    ("反斜杠.txt", "路径 C:\\制度\\考勤"),
+    ("无关.txt", "报销流程：发票需要在30天内提交。"),
+]
+
+
+def _prefilter_truth(clean_keywords, corpus):
+    """独立真值：任一展开关键词按旧口径归一化后出现在正文里，该行就必须被取到。"""
+    return [
+        name
+        for name, content in corpus
+        if any(_legacy_normalize(keyword) in _legacy_normalize(content) for keyword in clean_keywords)
+    ]
+
+
+def test_keyword_recall_prefilter_keeps_exactly_the_rows_that_can_match(tmp_path):
+    """SQL 预筛必须既不漏召回、也不把无关行搬进内存。
+
+    ``%``/``_``/``!``/``\\`` 在 LIKE 里都有特殊含义，而 ``!`` 正是本实现选的转义符：
+
+    * 不转义就是漏——``'%!%a%'`` 里的 ``!%`` 会被读成「字面百分号」，「!a」这类
+      关键词的真命中在取数层就被丢掉（旧实现没有预筛，能召回）；
+    * 转义不全就是泛化——``100%`` 退化成「含 1、0、0」，``a_b`` 退化成「a 任意 b」，
+      把「100元补贴」「字段 axb」这些不可能命中的行也加载进来，正是本 PR 要省的成本。
+    """
+    _, db = _new_db(tmp_path)
+    _add_files(db, PREFILTER_CORPUS)
+    db.expunge_all()
+
+    for keyword in ["!a", "100%", "a_b", "C:\\制度", "!%"]:
+        clean_keywords = retrieval._expand_keywords([keyword])
+        rows = list(
+            retrieval._iter_keyword_candidate_files(
+                db, KB, clean_keywords, retrieval._needs_case_fold(clean_keywords)
+            )
+        )
+        assert [name for _, name, _ in rows] == _prefilter_truth(clean_keywords, PREFILTER_CORPUS)
+
+
+UPPER_ONLY_CORPUS = [
+    ("俄文大写.txt", "ПРИВЕТ ВСЕМ СОТРУДНИКАМ"),
+    ("俄文小写.txt", "привет всем сотрудникам"),
+    ("希腊大写.txt", "ΟΔΟΣ ΚΑΙ ΠΑΡΑΔΕΙΓΜΑ"),
+    ("希腊小写.txt", "οδος και παραδειγμα"),
+    ("英文大写.txt", "LEAVE POLICY DRAFT"),
+    ("无关.txt", "报销流程：发票需要在30天内提交。"),
+]
+
+
+def test_keyword_recall_matches_legacy_when_the_corpus_has_only_one_case(tmp_path):
+    """正文只有一种大小写写法时，另一种写法的小写关键词也必须召回。
+
+    SQLite 的 ``LOWER``/``LIKE`` 只折叠 ASCII：西里尔/希腊文的大写写法在库侧折不动，
+    含非 ASCII 大小写字母的关键词必须整体放弃预筛（退回整库分批扫），否则整行在取数层
+    就被丢掉——「关键词用小写问、正文用大写写」是最普通不过的用法。
+    """
+    _, db = _new_db(tmp_path)
+    _add_files(db, UPPER_ONLY_CORPUS)
+    db.expunge_all()
+
+    for keyword, expected in [
+        ("привет", {"俄文大写.txt", "俄文小写.txt"}),
+        ("οδος", {"希腊大写.txt", "希腊小写.txt"}),
+        ("leave", {"英文大写.txt"}),
+    ]:
+        chunks = _assert_matches_legacy(db, [keyword], 8)
+        assert {chunk["file_name"] for chunk in chunks} == expected
+
+
+FOLD_SOURCE_CORPUS = [
+    ("开尔文.txt", "温度 300 \u212a \u212a 之间"),
+    ("带点I.txt", "S\u0130 是土耳其语写法。"),
+    ("分解写法.txt", "İstanbul kaydı açıldı."),
+    ("无关.txt", "报销流程：发票需要在30天内提交。"),
+]
+
+
+def test_keyword_recall_matches_legacy_for_case_folds_sql_cannot_see(tmp_path):
+    """正文用 U+212A（KELVIN SIGN）/ U+0130（İ）写、关键词用另一种写法写。
+
+    全码位扫描确认：只有这两个非 ASCII 码位的 ``lower()`` 会折到别处去
+    （``'K'.lower() == 'k'``、``'İ'.lower() == 'i' + U+0307``），而 SQL 的 ``LOWER``
+    折不到它们。预筛要求字面出现，这几行就会在取数层被丢掉——旧实现没有预筛，能召回。
+    """
+    _, db = _new_db(tmp_path)
+    _add_files(db, FOLD_SOURCE_CORPUS)
+    db.expunge_all()
+
+    for keywords, expected in [
+        (["kk"], ["开尔文.txt"]),
+        (["si"], ["带点I.txt"]),
+        (["kk", "温度"], ["开尔文.txt"]),
+        # 关键词用分解写法（i + U+0307，土耳其语文本复制粘贴的常见形态），正文用预组合 İ：
+        # İ 一个字符折出两个字符，按「一个字符占一位」对齐的 LIKE 模式表达不了，预筛必须退让。
+        (["i̇s"], ["分解写法.txt"]),
+    ]:
+        chunks = _assert_matches_legacy(db, keywords, 8)
+        assert [chunk["file_name"] for chunk in chunks] == expected
 
 
 def test_keyword_recall_does_not_load_unmatched_file_bodies(tmp_path):
