@@ -46,7 +46,7 @@ jobs:
 
       # 产物保留 7 天，便于排查构建期问题。
       - name: 上传构建产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
