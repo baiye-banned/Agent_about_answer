@@ -122,6 +122,44 @@ def test_multi_route_vector_hits_still_merge_onto_one_slice():
     assert [entry["route"] for entry in fused[0]["routes"]] == ["planned", "hyde", "rewrite_1"]
 
 
+def test_same_text_from_two_schemes_merges_into_one_fused_candidate():
+    """短文档整篇就是 offset=0 的那个窗口：两条候选文本一样，融合阶段就该并成一条。
+
+    否则同一段文字会以两条候选的身份走到重排，白占一个重排名额与上下文配额，还会丢掉
+    「两条路由都召回了它」这个 RRF 信号。
+    """
+    text = "报销申请需提交原始发票，由财务部在五个工作日内完成审核并付款。"
+    semantic = _semantic_chunk("0", text)
+    keyword = _keyword_chunk("0", text)
+
+    fused = retrieval.rrf_fuse([("planned", [semantic]), ("keyword", [keyword])])
+
+    assert len(fused) == 1
+    assert fused[0]["rrf_score"] == pytest.approx(2 / 61)
+    assert [entry["route"] for entry in fused[0]["routes"]] == ["planned", "keyword"]
+
+
+def test_duplicate_text_inside_one_scheme_is_left_alone():
+    """同一套方案里的重复文本（页眉页脚、表格表头）维持原有「按 id 各算一条」的行为。"""
+    left = _semantic_chunk("10", "页脚：内部资料，请勿外传")
+    right = _semantic_chunk("11", "页脚：内部资料，请勿外传")
+
+    fused = retrieval.rrf_fuse([("planned", [left, right])])
+    final = rerank.select_final_chunks([left, right], [])
+
+    assert len(fused) == 2
+    assert [chunk["chunk_id"] for chunk in final] == ["10", "11"]
+
+
+def test_same_scheme_chunks_differing_only_in_whitespace_are_both_kept():
+    left = _semantic_chunk("3", "2024  年度\n\n考核 指标")
+    right = _semantic_chunk("4", "2024 年度考核指标")
+
+    final = rerank.select_final_chunks([left, right], [])
+
+    assert [chunk["chunk_id"] for chunk in final] == ["3", "4"]
+
+
 def test_same_slice_returned_by_keyword_route_is_still_deduped():
     """同一条切片被关键字路再次召回时，仍按「同一段上下文」去重，不重复占配额。"""
     semantic = _semantic_chunk("2", "迟到超过30分钟视为旷工半天")

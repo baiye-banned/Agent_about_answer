@@ -195,40 +195,58 @@ def select_final_chunks(ranked_chunks: list[dict], keyword_chunks: list[dict]) -
 def _dedupe_chunks(chunks: list[dict]) -> list[dict]:
     deduped: list[dict] = []
     seen_keys = set()
-    seen_contents = set()
+    seen_contents: dict[str, str] = {}
     for chunk in chunks:
         if not isinstance(chunk, dict):
             continue
-        key, content = _context_identity(chunk)
-        if key in seen_keys or (content and content in seen_contents):
+        key = chunk_key(chunk)
+        if key in seen_keys:
             continue
-        seen_keys.add(key)
+        scheme = chunk_scheme(chunk)
+        content = chunk_content_key(chunk)
         if content:
-            seen_contents.add(content)
+            # 只并「两套分块方案给出同一段文本」这一种情形；同一套方案里的重复文本
+            # （页眉页脚、表格表头这类）维持原有「按 id 各算一条」的行为。
+            owner = seen_contents.get(content)
+            if owner is not None and owner != scheme:
+                continue
+            seen_contents.setdefault(content, scheme)
+        seen_keys.add(key)
         deduped.append(chunk)
     return deduped
 
 
 def _same_context(left: dict, right: dict) -> bool:
-    """两条候选是否是「同一段上下文」：同一条切片，或同一份文件里的同文片段。
+    """两条候选是否是「同一段上下文」：同一条切片，或两套分块方案给出的同一段文本。
 
-    前者靠融合键判断（同一条切片被多路召回命中）；后者兜住不同分块方案产出同一段
-    文本的情形——那样两条候选内容完全一样，进上下文只会重复占用配额。
+    前者靠融合键判断（同一条切片被多路召回命中）；后者兜住分块方案不同、文本却完全
+    一样的情形（短文档整篇就是 offset=0 的那个窗口），那样两条候选进上下文只会重复
+    占用配额。
     """
-    left_key, left_content = _context_identity(left)
-    right_key, right_content = _context_identity(right)
-    return left_key == right_key or bool(left_content) and left_content == right_content
+    if chunk_key(left) == chunk_key(right):
+        return True
+    if chunk_scheme(left) == chunk_scheme(right):
+        return False
+    left_content = chunk_content_key(left)
+    return bool(left_content) and left_content == chunk_content_key(right)
 
 
-def _context_identity(chunk: dict) -> tuple[str, str]:
-    """候选在最终上下文里的身份：(融合键, 同文件内容键)。
+def chunk_scheme(chunk: dict) -> str:
+    """候选来自哪一套分块方案。
 
-    没有正文的候选内容键留空，不参与内容判重——否则同一份文件里两条空正文候选
-    会被误判成同一条。
+    关键字窗口与入库切片各自从 0 编号，是两套方案；多路向量召回命中的都是同一条
+    入库切片，算同一套。
+    """
+    return KEYWORD_CHUNK_NAMESPACE if chunk.get("route") == "keyword" else INGEST_CHUNK_NAMESPACE
+
+
+def chunk_content_key(chunk: dict) -> str:
+    """「同一份文件里的同一段文本」这个身份；没有正文时返回空串，不参与判重。
+
+    空正文若也参与判重，同一份文件里两条没有正文的候选会被误判成同一条。
     """
     content = "".join(str(chunk.get("content") or "").split())
-    content_key = f"{chunk.get('file_id', 0)}:{content}" if content else ""
-    return chunk_key(chunk), content_key
+    return f"{chunk.get('file_id', 0)}:{content}" if content else ""
 
 
 def _keyword_chunk_hits_query(chunk: dict) -> bool:
@@ -243,6 +261,7 @@ def _keyword_chunk_hits_query(chunk: dict) -> bool:
 
 
 KEYWORD_CHUNK_NAMESPACE = "kw"
+INGEST_CHUNK_NAMESPACE = "ingest"
 
 
 def chunk_key(chunk: dict) -> str:
@@ -258,7 +277,7 @@ def chunk_key(chunk: dict) -> str:
     ``file_id + chunk_id`` 合并，RRF 排序才有意义，所以只有关键字窗口另起命名空间。
     """
     chunk_id = chunk.get("chunk_id") or chunk.get("id")
-    if chunk.get("route") == "keyword":
+    if chunk_scheme(chunk) == KEYWORD_CHUNK_NAMESPACE:
         return f"{chunk.get('file_id', 0)}:{KEYWORD_CHUNK_NAMESPACE}:{chunk_id}"
     return f"{chunk.get('file_id', 0)}:{chunk_id}"
 
