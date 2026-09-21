@@ -16,6 +16,7 @@ jobs:
   pr-title-check:
     name: PR 标题规范校验
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: 检出 PR 合并结果（脚本兜底来源）
         uses: actions/checkout@v7
