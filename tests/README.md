@@ -7,8 +7,9 @@ hand-maintained: `npm test` discovers files through `tests/**/*.test.js` and pyt
 `python_files = test_*.py` in `pytest.ini`, so a missing entry never stops a test from running - it
 only makes that file invisible to anyone auditing coverage against this document, which is how an
 already-covered behaviour ends up being read as uncovered. The directory itself is the source of
-truth; when a list and the tree disagree, `ls tests/*.test.js tests/test_*.py` and
-`python -m pytest tests --collect-only` win.
+truth; when a list and the tree disagree, `ls tests/*.test.js tests/test_*.py tests/conftest.py`
+and `python -m pytest tests --collect-only` win. (`tests/e2e/*.spec.mjs` is the Playwright suite
+run by `npm run test:e2e` and is deliberately in neither list.)
 
 ## Node Tests
 

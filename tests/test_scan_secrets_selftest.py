@@ -205,8 +205,8 @@ def test_allow_marker_exempts_only_when_a_reason_follows(tmp_path):
     - 只有标记、没有理由的赋值行：不豁免，仍按命中报红（stderr）；
     - 形态命中 + 完整标记：标记对它无效，照常报红（stderr）且不进豁免清单；
     - 双路径（大写键名 + `sk-` 形态同行）：赋值命中被豁免（stdout）、形态命中照常报红
-      （stderr）。前三侧各自只钉一头，这一侧把两头钉在同一行上，才排得掉「标记压根没被
-      咨询」——详见下面断言的注释。
+      （stderr）。前三侧各自只钉一头，这一侧把「标记生效过」与「效力到此为止」钉在同一行
+      上；它独有的判别力边界见下面断言的注释（不主张覆盖更粗的退化）。
     """
     allowed = "planted_allowed.py"
     bare = "planted_bare_allow.py"
@@ -240,12 +240,14 @@ def test_allow_marker_exempts_only_when_a_reason_follows(tmp_path):
     assert "%s:1 [sk- token]" % shape in stderr, stderr
     assert "%s:1" % shape not in stdout, stdout
     # 双路径夹具：「标记藏不住真密钥」这条属性的正面证据。同一行里赋值命中与形态命中并存，
-    # 于是四条断言把两种失效方式分得开——
-    #   若豁免逻辑退化成「有标记就整行放过」：前两条仍绿，形态命中那两条转红；
-    #   若标记压根不再被咨询（例如 RE_ALLOW 取不到、判定被移出分支）：第 1、2 条转红，
-    #   因为赋值命中会掉回命中列表，而不是进豁免清单。
-    # 换句话说，前两条断言证明标记对这一行**生效过**，后两条证明它的效力**到此为止**。
-    # 少了前两条，「形态命中永不豁免」就还是那句恒真的空话。
+    # 四条断言把「标记生效过」与「效力到此为止」钉在同一行上：
+    #   前两条——赋值命中进豁免清单、不进命中列表——证明标记**确实被咨询且生效**；
+    #   后两条——形态命中进命中列表、不进豁免清单——证明它的效力**不覆盖**同一行的形态命中。
+    # 它相对前三侧独有的判别力是这一种退化：把形态命中的豁免条件写成「该行既是赋值命中、
+    # 又带标记」（即在形态分支里也去查 RE_PREFIX）。那样小写键名的 `shape` 侧仍照常报红、
+    # 前三侧全绿，这一侧却会把真密钥连同赋值一起放过——只有这几条断言会转红。
+    # 不声称覆盖更多：「有标记就整行放过」「RE_ALLOW 取不到」这类更粗的退化，`allowed` 与
+    # `shape` 两侧本来就会转红。
     assert "%s:1 [credential assignment]" % dual in stdout, stdout
     assert "%s:1 [credential assignment]" % dual not in stderr, stderr
     assert "%s:1 [sk- token]" % dual in stderr, stderr
