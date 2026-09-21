@@ -75,6 +75,39 @@ def list_messages(
     return rows
 
 
+def list_conversation_attachment_keys(db: Session, cid: str, user_id: int) -> list[str] | None:
+    """会话内所有消息引用到的 OSS 对象键，去重后按「旧 -> 新」返回。
+
+    必须在会话行被删除之前调用：`messages` 随会话级联删除，附件列里的对象键会一起消失，
+    删完之后就再也说不清这个会话扔下过哪些对象。只看 attachments 一列，不把正文
+    （LONGTEXT）读进内存；也不走 list_messages——那个有分页上限，翻不到的消息会漏收。
+
+    会话不存在或不属于该用户时返回 None，与 list_messages 的约定一致。
+    """
+    if not get_conversation(db, cid, user_id):
+        return None
+
+    rows = (
+        db.query(Message.attachments)
+        .filter(Message.conversation_id == cid)
+        .order_by(Message.id.asc())
+        .all()
+    )
+    keys: list[str] = []
+    seen: set[str] = set()
+    for (raw_attachments,) in rows:
+        for item in load_json_value(raw_attachments, []):
+            # 历史脏数据与上传中断留下的记录都可能不是 dict、或缺 object_key。
+            if not isinstance(item, dict):
+                continue
+            object_key = item.get("object_key")
+            if not isinstance(object_key, str) or not object_key or object_key in seen:
+                continue
+            seen.add(object_key)
+            keys.append(object_key)
+    return keys
+
+
 def delete_conversation(db: Session, cid: str, user_id: int) -> Conversation | None:
     conversation = get_conversation(db, cid, user_id)
     if not conversation:
