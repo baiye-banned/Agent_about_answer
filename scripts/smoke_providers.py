@@ -17,6 +17,10 @@ never counted as a pass: a `--live` run without credentials prints `5 checks: 0 
 5 skipped, 0 failed` plus a "no check executed" line instead of claiming that 5/5 checks
 passed. Exit code is 0 unless a check failed (a skip is an unverified check, not a
 failure), so read the summary rather than the exit code to see what actually ran.
+
+A check only passes on the provider it names: `rerank` counts as verified only when the
+qwen3-rerank endpoint answered, so a successful LLM fallback is reported as a failure
+instead of hiding an unreachable DashScope endpoint behind a pass.
 """
 
 import argparse
@@ -208,8 +212,15 @@ def check_rerank(live: bool) -> str:
         ranked, trace = asyncio.run(rerank.rerank_chunks(QUESTION, [dict(chunk) for chunk in CHUNKS]))
     finally:
         rerank.httpx.AsyncClient = original
-    if trace.get("status") != "done":
-        raise AssertionError(f"rerank status={trace.get('status')!r} error={trace.get('error')!r}")
+    # `status == "done"` alone does not mean the qwen3-rerank endpoint answered: when it
+    # fails and RERANK_LLM_FALLBACK_ENABLED is on (the default), rerank_chunks() retries
+    # through the LLM and returns a done trace as well, so an unreachable endpoint, an
+    # expired key or a bad model name would all be reported as a passing rerank.
+    if trace.get("status") != "done" or trace.get("provider") != rerank.RERANK_PROVIDER:
+        raise AssertionError(
+            f"rerank status={trace.get('status')!r} provider={trace.get('provider')!r} "
+            f"error={trace.get('error')!r} fallback={trace.get('fallback_reason')!r}"
+        )
     if not ranked:
         raise AssertionError("rerank returned no chunk")
     scores = [chunk.get("rerank_score") for chunk in ranked]
@@ -238,8 +249,15 @@ def check_rerank_fallback(live: bool) -> str:
             )
         finally:
             rerank.call_chat_json = original_chat
-    if trace.get("status") != "done":
-        raise AssertionError(f"fallback rerank status={trace.get('status')!r} error={trace.get('error')!r}")
+    # The mirror of the check above: this one drives the LLM fallback directly, so a trace
+    # claiming the primary provider did not verify the fallback either. Without it a
+    # `rerank-fallback` served by qwen3-rerank would pass and the two checks would report
+    # the same thing.
+    if trace.get("status") != "done" or trace.get("provider") == rerank.RERANK_PROVIDER:
+        raise AssertionError(
+            f"fallback rerank status={trace.get('status')!r} provider={trace.get('provider')!r} "
+            f"error={trace.get('error')!r}"
+        )
     if not ranked:
         raise AssertionError("fallback rerank returned no chunk")
     return f"provider={trace.get('provider')} ranked={len(ranked)} first={ranked[0].get('chunk_id')}"
