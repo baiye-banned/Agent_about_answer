@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { effect, nextTick, reactive } from 'vue'
 
 // 覆盖 src/utils/detailPreview.js：Knowledge.vue 的详情弹窗（showDetail → knowledgeAPI.getContent）
 // 走的就是这里的 open/close。锁的是「标题与正文必须来自同一份文件」这条时序不变量（#63）：
@@ -15,7 +16,7 @@ const file = (id, name) => ({ id, name, size: 1024, created_at: '2026-09-01T10:0
 
 // 手动控制的取数桩：每个 id 一条待决队列，用例自己决定谁先返回。
 // fetchContent 在 open() 的同步段内就被调用，因此 open() 返回时队列里已经有这一笔。
-function setup() {
+function setup({ state = createDetailPreviewState() } = {}) {
   const calls = []
   const pending = new Map()
 
@@ -36,7 +37,6 @@ function setup() {
     return entry
   }
 
-  const state = createDetailPreviewState()
   const preview = createDetailPreview({ state, fetchContent })
 
   return {
@@ -224,6 +224,28 @@ test('最新请求成功后清掉上一次的错误', async () => {
 
   assert.equal(state.error, '')
   assert.equal(state.content, 'B 的正文')
+})
+
+test('控制器写入的状态经 reactive() 包装后能触发 Vue 的更新（视图接线契约）', async () => {
+  // createDetailPreview 是直接写 state 的属性，视图侧必须把响应式代理传进去；
+  // 传普通对象时写入不触发任何更新（界面会一直停在打开前的内容），所以这里把契约钉死。
+  const state = reactive(createDetailPreviewState())
+  const renders = []
+  effect(() => {
+    renders.push(`${state.file?.name ?? '-'}:${state.content}`)
+  })
+  const { preview, respond } = setup({ state })
+
+  const openA = preview.open(a)
+  await nextTick() // 打开瞬间：标题已经是 A，正文还没回来
+  respond(a.id, 'A 的正文')
+  await openA
+  await nextTick()
+
+  preview.close()
+  await nextTick() // 关闭只复位弹窗状态，不扰动已渲染的正文
+
+  assert.deepEqual(renders, ['-:', 'A-年度报告.md:', 'A-年度报告.md:A 的正文'])
 })
 
 test('正文为空的文件停在空态：content 为空且没有 error', async () => {
