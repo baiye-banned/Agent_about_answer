@@ -488,6 +488,7 @@ sequenceDiagram
   participant R as backend/rag/retrieval.retrieve_knowledge()
   participant V as milvus_client.query_vectors()
   participant L as DeepSeek
+  participant P as DashScope rerank
   participant DB as MySQL
 
   C->>Store: sendMessage()
@@ -499,7 +500,8 @@ sequenceDiagram
   R->>V: original / hyde / rewrite routes
   R->>R: keyword_recall()
   R->>R: rrf_fuse()
-  R->>L: rerank_chunks()
+  R->>P: rerank_chunks()（qwen3-rerank）
+  R->>L: rerank_chunks() 回退（仅 RERANK_LLM_FALLBACK_ENABLED=true 且主链路异常）
   B->>L: stream_rag_answer()
   B->>DB: 保存 user / assistant messages
 ```

@@ -80,7 +80,7 @@ flowchart LR
   Retrieval --> Milvus
   Retrieval --> DeepSeek
   RerankSvc -->|"qwen3-rerank"| DashScope
-  RerankSvc -.->|"RERANK_LLM_FALLBACK_ENABLED=true 且 DashScope 异常"| DeepSeek
+  RerankSvc -.->|"RERANK_LLM_FALLBACK_ENABLED=true 且主链路异常"| DeepSeek
   MilvusClient --> DashScope
   ChatSvc --> OSS
   VisionSvc --> OSS
@@ -195,7 +195,7 @@ flowchart LR
   Retrieval --> MilvusClient
   Retrieval --> RerankSvc
   RerankSvc -->|"qwen3-rerank"| DashScope
-  RerankSvc -.->|"RERANK_LLM_FALLBACK_ENABLED=true 且 DashScope 异常"| DeepSeek
+  RerankSvc -.->|"RERANK_LLM_FALLBACK_ENABLED=true 且主链路异常"| DeepSeek
   Chat --> Trace
   Chat --> Ragas
   Chat --> DB
