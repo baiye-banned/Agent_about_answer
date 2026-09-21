@@ -175,11 +175,17 @@ _SENTENCE_END_RE = re.compile(r"[。！？；;]")
 # 超过该长度的整行无论如何都按正文处理。只服务于 _looks_like_long_list_item：
 # 小数链会把标记正则整行吃光，只有「整行长度」这个信号还够得着它。
 _LONG_HEADING_MAX_LEN = 48
-# 标题标记之后的文本超过该长度即按正文处理：中文标题不会写这么长。
-# 长度必须量在**标记之后的文本**上，而不是整行——标记本身长度随前缀不同
-# （「三、」2 字 /「（一）」3 字 /「第三条 」4 字），量整行会让「标题 ↔ 正文」
-# 的边界按前缀漂移，同一段正文换个编号方式就从丢弃变成保留（issue #83 第 2 项）。
-_ORDER_HEADING_TAIL_MAX_LEN = 20
+# 编号标记的最大长度，按「第一百二十条」+ 分隔空格算：中文序数到 4 位数字已经够用，
+# 留出这一段是为了让下面那条统一边界在任何真实前缀下都不比旧口径（量整行、阈值 48）更严。
+_MAX_ORDER_MARKER_LEN = 7
+# 标题不会写这么长：**标记之后**的文本超过该长度即按正文处理。
+# 量在标记之后的文本上，而不是整行——标记本身长度随前缀不同
+# （「三、」2 字 /「（一）」3 字 /「第十二条」4 字），量整行会让「标题 ↔ 正文」的
+# 边界按前缀漂移，同一段正文换个编号方式就从保留变成丢弃（issue #83 第 2 项）。
+# 取 _LONG_HEADING_MAX_LEN - _MAX_ORDER_MARKER_LEN 而不是直接复用 48：量到标记之后
+# 总会让边界提前，提前得比最长标记还多，就会把旧口径下已经判成正文的行重新判回标题、
+# 把正文丢掉（对抗评审实测：45~48 字无标点正文换了长标记后整批翻转）。
+_ORDER_HEADING_TAIL_MAX_LEN = _LONG_HEADING_MAX_LEN - _MAX_ORDER_MARKER_LEN
 
 
 def _normalize_line(text: str) -> str:
@@ -187,15 +193,22 @@ def _normalize_line(text: str) -> str:
 
 
 def _looks_like_long_list_item(line: str) -> bool:
-    """小数编号的超长行按正文处理。
+    """小数编号**链**（「1.2.…20.1.」）按正文处理。
 
     不能并入 _looks_like_order_heading_with_body：_DECIMAL_MARKER_RE 是贪婪匹配，
-    碰到「1.2.…20.1.」这类整行只由数字与点号组成的行会把整行吃光、标记后为空；
-    而 _DECIMAL_HEADING_RE 能回溯到第一个点号后由 \\s*\\S+ 吃掉其余部分，仍然匹配。
-    只有这条长度保护拦得住这种行，删掉会让它们退回「整行当标题丢弃」。
+    碰到整行只由数字与点号组成的行会把整行吃光、标记后为空，那条判定取不到文本、
+    长度信号失效；而 _DECIMAL_HEADING_RE 能回溯到第一个点号后由 \\s*\\S+ 吃掉其余
+    部分，仍然匹配。只有这里拦得住这种行。
+
+    判据是「标记吃光了整行」（即标记之后没有文本），不是「整行超长」：后者会把
+    「1. ……」这种正常的小数行也一并排除在长度信号之外，让 1、/1. 前缀的
+    「标题 ↔ 正文」边界与其它前缀再次错开，正好是 issue #83 第 2 项要消掉的分裂。
+    长度条件保留，是为了让短的小数链维持原有判定不变。
     """
     stripped = _normalize_line(line)
-    return len(stripped) > _LONG_HEADING_MAX_LEN and bool(_DECIMAL_HEADING_RE.match(stripped))
+    if not _DECIMAL_HEADING_RE.match(stripped):
+        return False
+    return not _order_heading_tail(stripped) and len(stripped) > _LONG_HEADING_MAX_LEN
 
 
 def _order_heading_tail(line: str) -> str:
@@ -215,10 +228,13 @@ def _looks_like_order_heading_with_body(line: str) -> bool:
     issue #53 只挂进了「第N条」，这里把「三、」「（一）」「1、」「1.」四种前缀
     并入同一套判定，避免它们各自依赖长度阈值兜底。
 
-    issue #83 第 1 项：两个信号都量在标记之后的文本上。两条判据缺一不可——
-    只有句末标点时，「三、员工迟到30分钟以内罚款50元，由人事部汇总」这种不带
-    句末标点的短语正文仍会被整行丢弃（40 行语料覆盖率 2.4%）；只有长度阈值时，
-    带句末标点的短正文会漏判。标记之后没有文本（纯标题行）的行仍走标题分支。
+    issue #83 第 2 项：长度信号量在标记之后的文本上（原先量整行），四类前缀的
+    「标题 ↔ 正文」边界因此落在同一个字符数上，不再随标记本身的长短漂移。
+    标记之后没有文本（纯标题行）的行仍走标题分支。
+
+    单独的标记不构成「同行排版」判据：短标题与短正文在这一层无法区分，
+    「三、员工迟到30分钟以内罚款50元，由人事部汇总」这类不带句末标点的短语正文
+    仍然会被判成标题。整篇都判成标题时由 chunk_text 的结构兜底救回（issue #83 第 1 项）。
     """
     tail = _order_heading_tail(line)
     if not tail:
@@ -392,51 +408,72 @@ def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: i
     for block in raw_blocks:
         units.extend(_semantic_units(block, semantic_limit))
 
-    chunks: list[dict] = []
-    heading_path: dict[int, str] = {}
-    current_body: list[str] = []
-    pending_overlap: list[str] = []
+    def assemble(candidate_units: list[str], *, as_body: bool) -> tuple[list[dict], dict[int, str], list[str]]:
+        """把候选单元按标题层级组装成切片。
 
-    def flush_chunk() -> None:
-        nonlocal current_body, pending_overlap
-        if not current_body:
-            return
+        as_body=True 时所有单元一律当正文（结构兜底重跑用），此时不会产生标题路径。
+        返回值第三项是「被判成标题（层级 > 0）的单元」，按出现顺序，供结构兜底判断。
+        """
+        chunks: list[dict] = []
+        heading_path: dict[int, str] = {}
+        heading_units: list[str] = []
+        current_body: list[str] = []
+        pending_overlap: list[str] = []
 
-        # 正文行必须逐条保留：同一句话在文档里重复出现（制度文档很常见）时去重，
-        # 会让入库文本合计远小于原文，属于静默丢正文。
-        # 这里不会重复标题：_heading_level 对同一字符串判定恒定，标题不会进入 current_body，
-        # _overlap_units 也会跳过标题行。
-        heading_lines = _heading_lines(heading_path)
-        content_lines = [line for line in [*heading_lines, *pending_overlap, *current_body] if line]
+        def flush_chunk() -> None:
+            nonlocal current_body, pending_overlap
+            if not current_body:
+                return
 
-        chunk_text_value = "\n".join(content_lines).strip()
-        if chunk_text_value:
-            chunks.append({"id": f"{len(chunks)}", "text": chunk_text_value})
-        pending_overlap = _overlap_units(current_body, overlap_limit)
-        current_body = []
+            # 正文行必须逐条保留：同一句话在文档里重复出现（制度文档很常见）时去重，
+            # 会让入库文本合计远小于原文，属于静默丢正文。
+            # 这里不会重复标题：_heading_level 对同一字符串判定恒定，标题不会进入 current_body，
+            # _overlap_units 也会跳过标题行。
+            heading_lines = _heading_lines(heading_path)
+            content_lines = [line for line in [*heading_lines, *pending_overlap, *current_body] if line]
 
-    for unit in units:
-        level = _heading_level(unit)
-        if level == 0:
-            flush_chunk()
-            pending_overlap = []
-            continue
+            chunk_text_value = "\n".join(content_lines).strip()
+            if chunk_text_value:
+                chunks.append({"id": f"{len(chunks)}", "text": chunk_text_value})
+            pending_overlap = _overlap_units(current_body, overlap_limit)
+            current_body = []
 
-        if level is not None:
-            flush_chunk()
-            heading_path = _trim_heading_path(heading_path, level)
-            heading_path[level] = unit
-            pending_overlap = []
-            continue
+        for unit in candidate_units:
+            level = None if as_body else _heading_level(unit)
+            if level == 0:
+                flush_chunk()
+                pending_overlap = []
+                continue
 
-        projected_lines = [*_heading_lines(heading_path), *pending_overlap, *current_body, unit]
-        if current_body and _content_length(projected_lines) > semantic_limit:
-            flush_chunk()
-        current_body.append(unit)
+            if level is not None:
+                flush_chunk()
+                heading_units.append(unit)
+                heading_path = _trim_heading_path(heading_path, level)
+                heading_path[level] = unit
+                pending_overlap = []
+                continue
 
-    flush_chunk()
+            projected_lines = [*_heading_lines(heading_path), *pending_overlap, *current_body, unit]
+            if current_body and _content_length(projected_lines) > semantic_limit:
+                flush_chunk()
+            current_body.append(unit)
+
+        flush_chunk()
+        return chunks, heading_path, heading_units
+
+    chunks, heading_path, heading_units = assemble(units, as_body=False)
+
+    if not chunks and heading_units:
+        # 结构兜底（issue #83 第 1 项）：整篇没有一行进入正文，说明「标题」判定在这里
+        # 整体失效，典型是通篇「三、员工迟到30分钟以内罚款50元，由人事部汇总」这种
+        # 编号与短语正文同行的清单排版——40 行语料修复前只剩兜底的最后一行，覆盖率 2.4%。
+        # 一个标题树不可能只有标题、没有正文，此时把所有编号行当正文重新组装。
+        # 宁可标题层级不准（正文会并进上一节、继承上一节标题），也不能整段丢正文。
+        # 这层兜底与阈值/标点无关，标记后文本再短也不会漏——它救的是「塌缩」，不是单行误判。
+        chunks, _, _ = assemble(heading_units, as_body=True)
 
     if not chunks and heading_path:
+        # 上一分支已覆盖「只有标题」的情形，这里只兜住 heading_units 为空的历史分支。
         heading_text = "\n".join(_heading_lines(heading_path)).strip()
         if heading_text:
             chunks.append({"id": "0", "text": heading_text})
