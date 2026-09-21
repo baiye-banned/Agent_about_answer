@@ -408,6 +408,22 @@ def test_keyword_recall_sql_is_paged_and_prefiltered(tmp_path):
     assert len(statements) <= math.ceil(9 / retrieval.KEYWORD_RECALL_BATCH_SIZE) + 1
 
 
+def test_keyword_recall_fetch_layer_loads_only_matching_content(tmp_path):
+    """取数层实际搬进内存的字符数有上界：无关文件连 content 都不会被取出来。"""
+    _, db = _new_db(tmp_path)
+    _add_files(db, [("命中.txt", ATTENDANCE), ("命中2.txt", ATTENDANCE)])
+    _add_files(db, [(f"无关{index}.txt", EXPENSE * 8000) for index in range(30)])
+    db.expunge_all()
+    clean_keywords = retrieval._expand_keywords(["迟到"])
+
+    rows = list(
+        retrieval._iter_keyword_candidate_files(db, KB, clean_keywords, retrieval._needs_case_fold(clean_keywords))
+    )
+
+    assert [name for _, name, _ in rows] == ["命中.txt", "命中2.txt"]
+    assert sum(len(content) for _, _, content in rows) < 1000
+
+
 def test_keyword_recall_does_not_load_unmatched_file_bodies(tmp_path):
     def run(name, noise_files):
         _, db = _new_db(tmp_path, name=name)

@@ -420,7 +420,7 @@ def _collect_file_keyword_candidates(
     normalized_content = _normalize_for_match(content, case_fold)
     occurrences = []
     for keyword, normalized, weight in prepared_keywords:
-        if len(normalized) >= 2 and normalized in normalized_content:
+        if normalized in normalized_content:
             occurrences.append((keyword, normalized, weight))
     if not occurrences:
         return order
