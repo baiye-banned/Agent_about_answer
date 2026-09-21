@@ -1,5 +1,6 @@
 from sqlalchemy.orm import Session, selectinload
 
+from crud import trace as crud_trace
 from model.models import ChatTraceSession, Conversation, Message
 from service.json_utils import load_json_value
 
@@ -78,6 +79,11 @@ def delete_conversation(db: Session, cid: str, user_id: int) -> Conversation | N
     conversation = get_conversation(db, cid, user_id)
     if not conversation:
         return None
+    # 学习轨迹按 conversation_id 关联，列上没有外键约束（model/models.py），数据库不会级联，
+    # 必须显式清理。与会话删除共用同一次提交：分两次提交时中间失败就会留下
+    # 「会话已删、轨迹仍能读」的残留（issue #127）。不按 LEARNING_TRACE_ENABLED 分流——
+    # 关掉开关只是不再写新轨迹，已经写下的行仍然要随会话删除。
+    crud_trace.delete_trace_sessions_for_conversation(db, cid)
     db.delete(conversation)
     db.commit()
     return conversation
