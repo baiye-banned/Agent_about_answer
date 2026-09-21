@@ -1,23 +1,38 @@
-# Dependabot 版本更新配置。
+# Dependabot 配置：npm / pip / GitHub Actions 三个生态的依赖更新与安全更新。
 #
-# 目标：让 npm / pip / GitHub Actions 三个生态的依赖过期与已知漏洞在仓库里可见、可处理。
-# 设计取舍：
-#   - 每个生态每周一次、统一在周一，避免每天开 PR 造成的评审噪音；
-#   - 按 semver 语义分组：minor + patch 合批（向后兼容，可整批过 CI 后合并），
-#     major 不分组、单独开 PR（可能破坏兼容，需要逐个判断）；
-#   - open-pull-requests-limit 兜底，单个生态同时最多开 5 个版本更新 PR；
-#   - 分组只作用于版本更新（applies-to: version-updates），安全更新仍逐个单独开 PR，
-#     保证漏洞修复能立刻被看见、快速合入，不被批次拖住；
-#   - commit-message 带 chore(deps) 前缀，使 PR 标题符合仓库的 Conventional Commits 门禁
-#     （否则 Dependabot 默认标题 “Bump x from a to b” 会被 PR 标题校验判红）。
+# 三个刻意的设计取舍，都不是随手取值：
 #
-# 注意：本文件只控制“版本更新”。安全告警与安全更新由仓库 Security 设置控制，不依赖本文件。
+# 1) 不写 target-branch。
+#    本仓库的默认分支就是 develop（gh api repos/... --jq .default_branch），而 Dependabot
+#    的版本更新默认就对着默认分支开 PR，所以写 `target-branch: develop` 是冗余的。
+#    更重要的是：官方文档明确写了，一旦定义了 target-branch，
+#    「Options defined for this package-ecosystem no longer apply to security updates
+#      because security updates always use the default branch for the repository.」
+#    —— 也就是说写死 target-branch 会让本节其余选项（含下面的 groups）对安全更新失效。
+#    省掉它，版本更新照样开在 develop，安全更新的分组才真的生效。
+#
+# 2) 安全更新也分组。
+#    `open-pull-requests-limit` 只约束版本更新；官方文档原文：
+#    「Security update pull requests are not subject to this limit and do not count
+#      toward it. There is no limit on the number of open pull requests for security
+#      updates.」
+#    本仓库开启告警后一次性暴露了 82 条 open 告警，若安全更新逐条开 PR，将出现一个
+#    任何上限都兜不住的 PR 洪水。因此按生态把安全更新合成一个 PR：正常期一个组里往往
+#    只有一两条，行为等同于单独开 PR；只在积压期起「合并同类项」的作用。
+#    代价：一个安全 PR 会同时包含多条 CVE 修复，若其中一条让 CI 变红，需要再拆开定位——
+#    相对于几十个无人处理的 PR，这个代价是可接受的。
+#
+# 3) 版本更新按 semver 分组：minor + patch 合批（向后兼容，可整批过 CI 后合并），
+#    major 不分组、单独开 PR（可能破坏兼容，需要逐个判断）。
+#
+# 另外，commit-message 的 chore(deps) 前缀是必需的、不是装饰：Dependabot 默认标题形如
+# “Bump axios from 1.16.0 to 1.17.0”，会被仓库的 scripts/check_title.mjs 判红，
+# 带上前缀后才符合 Conventional Commits 门禁。
 version: 2
 updates:
   # 前端依赖：package.json / package-lock.json 位于仓库根目录。
   - package-ecosystem: npm
     directory: "/"
-    target-branch: develop
     schedule:
       interval: weekly
       day: monday
@@ -27,8 +42,6 @@ updates:
     commit-message:
       prefix: chore
       include: scope
-    labels:
-      - dependencies
     groups:
       npm-minor-patch:
         applies-to: version-updates
@@ -37,11 +50,14 @@ updates:
         update-types:
           - minor
           - patch
+      npm-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   # 后端依赖：requirements.txt 位于 /backend。
   - package-ecosystem: pip
     directory: "/backend"
-    target-branch: develop
     schedule:
       interval: weekly
       day: monday
@@ -51,8 +67,6 @@ updates:
     commit-message:
       prefix: chore
       include: scope
-    labels:
-      - dependencies
     groups:
       pip-minor-patch:
         applies-to: version-updates
@@ -61,11 +75,14 @@ updates:
         update-types:
           - minor
           - patch
+      pip-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   # CI 依赖：.github/workflows/ 下各 action 的 uses 引用。
   - package-ecosystem: github-actions
     directory: "/"
-    target-branch: develop
     schedule:
       interval: weekly
       day: monday
@@ -75,8 +92,6 @@ updates:
     commit-message:
       prefix: chore
       include: scope
-    labels:
-      - dependencies
     groups:
       actions-minor-patch:
         applies-to: version-updates
@@ -85,3 +100,7 @@ updates:
         update-types:
           - minor
           - patch
+      actions-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
