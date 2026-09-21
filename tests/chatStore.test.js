@@ -8,10 +8,12 @@ const stubSource = [
   'const conversationResolvers = []',
   'export const streams = []',
   'export const getMessagesCalls = []',
+  'export const getMessagesParams = []',
   'export const chatAPI = {',
   '  getConversations: () => new Promise((resolve) => conversationResolvers.push(resolve)),',
-  '  getMessages: (id) => new Promise((resolve, reject) => {',
+  '  getMessages: (id, params) => new Promise((resolve, reject) => {',
   '    getMessagesCalls.push(id)',
+  '    getMessagesParams.push(params)',
   '    const queue = pending.get(id) || []',
   '    queue.push({ resolve, reject })',
   '    pending.set(id, queue)',
@@ -81,7 +83,7 @@ globalThis.window = {
 
 const { createPinia, setActivePinia } = await import('pinia')
 const { useChatStore } = await import('../src/stores/chat.js')
-const { respond, respondError, respondConversations, resetStub, streams, getMessagesCalls } =
+const { respond, respondError, respondConversations, resetStub, streams, getMessagesCalls, getMessagesParams } =
   await import(chatApiStub)
 
 const conversation = (id, knowledgeBaseId = null) => ({
@@ -114,6 +116,7 @@ function createStore(conversations) {
   resetStub()
   streams.length = 0
   getMessagesCalls.length = 0
+  getMessagesParams.length = 0
   pollingStarts.length = 0
   pollingDelays.length = 0
   pollingStops.length = 0
@@ -804,4 +807,86 @@ test('消息合并：会话已切走时只返回合并结果，不写当前视�
 
   assert.equal(merged.length, 2) // 合并结果照常返回
   assert.deepEqual(contents(store), ['A 的问题']) // 但不改写已切走会话的视图
+})
+
+// ---- 会话消息分页（issue #61）：后端默认只返回一页，前端按需向前翻 ----
+
+test('selectConversation 只请求最新一页并标记还有更早消息', async () => {
+  const store = createStore([conversation('a')])
+
+  const request = store.selectConversation('a')
+  const page = Array.from({ length: 50 }, (_, index) => message(index + 100, `第 ${index + 100} 条`))
+  respond('a', page)
+  await request
+
+  assert.deepEqual(getMessagesParams, [{ limit: 50 }])
+  assert.deepEqual(contents(store), page.map((item) => item.content))
+  assert.equal(store.hasMoreMessages, true)
+})
+
+test('会话消息不足一页时不再提示还有更早消息', async () => {
+  const store = createStore([conversation('a')])
+
+  const request = store.selectConversation('a')
+  respond('a', [message(1, '唯一一条')])
+  await request
+
+  assert.equal(store.hasMoreMessages, false)
+})
+
+test('loadOlderMessages 以最旧一条为游标向前翻页，重复行不重复插入', async () => {
+  const store = createStore([conversation('a')])
+  const firstPage = Array.from({ length: 50 }, (_, index) => message(index + 51, `第 ${index + 51} 条`))
+  const open = store.selectConversation('a')
+  respond('a', firstPage)
+  await open
+
+  const loading = store.loadOlderMessages()
+  // 游标是当前最旧一条的 id；返回里混入一条已存在的 51，用来验证去重。
+  respond('a', [message(1, '第 1 条'), message(2, '第 2 条'), message(51, '第 51 条')])
+  await loading
+
+  assert.deepEqual(getMessagesParams.at(-1), { limit: 50, before_id: 51 })
+  assert.deepEqual(contents(store), ['第 1 条', '第 2 条', ...firstPage.map((item) => item.content)])
+  assert.equal(store.hasMoreMessages, false) // 不足一页即到最早一条
+})
+
+test('loadOlderMessages 取满一页时仍可继续向前翻', async () => {
+  const store = createStore([conversation('a')])
+  const firstPage = Array.from({ length: 50 }, (_, index) => message(index + 51, `第 ${index + 51} 条`))
+  const open = store.selectConversation('a')
+  respond('a', firstPage)
+  await open
+
+  const loading = store.loadOlderMessages()
+  respond('a', Array.from({ length: 50 }, (_, index) => message(index + 1, `第 ${index + 1} 条`)))
+  await loading
+
+  assert.equal(store.messages.length, 100)
+  assert.equal(store.hasMoreMessages, true)
+})
+
+test('refreshMessages 不截断已翻出的更早历史', async () => {
+  const store = createStore([conversation('a')])
+  const firstPage = Array.from({ length: 50 }, (_, index) => message(index + 51, `第 ${index + 51} 条`))
+  const open = store.selectConversation('a')
+  respond('a', firstPage)
+  await open
+  const loading = store.loadOlderMessages()
+  respond('a', [message(1, '第 1 条')])
+  await loading
+  assert.equal(store.messages.length, 51)
+
+  const refreshing = store.refreshMessages('a')
+  // 刷新按已加载条数放大页大小，取回最新 51 条
+  const refreshParams = getMessagesParams.at(-1)
+  respond('a', [
+    message(1, '第 1 条'),
+    ...Array.from({ length: 50 }, (_, index) => message(index + 51, `第 ${index + 51} 条`)),
+  ])
+  await refreshing
+
+  assert.equal(refreshParams.limit, 51)
+  assert.equal(store.messages.length, 51)
+  assert.equal(store.messages[0].content, '第 1 条')
 })

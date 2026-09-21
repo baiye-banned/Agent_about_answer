@@ -6,11 +6,18 @@ import { RAGAS_STATUS, isPendingRagasStatus } from '@/utils/ragasStatus'
 const EVALUATION_POLL_INTERVAL_MS = 3000
 const EVALUATION_POLL_TIMEOUT_MS = 190000
 
+// 会话消息分页：与后端 CHAT_MESSAGE_DEFAULT_LIMIT / CHAT_MESSAGE_MAX_LIMIT 保持一致。
+// 后端一次最多返回 MESSAGE_PAGE_SIZE 条，UI 先展示最新一页，再按需向前翻。
+const MESSAGE_PAGE_SIZE = 50
+const MESSAGE_MAX_LIMIT = 200
+
 export const useChatStore = defineStore('chat', () => {
   const conversations = ref([])
   const currentId = ref(null)
   const messages = ref([])
   const loading = ref(false)
+  const hasMoreMessages = ref(false)
+  const loadingOlderMessages = ref(false)
   const historyManageMode = ref(false)
   const selectedConversationIds = ref([])
 
@@ -78,9 +85,12 @@ export const useChatStore = defineStore('chat', () => {
     currentId.value = id
     loading.value = true
     try {
-      const response = await chatAPI.getMessages(id)
+      // 只取最新一页：历史由 loadOlderMessages 按需向前翻，避免一次拉回整段会话。
+      const response = await chatAPI.getMessages(id, { limit: MESSAGE_PAGE_SIZE })
       if (!isLatestLoad(seq, id)) return
-      messages.value = Array.isArray(response) ? response.map(normalizeMessage) : []
+      const page = Array.isArray(response) ? response.map(normalizeMessage) : []
+      messages.value = page
+      hasMoreMessages.value = page.length >= MESSAGE_PAGE_SIZE
       const conversation = conversations.value.find((item) => item.id === id)
       if (conversation?.knowledge_base_id) {
         selectedKnowledgeBaseId.value = conversation.knowledge_base_id
@@ -92,6 +102,31 @@ export const useChatStore = defineStore('chat', () => {
       }
     } finally {
       if (seq === loadSeq) loading.value = false
+    }
+  }
+
+  // 向前翻页：以当前最旧一条的 id 作游标，把更早的一页拼到列表头部。
+  // 后端按 id 游标返回，翻页不会重复也不会漏；返回不足一页即说明已经到最早一条。
+  async function loadOlderMessages() {
+    const id = currentId.value
+    const oldest = messages.value.find((message) => message.id != null)
+    if (!id || !oldest || !hasMoreMessages.value || loadingOlderMessages.value) return
+    loadingOlderMessages.value = true
+    try {
+      const response = await chatAPI.getMessages(id, {
+        limit: MESSAGE_PAGE_SIZE,
+        before_id: oldest.id,
+      })
+      if (currentId.value !== id) return
+      const older = Array.isArray(response) ? response.map(normalizeMessage) : []
+      const known = new Set(messages.value.map((message) => message.id))
+      const fresh = older.filter((message) => message.id == null || !known.has(message.id))
+      if (fresh.length) {
+        messages.value = [...fresh, ...messages.value]
+      }
+      hasMoreMessages.value = older.length >= MESSAGE_PAGE_SIZE
+    } finally {
+      loadingOlderMessages.value = false
     }
   }
 
@@ -391,12 +426,22 @@ export const useChatStore = defineStore('chat', () => {
   async function refreshMessages(id = currentId.value, options = {}) {
     const { shouldWrite = null } = options
     if (!id) return []
-    const response = await chatAPI.getMessages(id)
-    const nextMessages = Array.isArray(response) ? response : []
+    // 刷新只取最新一页。已翻出的更早历史按 id 拼回列表头部，否则轮询刷新会把用户
+    // 翻过的历史截断；取页大小按已加载条数放大（仍受后端上限约束）。
+    const isCurrent = id === currentId.value
+    const limit = isCurrent
+      ? Math.min(MESSAGE_MAX_LIMIT, Math.max(MESSAGE_PAGE_SIZE, messages.value.length))
+      : MESSAGE_PAGE_SIZE
+    const response = await chatAPI.getMessages(id, { limit })
+    const page = (Array.isArray(response) ? response : []).map(normalizeMessage)
+    const oldestPageId = page.length ? page[0].id : null
+    const loadedOlder = isCurrent && oldestPageId != null
+      ? messages.value.filter((message) => message.id != null && message.id < oldestPageId)
+      : []
     const localAssistantMessages = messages.value.filter(
       (message) => message.role === 'assistant' && message.isLocal
     )
-    const mergedMessages = nextMessages.map(normalizeMessage)
+    const mergedMessages = [...loadedOlder, ...page]
     const latestBackendAssistant = [...mergedMessages].reverse().find(
       (message) => message.role === 'assistant'
     )
@@ -419,6 +464,10 @@ export const useChatStore = defineStore('chat', () => {
     }
     if (currentId.value === id && (!shouldWrite || shouldWrite())) {
       messages.value = mergedMessages
+      if (isCurrent && !loadedOlder.length) {
+        // 没有已翻出的历史时，本页是否取满就决定还能不能再向前翻。
+        hasMoreMessages.value = page.length >= limit
+      }
     }
     return mergedMessages
   }
@@ -487,6 +536,7 @@ export const useChatStore = defineStore('chat', () => {
     viewEpoch += 1
     currentId.value = null
     messages.value = []
+    hasMoreMessages.value = false
     stopEvaluationPolling()
   }
 
@@ -525,6 +575,8 @@ export const useChatStore = defineStore('chat', () => {
     currentId,
     messages,
     loading,
+    hasMoreMessages,
+    loadingOlderMessages,
     historyManageMode,
     selectedConversationIds,
     streaming,
@@ -538,6 +590,7 @@ export const useChatStore = defineStore('chat', () => {
     currentConversation,
     fetchConversations,
     selectConversation,
+    loadOlderMessages,
     addMessage,
     replaceMessages,
     refreshMessages,

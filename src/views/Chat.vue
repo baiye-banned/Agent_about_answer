@@ -78,6 +78,16 @@
       </section>
 
       <section v-else class="mx-auto max-w-5xl space-y-5">
+        <div v-if="chatStore.hasMoreMessages" class="flex justify-center">
+          <el-button
+            text
+            size="small"
+            :loading="chatStore.loadingOlderMessages"
+            @click="loadOlderMessages"
+          >
+            加载更早的消息
+          </el-button>
+        </div>
         <article
           v-for="(message, index) in chatStore.messages"
           :key="`${message.role}-${index}-${message.created_at || index}`"
@@ -682,6 +692,19 @@ function scrollToBottom() {
   nextTick(() => {
     chatRef.value?.scrollTo({ top: chatRef.value.scrollHeight, behavior: 'smooth' })
   })
+}
+
+// 向前翻页会把更早的消息插到列表头部，这里按插入高度补回 scrollTop，
+// 否则用户点一次「加载更早的消息」就会被弹到那批老消息的开头。
+async function loadOlderMessages() {
+  const container = chatRef.value
+  const previousHeight = container?.scrollHeight ?? 0
+  const previousTop = container?.scrollTop ?? 0
+  await chatStore.loadOlderMessages()
+  await nextTick()
+  if (container) {
+    container.scrollTop = container.scrollHeight - previousHeight + previousTop
+  }
 }
 
 function openSources(sources) {
