@@ -3,6 +3,7 @@ import logging
 import os
 import secrets
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
@@ -64,6 +65,49 @@ def seed_default_users() -> list[str]:
     return created
 
 
+def _avatar_file_from_path(avatar_path: str) -> Path | None:
+    """把库里存的头像路径映射回头像目录里的文件；不是本服务写下的路径就返回 None。
+
+    avatar 列由上传接口写入、只在 profile 里读出去，但它是数据库里的值：历史数据、手工
+    订正或将来某个写接口都可能把它塞成 `../` 之类的路径，那条路径会直接变成删除目标，
+    所以这里只认「头像目录下的单个文件名」。
+    """
+    prefix = "/uploads/avatars/"
+    if not avatar_path or not avatar_path.startswith(prefix):
+        return None
+    filename = avatar_path[len(prefix):]
+    if not filename or filename in (".", "..") or filename != Path(filename).name:
+        return None
+    return AVATAR_DIR / filename
+
+
+def _remove_replaced_avatar(previous_avatar: str, new_avatar: str) -> None:
+    """删除被替换下来的旧头像文件；删不掉只记日志，不影响新头像已经生效。
+
+    先落库、后删文件：库里指向新文件、磁盘上最多多留一个旧文件（可回收）；反过来一旦
+    落库失败，avatar 列会指向一个已经被删掉的文件，用户头像直接 404，而旧文件已经没了。
+    """
+    # 首次上传没有旧文件；同一秒内重复上传同扩展名会落到同一个文件名，
+    # 那个路径此刻就是刚写进去的新文件，不能当旧文件删掉。
+    if not previous_avatar or previous_avatar == new_avatar:
+        return
+    target = _avatar_file_from_path(previous_avatar)
+    if target is None:
+        return
+    try:
+        target.unlink()
+    except FileNotFoundError:
+        # 文件已经不在了：旧头像不可达这个目标状态已经满足。
+        return
+    except OSError as exc:
+        logger.warning(
+            "replaced avatar cleanup failed: path=%s error=%s",
+            previous_avatar,
+            exc,
+            exc_info=exc,
+        )
+
+
 def get_profile(user: User = Depends(get_current_user)):
     return crud_user.serialize_user_profile(user)
 
@@ -89,5 +133,8 @@ async def upload_avatar(file: UploadFile = File(...), user: User = Depends(get_c
     target = AVATAR_DIR / filename
     target.write_bytes(content)
 
-    crud_user.update_avatar_path(db, user, f"/uploads/avatars/{filename}")
+    previous_avatar = user.avatar or ""
+    new_avatar = f"/uploads/avatars/{filename}"
+    crud_user.update_avatar_path(db, user, new_avatar)
+    _remove_replaced_avatar(previous_avatar, new_avatar)
     return {"avatar": user.avatar}
