@@ -1,6 +1,33 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* 兼容桥：沿用仓库既有的 JS 配置（content 数组 + brand 色阶 + panel 阴影），
+   不把主题改写成 CSS-first —— 本次迁移的目标是不动样式，不是顺带重构配置。 */
+@config "../../tailwind.config.js";
+
+/* ---------------------------------------------------------------------------
+   v4 默认值回填：把 v3 的裸边框默认色补回来。
+
+   v4 的 preflight 把通用重置写成 `border: 0 solid`，简写里**不含颜色**，于是
+   `border-color` 落到 CSS 初始值 `currentColor`；v3 的 preflight 显式写的是
+   `border-color: theme('borderColor.DEFAULT')`，即 gray-200。本仓库模板里有 40 处
+   裸 `border`（不带颜色后缀），不回填的话这些边框会跟着文字色变（深色文字 → 深色边框），
+   全站观感整体改变，而且构建、CI、e2e 全绿，只有肉眼能看出来。
+
+   取迁移前产物的实读值做基准：v3 产物里该声明为 `border-color:#e5e7eb`，
+   与 v4 主题的 `--color-gray-200` 是同一个颜色（v4 把调色板改写成了 oklch 记法）。
+
+   放在 @layer base：utilities 层在其后，显式的 `border-<色>` 仍然照常覆盖这一条，
+   因此只有「没说颜色」的裸边框会拿到这里的默认值 —— 与 v3 的行为一致。
+   --------------------------------------------------------------------------- */
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentColor);
+  }
+}
 
 html,
 body,

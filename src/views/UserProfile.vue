@@ -20,7 +20,7 @@
             >
               <button
                 type="button"
-                class="relative rounded-full outline-none ring-brand-500 hover:ring-2 focus:ring-2"
+                class="relative rounded-full outline-hidden ring-brand-500 hover:ring-2 focus:ring-2"
                 title="点击上传头像"
               >
                 <el-avatar :size="60" :src="avatarSrc">{{ userStore.avatarText }}</el-avatar>
