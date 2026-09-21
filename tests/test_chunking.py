@@ -2,6 +2,7 @@ import pytest
 
 from crud.knowledge_file import (
     KNOWLEDGE_INDEX_MIN_COVERAGE_RATIO,
+    _LONG_HEADING_MAX_LEN,
     _heading_level,
     chunk_coverage_ratio,
     chunk_text,
@@ -20,6 +21,10 @@ ORDER_PREFIXES = ["三、", "（一）", "1、", "1. "]
 ORDER_BODY = CLAUSE_BODY
 LONG_ORDER_BODY_REPEATS = 6
 LONG_ORDER_BODY = ORDER_BODY * LONG_ORDER_BODY_REPEATS
+# 长度边界语料：45 字正文配上最长的 3 字标记「（一）」后整行恰好 48 字，
+# 卡在 _LONG_HEADING_MAX_LEN 上，四种前缀都只能靠句末标点被判定为正文。
+BOUNDARY_SENTENCE = "本制度适用于全体员工，由人事部门解释与修订。"
+BOUNDARY_BODY = f"{BOUNDARY_SENTENCE}{ORDER_BODY}"
 
 
 def _assert_clause_document_fully_indexed(source: str, chunks: list[dict]) -> None:
@@ -31,11 +36,11 @@ def _assert_clause_document_fully_indexed(source: str, chunks: list[dict]) -> No
     assert joined.count(CLAUSE_BODY) >= CLAUSE_COUNT * SENTENCES_PER_CLAUSE
 
 
-def _assert_order_document_fully_indexed(source: str, chunks: list[dict], body_repeats: int = 1) -> None:
-    """入库文本合计覆盖原文 ≥ 90%，且每一行的正文都真的进了库（无损）。"""
+def _assert_order_document_fully_indexed(source: str, chunks: list[dict], body: str, expected_count: int) -> None:
+    """入库文本合计覆盖原文 ≥ 90%，且每一行正文的每一句都真的进了库（无损）。"""
     assert chunk_coverage_ratio(source, chunks) >= 0.9
     joined = "\n".join(chunk["text"] for chunk in chunks)
-    assert joined.count(ORDER_BODY) >= ORDER_ROWS * body_repeats
+    assert joined.count(body) >= expected_count
 
 
 def test_chunk_text_tolerates_missing_text():
@@ -185,7 +190,7 @@ def test_chunk_text_keeps_order_text_when_marker_shares_short_line(prefix):
 
     chunks = chunk_text(source, file_id=1)
 
-    _assert_order_document_fully_indexed(source, chunks)
+    _assert_order_document_fully_indexed(source, chunks, ORDER_BODY, ORDER_ROWS)
 
 
 @pytest.mark.parametrize("prefix", ORDER_PREFIXES)
@@ -199,7 +204,22 @@ def test_chunk_text_keeps_order_text_when_marker_shares_long_line(prefix):
 
     chunks = chunk_text(source, file_id=1)
 
-    _assert_order_document_fully_indexed(source, chunks, body_repeats=LONG_ORDER_BODY_REPEATS)
+    _assert_order_document_fully_indexed(
+        source, chunks, ORDER_BODY, ORDER_ROWS * LONG_ORDER_BODY_REPEATS
+    )
+
+
+@pytest.mark.parametrize("prefix", ORDER_PREFIXES)
+def test_chunk_text_keeps_order_text_at_heading_length_boundary(prefix):
+    """issue #75 边界：整行最多 48 字，长度阈值救不了场，四种前缀都要靠句末标点判定为正文。"""
+    line = f"{prefix}{BOUNDARY_BODY}"
+    assert len(f"（一）{BOUNDARY_BODY}") == _LONG_HEADING_MAX_LEN
+    assert len(line) <= _LONG_HEADING_MAX_LEN
+    source = "\n".join(line for _ in range(ORDER_ROWS))
+
+    chunks = chunk_text(source, file_id=1)
+
+    _assert_order_document_fully_indexed(source, chunks, BOUNDARY_SENTENCE, ORDER_ROWS)
 
 
 @pytest.mark.parametrize("prefix", ORDER_PREFIXES)
