@@ -66,16 +66,51 @@ def ingest_deadline() -> float:
     return asyncio.get_running_loop().time() + KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS
 
 
-def submit_ingest_work(step: Callable[..., Any], args: tuple) -> tuple:
-    """把一步入库工作提交到入库池，返回 (底层 concurrent future, asyncio future)。
+def _submit_on(executor: ThreadPoolExecutor, step: Callable[..., Any], args: tuple) -> tuple:
+    """把一步同步工作提交到指定线程池，返回 (底层 concurrent future, asyncio future)。
 
     自己 submit + wrap_future，而不是用 loop.run_in_executor：后者只返回 asyncio
     那一层，而 asyncio.wait_for 超时时会立刻取消并**完成**它——哪怕工作线程还在跑。
     要判断「工作线程真的跑完了」，必须持有底层 concurrent future，
     超时清理正是挂在它上面（见 defer_ingest_cleanup）。
     """
-    work = _INDEX_EXECUTOR.submit(partial(step, *args))
+    work = executor.submit(partial(step, *args))
     return work, asyncio.wrap_future(work)
+
+
+def submit_ingest_work(step: Callable[..., Any], args: tuple) -> tuple:
+    """把一步入库工作提交到入库池，返回 (底层 concurrent future, asyncio future)。"""
+    return _submit_on(_INDEX_EXECUTOR, step, args)
+
+
+async def _run_step_on(
+    executor: ThreadPoolExecutor,
+    step: Callable[..., Any],
+    args: tuple,
+    deadline: float | None,
+) -> Any:
+    """在线程池上执行一步同步工作，deadline 非 None 时给整份文档的总预算。
+
+    入库与清理共用这一份超时语义：两条路径各写一遍，迟早会漂移成两种行为。
+    """
+    loop = asyncio.get_running_loop()
+    work, future = _submit_on(executor, step, args)
+    if deadline is None:
+        return await future
+
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        # 还没轮到执行：可以真的取消掉这个工作项（cancel 只对未开始的任务生效）。
+        work.cancel()
+        raise KnowledgeIngestTimeout(INGEST_TIMEOUT_MESSAGE, work)
+    try:
+        return await asyncio.wait_for(future, timeout=remaining)
+    except (asyncio.TimeoutError, TimeoutError):
+        # 两个都写：3.11 起 asyncio.TimeoutError 就是内建 TimeoutError 的别名，
+        # 而 3.10 上它是另一个类（继承自 Exception），只写内建那个接不住——
+        # 超时会落到下面的通用失败分支：既不报「超过总时限」，也走不到排在写入线程
+        # 之后的清理，等于把这一项的两个修复一起绕过去。CI 的 Python 3.10 实测过。
+        raise KnowledgeIngestTimeout(INGEST_TIMEOUT_MESSAGE, work)
 
 
 async def run_ingest_step(step: Callable[..., Any], /, *args: Any, deadline: float | None = None) -> Any:
@@ -94,24 +129,21 @@ async def run_ingest_step(step: Callable[..., Any], /, *args: Any, deadline: flo
     因此超时抛出的 KnowledgeIngestTimeout 会带上那个 future，
     调用方必须把清理排在它之后，否则删掉的向量会被还在跑的批次重新写回来。
     """
-    loop = asyncio.get_running_loop()
-    work, future = submit_ingest_work(step, args)
-    if deadline is None:
-        return await future
+    return await _run_step_on(_INDEX_EXECUTOR, step, args, deadline)
 
-    remaining = deadline - loop.time()
-    if remaining <= 0:
-        # 还没轮到执行：可以真的取消掉这个工作项（cancel 只对未开始的任务生效）。
-        work.cancel()
-        raise KnowledgeIngestTimeout(INGEST_TIMEOUT_MESSAGE, work)
-    try:
-        return await asyncio.wait_for(future, timeout=remaining)
-    except (asyncio.TimeoutError, TimeoutError):
-        # 两个都写：3.11 起 asyncio.TimeoutError 就是内建 TimeoutError 的别名，
-        # 而 3.10 上它是另一个类（继承自 Exception），只写内建那个接不住——
-        # 超时会落到下面的通用失败分支：既不报「超过总时限」，也走不到排在写入线程
-        # 之后的清理，等于把这一项的两个修复一起绕过去。CI 的 Python 3.10 实测过。
-        raise KnowledgeIngestTimeout(INGEST_TIMEOUT_MESSAGE, work)
+
+async def run_cleanup_step(step: Callable[..., Any], /, *args: Any, deadline: float | None = None) -> Any:
+    """在清理专用线程池上执行一步同步清理工作（删向量）。
+
+    返工轮 minor-1：失败分支原本走 run_ingest_step，即排进只有
+    KNOWLEDGE_INDEX_MAX_WORKERS 个槽位的入库池——被卡死的写入线程占满时这一步会
+    无限期排队（对抗评审实测 1.5s 未完成），而且 deadline=None 时 `await future`
+    本身没有上限，等于把已经失败的请求再挂死一次。这里换成独立池 + 可选总时限。
+
+    deadline 由调用方给（上传链路用 ingest_deadline()，与入库共用同一把尺子）。
+    超时同样只放弃等待：工作项已经提交、会在后台跑完，留痕交由调用方。
+    """
+    return await _run_step_on(_CLEANUP_EXECUTOR, step, args, deadline)
 
 
 def defer_ingest_cleanup(work, entry_id: int, user_id: int) -> None:
@@ -453,7 +485,17 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
     except Exception as exc:
         logger.warning("Knowledge file indexing failed: file_id=%s error=%s", entry.id, exc, exc_info=True)
         try:
-            await run_ingest_step(delete_file_chunks, entry.id)
+            # 清理走清理专用池并自带总时限（minor-1）：入库池只有 4 个槽位，被卡死的
+            # 写入线程占满时这一步会无限期排队；不设上限还会把已经失败的请求再挂死。
+            # 超时只放弃等待——工作项已提交、会在后台跑完，下面的删行照常进行。
+            await run_cleanup_step(delete_file_chunks, entry.id, deadline=ingest_deadline())
+        except KnowledgeIngestTimeout as cleanup_exc:
+            logger.warning(
+                "Vector cleanup timed out after indexing failure, abandoned the wait: file_id=%s error=%s",
+                entry.id,
+                cleanup_exc,
+                exc_info=True,
+            )
         except Exception as cleanup_exc:
             logger.warning("Failed to clean partially indexed chunks: file_id=%s error=%s", entry.id, cleanup_exc, exc_info=True)
         try:

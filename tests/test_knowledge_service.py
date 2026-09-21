@@ -715,3 +715,59 @@ def test_upload_knowledge_cleans_up_off_the_event_loop_when_the_budget_expires_w
     assert [name for name, _, _ in cleanup_threads] == ["vectors", "mysql"]
     # 超时兜底的整段清理（外呼 + 删行）都不得落回事件循环线程。
     assert all(tid != threading.get_ident() for _, _, tid in cleanup_threads)
+
+
+def test_upload_knowledge_failure_cleanup_does_not_queue_behind_a_saturated_ingest_pool(monkeypatch):
+    """返工轮 minor-1：失败分支的删向量不得排在入库池后面，也不能无界等待。
+
+    先证红：入库池只有 KNOWLEDGE_INDEX_MAX_WORKERS 个槽位，被卡死的写入线程占满时
+    run_ingest_step(delete_file_chunks) 会无限期排队（对抗评审实测 1.5s 未完成），
+    而 deadline=None 的 `await future` 本身也没有上限——已经失败的请求再被挂死一次。
+    清理改走清理专用池 + 自带总时限后，卡死的入库池挡不住它。
+    """
+    calls = []
+    cleanup_threads = []
+    release = threading.Event()
+    _patch_upload(monkeypatch, calls, RuntimeError("unused"))
+    monkeypatch.setattr(knowledge_service, "SessionLocal", lambda: _CleanupSession(calls))
+    monkeypatch.setattr(
+        knowledge_service,
+        "delete_file_chunks",
+        lambda file_id: cleanup_threads.append(("vectors", file_id, threading.get_ident())),
+    )
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "delete_knowledge_file",
+        lambda db, file_id, user_id: cleanup_threads.append(("mysql", file_id, threading.get_ident())),
+    )
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(knowledge_service, "_INDEX_EXECUTOR", pool)
+
+    def add_chunks_then_occupy_the_pool(*args, **kwargs):
+        # 先把唯一的槽位交给一个卡死的工作项（FIFO 排在 add_chunks 之后），再抛错——
+        # 于是清理提交时入库池一定是满的，不依赖线程调度时序。
+        pool.submit(release.wait, 10)
+        raise RuntimeError("milvus unavailable")
+
+    monkeypatch.setattr(knowledge_service, "add_chunks", add_chunks_then_occupy_the_pool)
+
+    try:
+        started = time.perf_counter()
+        with pytest.raises(HTTPException) as exc_info:
+            _upload()
+        elapsed = time.perf_counter() - started
+    finally:
+        release.set()
+        pool.shutdown(wait=False)
+
+    assert exc_info.value.detail == "知识文件上传失败，向量库写入异常。"
+    # 关键断言：入库池还卡着（卡死的工作项要 10 秒才自己松口），请求却要立刻收口。
+    # 修复前这一步排在入库池后面，只能等卡死线程让位——实测这里要 30 秒（阻塞时长）；
+    # 走清理专用池后是毫秒级，3 秒的上限非常宽松。
+    assert elapsed < 3, f"清理排在了入库池后面：请求被挂了 {elapsed:.1f}s"
+    assert [name for name, _, _ in cleanup_threads] == ["vectors", "mysql"]
+    # 这条分支的删行走请求级 Session、留在请求线程里（既有语义），只有向量清理
+    # 搬到了清理专用池——它才是会排在入库池后面、把请求挂住的那一步。
+    vectors_thread = next(tid for name, _, tid in cleanup_threads if name == "vectors")
+    assert vectors_thread != threading.get_ident()
