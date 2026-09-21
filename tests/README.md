@@ -56,14 +56,17 @@ Current files:
 - `ciGateScripts.test.js`
 - `clipboard.test.js`
 - `detailPreview.test.js`
+- `fileListRequest.test.js`
 - `knowledgeFeedback.test.js`
 - `knowledgeUploadTypes.test.js`
+- `knowledgeViewWiring.test.js`
 - `markdownSanitize.test.js`
 - `streamEvents.test.js`
+- `traceVariableFlowMount.test.js`
 - `url.test.js`
 - `utils.test.js`
 
-These tests cover frontend stream parsing, stream response errors, chat store conversation switching, stale in-flight response handling and fallback reset events, knowledge file detail preview ordering (a late response from a previously opened file must not rewrite the current one, and closing the dialog discards in-flight requests), clipboard fallback behavior, knowledge batch delete and upload feedback helpers, the shared delete confirmation orchestration (user cancel, API rejection, and success outcomes), the upload-type whitelist staying in sync with the backend's accepted extensions (a static cross-check against `backend/service/utils_service.py`), HTML sanitization of rendered markdown (script/style/event-handler stripping, the element allowlist, and disallowed elements being dropped together with their content), URL normalization and link safety, display formatting, status helpers, image validation, the CI gate scripts (`scripts/check_issue.mjs`, `scripts/check_pr_body.mjs` and their shared `scripts/lib/markdown_sanitize.mjs`: the comment sanitizer's invariants - no comment start marker left behind, no section heading deleted by an unpaired marker - plus both gates' pass/fail verdicts on the fixtures in `tests/fixtures/ci-gate/`, including the code-fence behaviour that is deliberate rather than an oversight), and memory trace helpers.
+These tests cover frontend stream parsing, stream response errors, chat store conversation switching, stale in-flight response handling and fallback reset events, knowledge file detail preview ordering (a late response from a previously opened file must not rewrite the current one, and closing the dialog discards in-flight requests), clipboard fallback behavior, knowledge batch delete and upload feedback helpers, the shared delete confirmation orchestration (user cancel, API rejection, and success outcomes), the upload-type whitelist staying in sync with the backend's accepted extensions (a static cross-check against `backend/service/utils_service.py`), HTML sanitization of rendered markdown (script/style/event-handler stripping, the element allowlist, and disallowed elements being dropped together with their content), URL normalization and link safety, display formatting, status helpers, image validation, the CI gate scripts (`scripts/check_issue.mjs`, `scripts/check_pr_body.mjs` and their shared `scripts/lib/markdown_sanitize.mjs`: the comment sanitizer's invariants - no comment start marker left behind, no section heading deleted by an unpaired marker - plus both gates' pass/fail verdicts on the fixtures in `tests/fixtures/ci-gate/`, including the code-fence behaviour that is deliberate rather than an oversight), memory trace helpers, and the mounted-SFC layer for `TraceVariableFlow.vue` (`traceVariableFlowMount.test.js`: `@vue/compiler-sfc` compiles the real SFC, jsdom hosts it and Element Plus supplies the real `el-switch`, so the assertions cover the main-line/branch classification, the only-main-line and expand-branch switch linkage including the reset of the expand state, the variable inspector's selection, same-name upstream/downstream wiring and full-value rendering, and the clipboard toast paths - see the file header for which of the component's two state-sync watchers is reachable from the UI and which one is not).
 
 ## Python Tests
 

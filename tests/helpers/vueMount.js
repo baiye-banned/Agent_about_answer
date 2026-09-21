@@ -5,7 +5,8 @@
 // <script setup>：胶水层（调哪个 helper、toast 级别、失败时状态复位）至今只靠阅读。
 //
 // 这里不引入 vitest / @vue/test-utils 之类的新体系，全部走 package.json 里已有的依赖：
-//   @vue/compiler-sfc   把 SFC 编译成模块代码（@vitejs/plugin-vue 的传递依赖）
+//   @vue/compiler-sfc   把 SFC 编译成模块代码（由 vue 自己的 dependencies 带来，
+//                       不是本仓库的直接依赖，package.json 里查不到它）
 //   jsdom               提供 document（已有的 devDependency）
 //   vue / element-plus  已有的运行时依赖
 //
@@ -148,7 +149,9 @@ export async function mountSfc(filePath, options = {}) {
 
   let pinia = null
   if (options.pinia !== false) {
-    pinia = vue.createPinia?.() ?? (await import('pinia')).createPinia()
+    // createPinia 在 pinia 包里，vue 不导出它；动态 import 是为了走上面的加载钩子，
+    // 而不是可选链兜底。
+    pinia = (await import('pinia')).createPinia()
     app.use(pinia)
   }
 

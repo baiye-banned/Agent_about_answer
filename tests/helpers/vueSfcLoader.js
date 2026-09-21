@@ -129,6 +129,10 @@ export async function load(url, context, nextLoad) {
   const source = readFileSync(filename, 'utf8')
 
   if (isVue) {
+    // 这个包由 vue 自己的 dependencies 提供（`vue` -> `@vue/compiler-sfc`），
+    // package.json 里没有直接声明它。上游若把它从 vue 的依赖树里摘掉，这里会以
+    // ERR_MODULE_NOT_FOUND 暴露；不加显式声明是刻意的——那会改动 package.json
+    // 与 lockfile，超出本次纯测试改动的面。
     const { parse, compileScript } = await import('@vue/compiler-sfc')
     const { descriptor, errors } = parse(source, { filename })
     if (errors.length) throw new Error(`解析 ${filename} 失败：${errors[0].message}`)
