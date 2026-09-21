@@ -18,7 +18,7 @@ from model.models import Conversation, Message, User, _new_id
 from rag.ragas_eval import schedule_ragas_evaluation
 from schema.schemas import ChatRequest, RenameRequest
 from service.auth_service import decode_token, get_current_user
-from service.oss_service import _public_oss_url, _put_oss_object
+from service.oss_service import _delete_oss_object, _public_oss_url, _put_oss_object
 from service.trace_service import _safe_trace_add, _safe_trace_attach, _safe_trace_finish, _trace_sse_payloads
 from service.utils_service import (
     CHAT_ATTACHMENT_MAX_BYTES,
@@ -109,13 +109,38 @@ def get_messages(cid: str,
     return [crud_chat.serialize_message(m) for m in rows]
 
 
+def _reclaim_chat_attachments(object_keys: list[str]) -> None:
+    """尽力回收会话里的聊天附件对象，任何一个删不掉都不影响会话删除的结果。
+
+    顺序是「先落库、后回收」：数据库是权威，最坏情况是 OSS 上多留一个孤儿对象（占空间、
+    可重跑、可对账）；反过来先删对象再删行，一旦删行失败，用户会看到一个仍然存在的会话里
+    图片全部失效——对象存储没有回收站，那是不可逆的内容丢失，比泄漏一个对象严重得多。
+
+    失败只记 warning 不上抛：会话此时已经删掉了，再把回收失败变成 5xx 只会让用户以为
+    没删成功而去重试。日志带上 object_key，便于按对象对账后重跑（删除本身是幂等的）。
+    """
+    for object_key in object_keys:
+        try:
+            _delete_oss_object(object_key)
+        except Exception as exc:
+            logger.warning(
+                "chat attachment reclaim failed: object_key=%s error=%s",
+                object_key,
+                exc,
+                exc_info=exc,
+            )
+
+
 def delete_conversation(cid: str, user: User = Depends(get_current_user),
                         db: Session = Depends(get_db)):
+    # 对象键必须在删行之前取：messages 随会话级联删除，删完就再也读不到引用了哪些对象。
+    attachment_keys = crud_chat.list_conversation_attachment_keys(db, cid, user.id)
     conv = crud_chat.delete_conversation(db, cid, user.id)
     if not conv:
         raise HTTPException(404, "对话不存在")
     # clean checkpointer state
     delete_thread_checkpoints(cid)
+    _reclaim_chat_attachments(attachment_keys or [])
     return {"message": "ok"}
 
 

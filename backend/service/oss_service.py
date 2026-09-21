@@ -59,6 +59,34 @@ async def _put_oss_object(object_key: str, content: bytes, content_type: str):
         raise RuntimeError(f"{response.status_code} {response.text[:200]}")
 
 
+def _delete_oss_object(object_key: str) -> None:
+    """删除一个对象。
+
+    404 不算失败：删除的目标状态是「对象不存在」，对象本来就不在时该状态已经满足，
+    重跑一次回收（或两个会话引用了同一个对象键）不应该报错。
+
+    同步实现：调用点是同步的删除接口（FastAPI 用线程池跑），不为了回收附件把整条
+    删除链路改成 async；同模块的上传路径保持 async 不变。
+    """
+    _ensure_oss_config()
+    host = _oss_host()
+    date = formatdate(usegmt=True)
+    resource = f"/{OSS_BUCKET}/{object_key}"
+    string_to_sign = f"DELETE\n\n\n{date}\n{resource}"
+    signature = _oss_signature(string_to_sign)
+    url = f"https://{host}{_oss_object_path(object_key)}"
+    headers = {
+        "Authorization": f"OSS {OSS_ACCESS_KEY_ID}:{signature}",
+        "Date": date,
+        "Host": host,
+    }
+
+    with httpx.Client(timeout=30) as client:
+        response = client.delete(url, headers=headers)
+    if response.status_code >= 400 and response.status_code != 404:
+        raise RuntimeError(f"{response.status_code} {response.text[:200]}")
+
+
 def _sign_oss_url(object_key: str, expires: int = 3600) -> str:
     _ensure_oss_config()
     expires_at = int(time.time()) + expires
