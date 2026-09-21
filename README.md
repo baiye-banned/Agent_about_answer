@@ -568,6 +568,8 @@ npm test
 Python 测试：
 
 ```bash
+# pytest 不在 backend/requirements.txt 里（该文件只列线上运行时依赖），测试工具要单独安装
+pip install pytest
 python -m pytest -q tests
 ```
 

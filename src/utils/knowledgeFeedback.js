@@ -81,9 +81,11 @@ export function describeCreateRefreshFailure(error) {
   return `知识库已创建，但列表刷新失败：${getApiErrorMessage(error, CREATE_REFRESH_FAILED_HINT)}`
 }
 
-// 刷新失败的处置在删除与创建两条链上完全一致（都不抛出、都交给调用方的 notifyError
-// 出口），只有文案里的操作名不同。收口的形态由这一份实现给出，两个具名出口各自绑定文案，
-// 免得两处各写一份 try/catch 后各自漂移 —— 创建面正是这么漂出来的（#157 与 #154 同族）。
+// 刷新失败的处置在删除、创建与上传三条链上完全一致（都不抛出、都交给调用方的
+// notifyError 出口），只有文案里的操作名不同。收口的形态由这一份实现给出，三个具名出口
+// 各自绑定文案，免得几处各写一份 try/catch 后各自漂移 —— 创建面（#157）与上传面
+// （issue #154：刷新的裸 await 留在了上传自己的 try 里，被上传的 catch 接走）
+// 都是这么漂出来的。
 export async function refreshAfterMutation({ refresh, notifyError, describeFailure }) {
   try {
     await refresh()
@@ -110,6 +112,25 @@ export async function refreshAfterCreate({ refresh, notifyError }) {
     refresh,
     notifyError,
     describeFailure: describeCreateRefreshFailure,
+  })
+}
+
+export const UPLOAD_REFRESH_FAILED_HINT = '请手动刷新页面'
+
+// 与 describeDeleteRefreshFailure 同一条规则：刷新失败不等于操作失败。
+// 上传成功后的刷新此前留在 handleUpload 的 try 内裸 await，刷新一失败就被上传自己的
+// catch 接走，逐字弹「上传失败，请稍后重试」——而文件其实已经入库，列表只是没跟上。
+// 用户据此重传会真的再入一份（后端对文件名没有唯一约束），所以文案必须先认下「上传成功」。
+export function describeUploadRefreshFailure(error) {
+  return `上传成功，但列表刷新失败：${getApiErrorMessage(error, UPLOAD_REFRESH_FAILED_HINT)}`
+}
+
+// 上传成功后的刷新出口，与删除侧同形：失败只报「刷新失败」，不回写上传失败态。
+export async function refreshAfterUpload({ refresh, notifyError }) {
+  return refreshAfterMutation({
+    refresh,
+    notifyError,
+    describeFailure: describeUploadRefreshFailure,
   })
 }
 

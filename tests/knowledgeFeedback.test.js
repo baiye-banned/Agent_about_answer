@@ -11,15 +11,18 @@ import {
   DELETE_FAILED,
   DELETE_REFRESH_FAILED_HINT,
   DELETE_SUCCEEDED,
+  UPLOAD_REFRESH_FAILED_HINT,
   computeUploadPercent,
   describeBatchDeleteResult,
   describeCreateRefreshFailure,
   describeDeleteRefreshFailure,
+  describeUploadRefreshFailure,
   describeUploadSuccess,
   hasDeletedAnyFile,
   isConfirmCancellation,
   refreshAfterCreate,
   refreshAfterDelete,
+  refreshAfterUpload,
   runConfirmedDelete,
   uploadFilesInOrder,
 } from '../src/utils/knowledgeFeedback.js'
@@ -353,6 +356,75 @@ test('describeDeleteRefreshFailure says the delete succeeded and falls back to t
     describeDeleteRefreshFailure({}),
     `删除成功，但列表刷新失败：${DELETE_REFRESH_FAILED_HINT}`
   )
+})
+
+// 上传面（issue #154）。与删除面同一条规则，但失败不得被读成「上传失败」：
+// 文件已经入库，用户据此重传会真的再入一份（后端对文件名没有唯一约束）。
+
+test('describeUploadRefreshFailure says the upload succeeded and falls back to the shared hint', () => {
+  assert.match(describeUploadRefreshFailure(new Error('boom')), /^上传成功，但列表刷新失败：/)
+  assert.ok(describeUploadRefreshFailure({}).endsWith(UPLOAD_REFRESH_FAILED_HINT))
+  assert.equal(
+    describeUploadRefreshFailure({}),
+    `上传成功，但列表刷新失败：${UPLOAD_REFRESH_FAILED_HINT}`
+  )
+  // 承重：这条文案里不能出现「上传失败」。逐字误报正是本项的缺陷形态。
+  assert.ok(
+    !describeUploadRefreshFailure({}).includes('上传失败'),
+    '刷新失败的文案不得含「上传失败」：文件已经入库了'
+  )
+  // 接口给了可显示的原因时用它，而不是笼统的兜底。
+  const error = new Error('Request failed with status code 500')
+  error.response = { status: 500, data: { detail: '服务暂时不可用' } }
+  assert.equal(
+    describeUploadRefreshFailure(error),
+    '上传成功，但列表刷新失败：服务暂时不可用'
+  )
+})
+
+test('refreshAfterUpload returns true and stays silent when the refresh succeeds', async () => {
+  const notifications = []
+  let refreshed = 0
+
+  const result = await refreshAfterUpload({
+    refresh: async () => {
+      refreshed += 1
+    },
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(result, true)
+  assert.equal(refreshed, 1)
+  assert.deepEqual(notifications, [])
+})
+
+test('refreshAfterUpload captures a failed refresh instead of returning a rejected promise', async () => {
+  // 参数是模板事件处理器：返回被拒 Promise 就是一条 unhandledrejection，
+  // 用户什么都看不到。刷新失败必须被捕获并转成一条带归属的提示。
+  const notifications = []
+  const error = new Error('网络连接已断开')
+
+  const result = await refreshAfterUpload({
+    refresh: () => Promise.reject(error),
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(result, false)
+  assert.deepEqual(notifications, ['上传成功，但列表刷新失败：网络连接已断开'])
+})
+
+test('refreshAfterUpload also captures synchronous throws from the refresh closure', async () => {
+  const notifications = []
+
+  const result = await refreshAfterUpload({
+    refresh: () => {
+      throw new Error('同步炸了')
+    },
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(result, false)
+  assert.equal(notifications.length, 1)
 })
 
 // issue #157：创建成功之后的刷新与删除侧同款收口。
