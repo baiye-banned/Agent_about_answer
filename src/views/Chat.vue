@@ -95,7 +95,7 @@
         >
           <div
             :class="[
-              'group relative max-w-[82%] rounded-lg px-4 py-3 shadow-sm',
+              'group relative max-w-[82%] rounded-lg px-4 py-3 shadow-xs',
               message.role === 'user'
                 ? 'bg-brand-600 text-white'
                 : 'border border-slate-200 bg-white text-slate-700',
@@ -174,7 +174,7 @@
 
             <div
               v-if="message.role === 'assistant'"
-              class="pointer-events-none absolute right-2 top-2 flex rounded-md border border-slate-200 bg-white/95 opacity-0 shadow-sm transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100"
+              class="pointer-events-none absolute right-2 top-2 flex rounded-md border border-slate-200 bg-white/95 opacity-0 shadow-xs transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100"
             >
               <el-tooltip content="复制" placement="bottom">
                 <el-button link :icon="CopyDocument" @click="copyMessage(message.content)" />
@@ -187,7 +187,7 @@
         </article>
 
         <article v-if="isCurrentConversationStreaming" class="flex justify-start">
-          <div class="max-w-[82%] rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-sm">
+          <div class="max-w-[82%] rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-xs">
             <div class="mb-2 flex items-center gap-2 text-xs text-slate-500">
               <el-icon><Loading /></el-icon>
               <span>AI 正在生成</span>

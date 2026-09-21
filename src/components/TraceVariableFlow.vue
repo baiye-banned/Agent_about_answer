@@ -31,7 +31,7 @@
           <article
             v-for="row in displayedMainRows"
             :key="row.id"
-            class="rounded-lg border border-slate-200 bg-white p-3 shadow-sm"
+            class="rounded-lg border border-slate-200 bg-white p-3 shadow-xs"
           >
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div class="min-w-0">
@@ -102,7 +102,7 @@
           <article
             v-for="row in showBranches ? branchRows : []"
             :key="row.id"
-            class="rounded-lg border border-amber-200 bg-white p-3 shadow-sm"
+            class="rounded-lg border border-amber-200 bg-white p-3 shadow-xs"
           >
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div class="min-w-0">
@@ -150,7 +150,7 @@
         </section>
       </div>
 
-      <aside class="min-w-0 rounded-lg border border-slate-200 bg-white p-3 shadow-sm xl:sticky xl:top-0 xl:max-h-[72vh] xl:overflow-auto">
+      <aside class="min-w-0 rounded-lg border border-slate-200 bg-white p-3 shadow-xs xl:sticky xl:top-0 xl:max-h-[72vh] xl:overflow-auto">
         <div class="flex items-center justify-between gap-3">
           <div>
             <p class="text-sm font-semibold text-slate-800">变量检视器</p>
