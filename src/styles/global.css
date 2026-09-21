@@ -29,6 +29,40 @@
   }
 }
 
+/* ---------------------------------------------------------------------------
+   v4 默认值回填：把 v3 的 ring 默认色补回来。
+
+   v4 的 ring 宽度工具类把阴影写成 `... var(--tw-ring-color, currentcolor)`，
+   而 preflight 在 `*, ::before, ::after, ::backdrop` 上把该变量置为 `initial`。
+   于是「写了环宽、没写环色」的元素会一路回退到 `currentcolor` —— 即元素自身的
+   文字色，且**不带 alpha**。
+
+   v3 的 preflight 在同一组选择器上显式写着 `--tw-ring-color: rgb(59 130 246 / .5)`
+   （blue-500 @ 50%）。所以同一个 `ring-1` 在两版里画出的光环并不相同：迁移前是
+   浅蓝半透明，迁移后是深蓝不透明。构建、CI、e2e 都不会报错，只有肉眼看得出来。
+
+   本仓库现有两处 ring 用法（全仓 grep `ring-` 仅此两处）：
+     - `src/views/Layout.vue:81` 选区态 `ring-1 ring-brand-200` —— 命中。`brand` 色阶只有
+       50/100/500/600/700，没有 200 键，`ring-brand-200` 在 v3/v4 两版产物里都不存在
+       （历史空类），颜色只能走默认值；该元素又同时带 `text-brand-700`，回退结果落在深蓝。
+       这是本仓库唯一实际发生位移的元素。
+     - `src/views/UserProfile.vue:23` `ring-brand-500 hover:ring-2 focus:ring-2` —— 颜色显式，
+       静止与交互态都不受默认值影响；其 hover/focus 只改环宽，环色同样取自这里。
+
+   放在 @layer base 且写在 `@import "tailwindcss"` 之后：同层内后写的同特异度规则覆盖
+   v4 preflight 的 `--tw-ring-color: initial`；utilities 层在其后，显式的 `ring-<色>`
+   仍然照常覆盖这一条。选择器与 v4 preflight 逐字对齐（不含 `::file-selector-button`），
+   因此覆盖范围恰好是 v4 置过初值的那一组元素，不额外放宽。
+   --------------------------------------------------------------------------- */
+@layer base {
+  *,
+  ::before,
+  ::after,
+  ::backdrop {
+    --tw-ring-color: rgb(59 130 246 / 0.5);
+  }
+}
+
 html,
 body,
 #app {
