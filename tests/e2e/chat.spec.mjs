@@ -48,6 +48,11 @@ const QUESTION = '员工出差回来多久内必须提交报销？'
 //   2. v4 改过默认值的裸 `border` 边框色。v4 的 preflight 是 `border: 0 solid`，
 //      简写不含颜色 ⇒ `border-color` 回落到 `currentColor`；v3 默认是 gray-200。
 //      仓库里只有 1 处元素真的落在默认值上（其余都带显式色号），肉眼巡检极难覆盖。
+//   3. v4 一并改掉的 ring 默认色（issue #136）。v4 的 ring 宽度工具类是
+//      `... var(--tw-ring-color, currentcolor)`，preflight 又把该变量置为 initial，
+//      于是「写了环宽、没写环色」的元素回退到自身文字色；v3 的默认是 blue-500 @ 50%。
+//      侧栏选区态 `ring-1 ring-brand-200` 正是这个形态（`brand` 色阶没有 200 键，
+//      该类两版都不生成，颜色只能走默认值），而它只在管理模式勾选会话时才渲染。
 // ---------------------------------------------------------------------------
 
 // brand-600 = #1d4ed8；panel 阴影 = 0 10px 30px rgba(15, 23, 42, 0.08)，两者都来自 tailwind.config.js。
@@ -56,6 +61,12 @@ const BRAND_600_RGB = 'rgb(29, 78, 216)'
 const BORDER_DEFAULT_RGB = 'rgb(229, 231, 235)'
 // 文字色：用来证明裸边框没有退化成 currentColor（那正是这次迁移的静默失败形态）。
 const BODY_TEXT_RGB = 'rgb(31, 41, 55)'
+// v3 preflight 的 ring 默认色 blue-500 @ 50%（`rgb(59 130 246 / .5)`）。断言打在
+// **合成后的 ring 层**上而不是 `--tw-ring-color` 变量：box-shadow 由浏览器归一化成
+// sRGB，与产物里的记法无关（产物压成了 `#3b82f680`，自定义属性则原样保留）。
+const RING_DEFAULT_LAYER = /rgba\(59, 130, 246, 0\.5\) 0px 0px 0px 1px/
+// 侧栏选区态元素自身的文字色 brand-700；ring 若退回 currentcolor 就会画成这个色。
+const BRAND_700_LAYER = /rgb\(30, 64, 175\) 0px 0px 0px 1px/
 
 // 知识库名带上运行标识：重名会被后端拒绝（「知识库名称已存在」），
 // 而 CI 复跑、本地连跑都不该互相干扰。
@@ -257,5 +268,42 @@ test('登录 → 建库 → 上传 → 提问 → 流式作答 → 引用可溯�
     await expect(drawer.getByText(/rerank\s+[\d.]/).first()).toBeVisible()
     await expect(drawer.getByText(/RRF\s+[\d.]/).first()).toBeVisible()
     await shot(page, testInfo, '7-sources-drawer')
+  })
+
+  await test.step('ring 默认色护栏：产物样式表 + 侧栏选中态', async () => {
+    // 参考资料抽屉还开着，它的遮罩会拦住侧栏点击；先关掉。
+    await page.keyboard.press('Escape')
+    await expect(page.locator('.el-drawer').filter({ hasText: '参考资料' })).toBeHidden()
+
+    // 第一段：产物样式表本身。临时挂一个「只有环宽、没有环色」的节点 —— 这正是默认值
+    // 那条路径，且不依赖任何 UI 状态。v4 未回填时它算出来的是元素文字色（currentcolor），
+    // 与 v3 的 blue-500 @ 50% 肉眼可辨（实测该元素截图逐像素最大通道差 119）。
+    const probeShadow = await page.evaluate(() => {
+      const node = document.createElement('div')
+      node.className = 'ring-1'
+      document.body.appendChild(node)
+      const shadow = getComputedStyle(node).boxShadow
+      node.remove()
+      return shadow
+    })
+    expect(probeShadow).toMatch(RING_DEFAULT_LAYER)
+    // 反向断言：不得是 currentcolor 的回退结果，否则这条护栏在退化的产物上也会绿。
+    expect(probeShadow).not.toContain(`${BODY_TEXT_RGB} 0px 0px 0px 1px`)
+
+    // 第二段：真实元素。侧栏选区态的 `ring-1` 只在管理模式勾选会话时渲染，
+    // 把合成后的 ring 层钉在这个元素上 —— 默认值再漂移一次，这条会直接红。
+    const historyHeader = page
+      .locator('div.flex.items-center.justify-between.px-4.py-3')
+      .filter({ hasText: '历史对话' })
+    await historyHeader.locator('button.el-button').first().click()
+
+    await page.getByRole('button', { name: '全选', exact: true }).click()
+    const selectedRow = page.locator('aside button.ring-1').first()
+    await expect(selectedRow).toBeVisible()
+    await expect(selectedRow).toHaveCSS('box-shadow', RING_DEFAULT_LAYER)
+    // 该元素同时带 `text-brand-700`，按 v4 的 fallback 会画出 brand-700；出现这个颜色
+    // 就说明环色又回到了元素文字色。
+    await expect(selectedRow).not.toHaveCSS('box-shadow', BRAND_700_LAYER)
+    await shot(page, testInfo, '8-ring-selected')
   })
 })
