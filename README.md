@@ -173,6 +173,12 @@ SSE 事件主要包含：
 - 可用的 DeepSeek / DashScope API Key
 - 可选：阿里云 OSS，用于图片附件存储
 
+浏览器基线（前端样式依赖）：
+
+- Safari 16.4+ / Chrome 111+ / Firefox 128+
+
+Tailwind CSS v4 依赖 `@property` 与 `color-mix()` 等较新的 CSS 特性，低于上述基线的浏览器上样式会整体失效（不是降级，是不生效）。旧浏览器需要继续支持时，前端需回退到 Tailwind 3.4.x。
+
 安装前端依赖：
 
 ```bash
