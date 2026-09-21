@@ -3,7 +3,7 @@ uvicorn==0.31.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 bcrypt<5
-python-multipart==0.0.9
+python-multipart>=0.0.31
 sqlalchemy==2.0.35
 pymysql==1.1.1
 cryptography==43.0.0
@@ -15,4 +15,4 @@ langchain-openai==1.2.1
 openai>=1.55.0
 pymilvus[milvus_lite]==3.0.0
 milvus-lite==3.0
-python-dotenv==1.0.1
+python-dotenv>=1.2.2

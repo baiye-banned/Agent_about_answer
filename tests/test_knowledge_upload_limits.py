@@ -190,6 +190,84 @@ def test_upload_without_filename_is_rejected(api):
     assert _stored_files(api) == []
 
 
+def _raw_multipart_upload(api, content_disposition_value, payload, content_type="text/plain"):
+    """自行拼 multipart 报文，用来发送 httpx 的 files= 参数拼不出的头（例如 RFC 5987 的 filename*）。
+
+    issue #98：python-multipart 0.0.30 改过 RFC 2231/5987 扩展参数与分号分隔语义，
+    这里按原始报文发送，避免被客户端库的编码行为掩盖。
+    """
+    boundary = "----fix98multipartboundary"
+    parts = [
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; {content_disposition_value}\r\n"
+        f"Content-Type: {content_type}\r\n\r\n"
+    ]
+    body = parts[0].encode("utf-8") + payload + b"\r\n"
+    body += (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="knowledge_base_id"\r\n\r\n'
+        f"{api.base.id}\r\n"
+        f"--{boundary}--\r\n"
+    ).encode("utf-8")
+
+    return api.client.post(
+        "/api/knowledge/upload",
+        content=body,
+        headers={**api.headers, "Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+
+def test_upload_keeps_non_ascii_filename(api):
+    """文件名含中文时，落库名与扩展名判定都要正确，不能被截断或错误解码。"""
+    response = _upload(api, "制度文件.md", "# 迟到处理\n\n迟到 30 分钟以内记口头提醒。".encode(), "text/plain")
+
+    assert response.status_code == 200
+    assert response.json()["name"] == "制度文件.md"
+    assert [entry.name for entry in _stored_files(api)] == ["制度文件.md"]
+
+
+def test_upload_drops_rfc5987_filename_extended_parameter(api):
+    """RFC 5987 的 filename* 不再被采信：该 part 会被当成普通表单字段，请求以 422 拒绝。
+
+    issue #98 的升级实测行为（0.0.9 → 0.0.31 唯一的行为变更）：
+    python-multipart 0.0.31 的加固解析器不再把 filename* 归一化成 filename，
+    而 starlette 0.38.6 的 formparsers 是把 Content-Disposition 解析委托给它、
+    再判 `b"filename" in options`（见 starlette/formparsers.py:183），
+    因此这个 part 不会被识别为文件，FastAPI 的 File(...) 匹配不上 → 422。
+
+    这是修复 GHSA-vffw-93wf-4j4q（RFC 2231/5987 参数走私）所采取的方向：
+    不在应用层重新解析 filename* 来恢复兼容，否则等于把这条告警刚堵上的洞重新打开。
+    浏览器一律只发 filename="..."（原始 UTF-8 字节），该形态在升级前后都正常，
+    见 test_upload_keeps_non_ascii_filename；受影响的是自造报文的 API 客户端，
+    改用 filename="制度文件.md" 即可。
+    """
+    response = _raw_multipart_upload(
+        api,
+        "name=\"file\"; filename*=UTF-8''%E5%88%B6%E5%BA%A6%E6%96%87%E4%BB%B6.md",
+        "# 标题\n\n正文。".encode(),
+    )
+
+    assert response.status_code == 422
+    assert _stored_files(api) == []
+
+
+def test_upload_rejects_duplicate_filename_parameters(api):
+    """重复的 filename 参数由扩展名白名单兜住：无论解析器取哪一个，都不能落库。
+
+    0.0.9 与 0.0.31 在 parse_options_header 层都取「后者」（此处为 evil.exe），
+    该行为未随升级改变；真正拦住它的是 resolve_knowledge_upload_type 的白名单，
+    这条用例钉的是白名单这道应用层防线本身。
+    """
+    response = _raw_multipart_upload(
+        api,
+        'name="file"; filename="payload.txt"; filename="evil.exe"',
+        b"payload",
+    )
+
+    assert response.status_code in (400, 422)
+    assert _stored_files(api) == []
+
+
 @pytest.mark.parametrize(
     ("filename", "content_type"),
     [
