@@ -26,7 +26,12 @@
   说明存在，避免「静默跳过」被误读成「扫过了」；
 - 每个夹具文件只命中一条规则（赋值启发式区分大小写，故夹具的变量名用小写），这样变异测试
   里「某条规则失效」与「某个夹具不再报红」是一一对应的，不会互相掩护；
-- 八次子进程调用（五个形态合并到同一目录，减少进程启动开销），无网络、无凭据依赖。
+- 八次子进程调用（五条规则的样本合并到同一目录、豁免边界三侧合并到同一次扫描，减少进程启动
+  开销），无网络、无凭据依赖；
+- 需要的是脚本头部声明的那个运行环境：git-bash / POSIX 的 bash。Windows 上
+  `shutil.which("bash")` 若优先命中 WSL 的 `System32\bash.exe`，那种 bash 读不了 `C:/…`
+  形式的路径，用例会整批以退出码 127 失败——那是环境不对，不是门禁退化；从 git-bash 里跑，
+  或让 Git 的 `usr\bin` 排在 PATH 前面即可。
 """
 
 import re
@@ -59,16 +64,25 @@ GITLEAKS_SKIP_NOTE = "--patterns-only - gitleaks skipped"
 # 变异测试用的「永不匹配」正则体：普通字面量，不会出现在任何夹具里。
 NEVER_MATCHES = "scan_selftest_mutation_never_matches"
 
-# 运行时拼出豁免标记，让本文件自身不含完整的标记文本——否则「标记 + 非空理由」若与某行
-# 赋值形态同行出现，仓库扫描会在日志里多打印一条豁免，看起来像这份测试在藏东西。
+# 代码里的标记文本按片段拼出来：本文件既要演示标记的判定，又紧挨着各种赋值形态的示例，
+# 若把它写成完整字面量，将来只要有人在同一行补一个「大写变量名 + 取值」的样例，仓库扫描就会
+# 多出一条豁免记录，看起来像这份测试在藏东西。完整的标记写法只在模块 docstring 的说明里出现
+# 一次（那一行不含赋值形态，因此不会被判成豁免）。改本文件时请照此办理。
 ALLOW_MARK = "# scan-secrets:" + "allow"
 
 ALNUM = "abcdefghijklmnopqrstuvwxyz0123456789"
 UPPER_ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
+# 随机体开头固定成一段不会命中占位词表的字符：`is_not_secret` 会把 xxx* / fake* / your[-_]*
+# / testkey* 这类前缀判成配置而不是凭据，纯随机串偶发撞上（`xxx` 开头约 1/46656）就会让夹具
+# 在某个无关提交上随机转红。开头固定、其余仍随机——命中形态不变，抖动消失。
+SAFE_HEAD = "q7z"
+SAFE_HEAD_UPPER = "Q7Z"
 
-def _body(alphabet, length):
-    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+def _body(alphabet, length, head):
+    """返回以 head 开头、总长 length 的随机串，字符取自 alphabet。"""
+    return head + "".join(secrets.choice(alphabet) for _ in range(length - len(head)))
 
 
 # ---------------------------------------------------------------------------
@@ -80,15 +94,15 @@ def _body(alphabet, length):
 
 
 def _sk_line():
-    return 'client_key = "%s"' % ("sk-" + _body(ALNUM, 24))
+    return 'client_key = "%s"' % ("sk-" + _body(ALNUM, 24, SAFE_HEAD))
 
 
 def _aws_line():
-    return 'aws_access_id = "%s"' % ("AKIA" + _body(UPPER_ALNUM, 16))
+    return 'aws_access_id = "%s"' % ("AKIA" + _body(UPPER_ALNUM, 16, SAFE_HEAD_UPPER))
 
 
 def _github_line():
-    return 'vcs_credential = "%s"' % ("ghp_" + _body(ALNUM, 24))
+    return 'vcs_credential = "%s"' % ("ghp_" + _body(ALNUM, 24, SAFE_HEAD))
 
 
 def _pem_line():
@@ -98,7 +112,7 @@ def _pem_line():
 def _assignment_line():
     # 赋值的变量名必须大写才会命中启发式（脚本刻意只匹配大写前缀，见文件头注释），
     # 取值是随机串而不是占位词，否则会被 `is_not_secret` 判成配置而非凭据。
-    return "%s=%s" % ("PASSWORD", _body(ALNUM, 24))
+    return "%s=%s" % ("PASSWORD", _body(ALNUM, 24, SAFE_HEAD))
 
 
 # (匹配类型标签, 夹具文件名, 生成判红内容的函数)
@@ -123,6 +137,10 @@ def _run_scan(target, script=SCAN_SCRIPT):
         [BASH, str(script.as_posix()), str(Path(target).as_posix()), PATTERNS_ONLY],
         capture_output=True,
         text=True,
+        # 固定 UTF-8 并允许替换：断言只看 ASCII 片段（文件名、匹配类型、文件数），
+        # 但路径里可能出现非 ASCII（例如中文用户名），不能让解码在此抛 UnicodeDecodeError。
+        encoding="utf-8",
+        errors="replace",
         timeout=300,
     )
     return result.returncode, result.stdout, result.stderr
@@ -163,38 +181,53 @@ def test_every_builtin_shape_is_green_once_the_fixtures_are_benign(tmp_path):
 
 
 def test_allow_marker_exempts_only_when_a_reason_follows(tmp_path):
-    """豁免标记的边界：带非空理由豁免该行，只有标记而无理由不豁免。
+    """豁免标记的三条边界：带理由的赋值行豁免、只有标记的赋值行不豁免、形态命中永不豁免。
 
-    两个文件放在同一次扫描里：带理由的进豁免清单（stdout），只有标记的仍按命中报红
-    （stderr）。同一次运行同时给出两侧结论——豁免既没有被静默，也没有被放大。
+    三个文件放在同一次扫描里：带理由的赋值行进豁免清单（stdout），只有标记的赋值行仍按命中
+    报红（stderr），带完整标记的 `sk-` 形态命中同样按命中报红（stderr）且不进豁免清单。
+    一次运行同时给出三侧结论——豁免既没有被静默，也没有被放大到形态命中上。
     """
-    allowed, bare = "planted_allowed.py", "planted_bare_allow.py"
+    allowed = "planted_allowed.py"
+    bare = "planted_bare_allow.py"
+    shape = "planted_shape_allow.py"
+    reason = "%s real fixture value, not a credential\n" % ALLOW_MARK
     _write_all(
         tmp_path,
         {
-            allowed: "%s  %s real fixture value, not a credential\n" % (_assignment_line(), ALLOW_MARK),
-            bare: "%s  %s\n" % (_assignment_line(), ALLOW_MARK),
+            allowed: _assignment_line() + "  " + reason,
+            bare: _assignment_line() + "  " + ALLOW_MARK + "\n",
+            # 第三侧是这套规则里最要紧的一条：脚本承诺标记只豁免赋值启发式，`sk-` 这类形态
+            # 命中永远豁免不了（见脚本头部与 DEVELOPING.md）。一旦这里失效，一个标记就能把
+            # 真正的密钥藏起来——门禁会从「兜底」变成「帮凶」，所以必须有断言盯着它。
+            shape: _sk_line() + "  " + reason,
         },
     )
 
     rc, stdout, stderr = _run_scan(tmp_path)
 
     assert rc == 1, (stdout, stderr)
-    # 带理由：进豁免清单，不再出现在命中列表里。
+    # 带理由的赋值行：进豁免清单，不再出现在命中列表里。
     assert "%s:1 [credential assignment]" % allowed in stdout, stdout
     assert "%s:1 [credential assignment]" % allowed not in stderr, stderr
-    # 只有标记、没有理由：不豁免，仍然报红。
+    # 只有标记、没有理由的赋值行：不豁免，仍然报红。
     assert "%s:1 [credential assignment]" % bare in stderr, stderr
+    # 形态命中 + 完整标记：标记对它无效，必须照常报红，也不得出现在豁免清单里。
+    assert "%s:1 [sk- token]" % shape in stderr, stderr
+    assert "%s:1" % shape not in stdout, stdout
 
 
 # ---------------------------------------------------------------------------
 # 变异测试：删掉任意一条规则，必须有用例转红
 #
 # 每个参数把脚本副本里的一条正则换成永不匹配的形态，再拿该规则的判红样本去扫。
-# 变异后必须恰好退出 0（真的扫描过、且什么都没命中）；若脚本因变异而坏掉会得到 2，
-# 用例同样失败。这一断言等价于「删掉该条正则后，上面 test_every_builtin_shape_...
-# 里对应那条 `文件:1 [匹配类型]` 断言会转红」——把 issue 要求的先红后绿证据固化成了
-# 每次 CI 都会重跑的自检，而不是只写在 PR 描述里。
+# 变异后必须恰好退出 0（真的扫到了那个夹具、且什么都没命中）；若脚本因变异而坏掉会得到 2，
+# 用例同样失败。
+#
+# 与上面判红用例的关系（别把它读成同一件事的两种写法）：变异用例断言「正则没了 → 样本不再
+# 报红」，判红用例断言「正则还在 → 样本报红」，两条是互补的两半，合起来才构成 issue 要求的
+# 先红后绿证据。反过来说，单独删掉判红用例，这五条变异用例会退化成弱断言（它们并不会因此
+# 失败）——这层耦合是刻意的：两半都在同一文件的同一次 CI 运行里执行，评审本文件时应把两者
+# 当一个整体看。
 # ---------------------------------------------------------------------------
 
 MUTATIONS = [
@@ -226,7 +259,7 @@ def test_removing_a_rule_regex_stops_its_fixture_from_being_reported(
     fixtures.mkdir()
     _write_all(fixtures, {name: build()})
 
-    rc, _stdout, stderr = _run_scan(fixtures, script=mutated_script)
+    rc, stdout, stderr = _run_scan(fixtures, script=mutated_script)
 
     # rc 必须恰好是 0：脚本坏掉（用法错误、grep 失败）会得到 2，同样判失败，不会被放过。
     assert rc == 0, "删掉 %s 后 %s 仍被判红（rc=%s）：说明该样本并非由这条正则命中" % (
@@ -234,4 +267,8 @@ def test_removing_a_rule_regex_stops_its_fixture_from_being_reported(
         name,
         rc,
     )
+    # 还必须真的扫到了那个夹具。非 git 目录下脚本没有「0 个文件」的兜底（脚本里那道兜底
+    # 只在 GIT_ROOT 非空时生效），collect_files 一旦退化，这里会拿「扫了 0 个文件」的干净
+    # 结果退出 0，五个变异用例就一起空转通过了。所以文件数和判绿用例一样要断言。
+    assert "built-in pattern scan over 1 file(s)" in stdout, stdout
     assert "[%s]" % label not in stderr, stderr

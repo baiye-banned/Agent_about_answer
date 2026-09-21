@@ -81,7 +81,11 @@ bash scripts/scan_secrets.sh
   `.gitleaks.toml` 里做**精确豁免**（只豁免该路径或该条规则，例如把样例文件放进
   `paths` allowlist），并在提交信息里说明原因；
 - **禁止**整体关闭某条规则、禁止 `--no-git`/`--patterns-only` 之类跳过扫描的做法
-  进入 CI（`--patterns-only` 只用于本地快速自查）；
+  进入 CI（`--patterns-only` 只用于本地快速自查）。这里拦的是**拿它去扫仓库**：让 CI 对
+  仓库本体少扫一层，等于把「什么都没扫」报成干净。门禁自检不在此列——
+  `tests/test_scan_secrets_selftest.py` 对临时目录里的夹具用 `--patterns-only`，扫的不是
+  仓库，且用例会断言脚本确实打印了跳过说明（跳过始终显式可见，不会变成一次假绿）；
+
 - 当前仓库没有 `.gitleaks.toml`，有 6 行使用上面的内联标记：
   `backend/config.py` 的 3 个来源标签常量、`tests/test_knowledge_ownership.py` 的
   3 行内存测试夹具（见 issue #36）；再有新增时按本节约定处理。
