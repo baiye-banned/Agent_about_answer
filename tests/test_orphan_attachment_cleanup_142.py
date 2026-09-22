@@ -630,7 +630,10 @@ def test_consuming_the_upload_never_commits_on_its_own(api, oss_requests):
 def test_lifespan_schedules_the_orphan_sweep(monkeypatch):
     """启动期必须挂上清扫任务（issue #142 点名的缺口：lifespan 里没有任何清扫）。"""
     calls = []
+    # 两条启动门禁都置空：本用例测的是清扫是否挂上，不测配置门禁，而它跑在测试环境里
+    # （未配 MYSQL_PASSWORD），否则会死在门禁上而不是断言上。
     monkeypatch.setattr(main, "ensure_secret_key_configured", lambda: None)
+    monkeypatch.setattr(main, "ensure_mysql_password_configured", lambda: None)
     monkeypatch.setattr(main, "init_db", lambda: None)
     monkeypatch.setattr(main, "seed_default_users", lambda: None)
     monkeypatch.setattr(main, "schedule_orphan_attachment_sweep", lambda: calls.append("sweep"))
