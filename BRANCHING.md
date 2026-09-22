@@ -32,14 +32,19 @@
 
 约定是 `main` 与 `develop` 都不能直接 push、必须通过 PR 合入，`main` 还要满足「合并前 CI 通过」。
 
-**现状（2026-09-21 核实）：`main` 与 `develop` 都已开启保护**，且都是 `allow_deletions=false`、`allow_force_pushes=false`（`gh api repos/baiye-banned/Agent_about_answer/branches/main/protection`，`develop` 同理）。两边都已勾选「Require a pull request before merging」（`required_approving_review_count=0`，即只要求走 PR、不要求 approve）；差别在必需检查：`main` 已设 9 条（`strict=false`，不要求分支先跟上 base），`develop` 未设必需检查。其余相关设置：`allow_merge_commit=true`、`allow_squash_merge=true`、`allow_rebase_merge=true`、`allow_auto_merge=false`、`delete_branch_on_merge=true`。
+**现状（2026-09-22 复核）：`main` 与 `develop` 都已开启保护**，且都是 `allow_deletions=false`、`allow_force_pushes=false`（`gh api repos/baiye-banned/Agent_about_answer/branches/main/protection`，`develop` 同理）。两边都已勾选「Require a pull request before merging」（`required_approving_review_count=0`，即只要求走 PR、不要求 approve）；必需检查两边也都已设置（`strict=false`，不要求分支先跟上 base），`main` 9 条、`develop` 8 条 —— `develop` 少的那一条是下面列出的 Dependabot 例外。其余相关设置：`allow_merge_commit=true`、`allow_squash_merge=true`、`allow_rebase_merge=true`、`allow_auto_merge=false`、`delete_branch_on_merge=true`。
 
 **这些保护只是兜底，不能当作流程正确性的前提。** 保护规则和仓库设置是两处独立配置，`delete_branch_on_merge` 由平台在合并 PR 时执行，不区分 head 是短分支还是长期分支（详见 §3「回同步工作流」）。2026-09-20 01:36Z 事故发生时两个分支都还没有任何保护（事故当天的清理线现场确认仓库无 ruleset、无 branch protection），`main` 正是这样被自动删掉的；本文这两条保护是事故之后才补上的。把安全寄托在"保护没被改动"上，等于把一个删除 `main` 的开关留在别人手里；正确的做法是让长期分支永远不出现在 PR 的 head 位置。
 
 管理员开启保护时至少需要：
 
 - Require a pull request before merging：`main` 与 `develop` 都勾。**现状：两者都已勾选**，合并审查人数要求为 0（只要求走 PR、不要求 approve）。
-- Require status checks to pass：至少加在 `main` 上。**现状：`main` 已设 9 条必需检查**——`node --test (Node 22)`、`Playwright e2e (chromium)`、`PR 标题规范校验`、`PR 描述必填节校验`、`pytest (Python 3.10)`、`Scan for secrets`、`vite build (Node 22)`、`后端静态检查 (compileall + ruff, Python 3.10)`、`前端静态检查 (node --check + eslint, Node 22)`；`develop` 尚未设置，是本条保留的建议项。
+- Require status checks to pass：`main` 与 `develop` 都要加。**现状：两边都已设置，`strict=false`；`main` 9 条、`develop` 8 条。**
+  - `main` 9 条：`node --test (Node 22)`、`Playwright e2e (chromium)`、`PR 标题规范校验`、`PR 描述必填节校验`、`pytest (Python 3.10)`、`Scan for secrets`、`vite build (Node 22)`、`后端静态检查 (compileall + ruff, Python 3.10)`、`前端静态检查 (node --check + eslint, Node 22)`。
+  - `develop` 8 条：同上，但**不含 `PR 描述必填节校验`**（2026-09-22 随 #182 设置）。这是两边**唯一的差别**，理由见下一条。
+  - **为什么 `develop` 必须少这一条**：`.github/workflows/pr-template-check.yml:24` 的 job 条件是 `if: github.event.pull_request.user.login != 'dependabot[bot]'`，该 job 在 Dependabot PR 上被判 `skipped`，而必需检查的 `skipped` **不等于** `success` —— 原样设为必需，Dependabot 的依赖 PR 会**永远无法合入**。实证：真实 Dependabot PR #122 上 `PR 描述必填节校验` 的结论是 `skipped`，同一次运行的另外 8 条全是 `success`，所以**只剔这一条**就够，不会连带漏掉别的检查。
+  - **漂移兜底（job 改名了怎么办）**：名单是按 **check-run 名逐字**匹配的，名字差一个字就等于永久 pending。因此**任何 job 改名，名单必须同步改掉**（`main` 与 `develop` 都要）—— 但这份名单存在**仓库设置**里、**不在仓库文件中**，改名 PR 自己动不了它：在管理员把 protection 的 `contexts` 更新到新名字之前，改名 PR 自身就是 `BLOCKED`（旧名永不再产出，缺的必需检查在 PR 页面显示为 `Expected — Waiting for status to be reported`），同一窗口内 `develop` 上的其他 PR 也会被连坐阻断。实操顺序是**先用管理员 API 改设置、再放行该 PR**（#182 的名单就是这样落的）。改名后旧名**永不再产出**，该 PR 会**被平台直接阻断合入** —— 这不是需要靠人去发现的风险，**响亮失败本身就是兜底机制**：`develop` 侧的检查名漂移从此有报警（此前名单只在 `main` 生效，`develop` 上漂移没有任何机制会发现）。另注意阻断只对**默认合并路径**成立（网页 Merge、不带 `--admin` 的 `gh pr merge`）：两边都是 `enforce_admins=false`，管理员仍可绕过，兜底的本质是**可见性**而不是一道绕不过去的硬门。
+  - **对账命令（两份输出的用途不同，别混用）**：名单的权威读数是 `gh api repos/baiye-banned/Agent_about_answer/branches/develop/protection --jq '.required_status_checks.contexts[]'`（读 `main` 就把分支名换掉），逐名比对名单用它；`gh pr checks <PR号>` 回答的是另一个问题——**这些检查跑没跑绿**，它打印 PR 上的**全部** check-run，既含非必需项（`CodeQL`、`Analyze (*)`），同一个名字还可能因 `push` 与 `pull_request` 两种事件各出一条而**重复出现**（本 PR 的 `Scan for secrets` 就是两行），所以拿它判必需面时**按名字集合判定、不能按行数判定**。
 - **保留 Allow merge commits**：发布 PR 和回同步 PR 都依赖 merge commit，关掉它这两条流程就跑不通。squash 可以同时开着，日常 PR 靠约定选 squash。
 - 不要开 Allow force pushes 和 Allow deletions：本流程明确不改写历史、不删 `main` / `develop`。
 
@@ -89,7 +94,7 @@
 
 ## 5. 已知限制与边界
 
-- **`GITHUB_TOKEN` 不会触发下游工作流。** 这是 GitHub 的既定行为：用 `GITHUB_TOKEN` 推送的分支、用 `GITHUB_TOKEN` 创建的 PR，都不会自动拉起其他 workflow。所以自动开的回同步 / 发布 PR 上，CI 一开始是空的，需要维护者点一次 **Close → Reopen**（`reopened` 属于用户触发的事件），或往分支上补一个提交来触发检查。
+- **`GITHUB_TOKEN` 不会触发下游工作流。** 这是 GitHub 的既定行为：用 `GITHUB_TOKEN` 推送的分支、用 `GITHUB_TOKEN` 创建的 PR，都不会自动拉起其他 workflow。所以自动开的回同步 / 发布 PR 上，CI 一开始是空的，需要维护者点一次 **Close → Reopen**（`reopened` 属于用户触发的事件），或往分支上补一个提交来触发检查。**`develop` 设了必需检查之后，这一步不再只是为了页面好看**：这些 PR 的检查没有产出时，平台会以「缺少必需的检查」为由阻断合入，所以必须先把 CI 触发出来（`main` 侧本来就有 9 条必需检查，发布 PR 同理）。
 - **不自动合并、不自动打 tag，工作流自身不执行删除分支。** 两条工作流都只有 `contents: write` + `pull-requests: write`，写操作限于"推一个 `chore/release-v*` 分支 / 把 `sync/main-into-develop` 重置到 `main` 的 tip"和"开一个 PR"。要和平台行为区分开：`delete_branch_on_merge` 是 **GitHub 在合并 PR 时**删掉该 PR 的 head 分支，不是工作流发出的删除操作——回同步 PR 合并后 `sync/main-into-develop` 会被平台删掉，这是预期的，也是「长期分支不能当 PR head」这条设计的由来。
 - **手动触发依赖默认分支。** `workflow_dispatch` 要求工作流文件存在于默认分支（本仓库是 `develop`）；在文件合入 `develop` 之前，`gh workflow run release.yml` / `sync-main-into-develop.yml` 都会返回 `404 workflow ... not found on the default branch`。这是 GitHub 的既定行为，不是配置错误。
 - **不重写历史。** 本流程不涉及 `rebase` 已推送的公共分支或改写已发布提交；`develop` 与 `main` 的历史只增不改，两者都不会被强推。唯一的 `push --force` 出现在回同步工作流里，且只作用于一次性 bot 分支 `sync/main-into-develop`——它的语义就是"当前 `main` 的镜像"，没有需要保留的历史。发布 PR 与回同步 PR 一律用 merge commit 合并，正是为了让发布点保持可追溯。

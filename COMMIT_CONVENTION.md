@@ -106,6 +106,6 @@ node scripts/check_issue.mjs path/to/issue_dump.md
 
 三点边界：
 
-- 三个 workflow 只负责在对应事件上运行校验并把检查标红；**是否阻断合并由仓库的分支保护 / required status check 决定**。现状（2026-09-21 实读 `gh api repos/baiye-banned/Agent_about_answer/branches/<分支>/protection`）：`main` 上「PR 标题规范校验」「PR 描述必填节校验」都在必需检查名单内（共 9 条，`strict=false`，不要求分支先跟上 base）；`develop` 上未设必需检查，需要管理员按需增设。
+- 三个 workflow 只负责在对应事件上运行校验并把检查标红；**是否阻断合并由仓库的分支保护 / required status check 决定**。现状（2026-09-22 实读 `gh api repos/baiye-banned/Agent_about_answer/branches/<分支>/protection`）：`main` 上「PR 标题规范校验」「PR 描述必填节校验」都在必需检查名单内（共 9 条，`strict=false`，不要求分支先跟上 base）；`develop` 上已设 8 条必需检查（同样是 `strict=false`），即 `main` 那 9 条**去掉「PR 描述必填节校验」**——该 job 在 Dependabot PR 上会被判 `skipped`，设成必需会把依赖 PR 永久卡死，理由与名单见 [BRANCHING.md](BRANCHING.md) §2。
 - `issue-validator` 由 `issues` 事件触发，运行的是**默认分支**上的 workflow 与脚本，因此规则改动要等合入默认分支后才对所有 issue 生效；`pr-*` 两个校验由 `pull_request` 事件触发，运行的是 PR 合并结果里的 workflow，脚本则优先取 base 分支上的版本。
 - 因为优先用 base 分支上的脚本，修改规则本身的 PR 会先被**旧脚本**校验一遍：放宽规则要等脚本合入 base 后才生效，加严规则则可能先把自己判红。base 分支上还没有脚本时（引入门禁的第一个 PR）回退用当前分支的脚本。
