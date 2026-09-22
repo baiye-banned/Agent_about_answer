@@ -66,6 +66,10 @@ def list_conversations(
     `before` 是 (updated_at, id) 复合游标，两者必须同时给出（service 层负责拦半个游标）。
     """
     limit = clamp_limit(limit)
+    # 排序与游标过滤共用同一个秒级表达式：两处必须同一口径，否则游标落不到排序位置上
+    # （列里存的文本形状不唯一，见 seconds_text）。排序用整列时，带小数的行会排在
+    # 秒级行之间，而游标只按秒级比较，两者对不齐。
+    timestamp_key = seconds_text(Conversation.updated_at)
     query = (
         db.query(Conversation)
         # 预加载知识库：序列化时每个会话都要读 conv.knowledge_base，逐行懒加载会让查询数随会话数增长。
@@ -78,13 +82,12 @@ def list_conversations(
         # SQLite 与 MySQL 共用同一段 SQL（两者都支持行值比较，但展开式在两边都不依赖方言支持）。
         # 两档都要归一后再比：时间戳截到秒级文本（理由见 seconds_text），主键本来就是文本。
         cursor_value = literal(datetime_cursor_value(before_updated_at))
-        cursor_timestamp = seconds_text(Conversation.updated_at)
         query = query.filter(or_(
-            cursor_timestamp < cursor_value,
-            and_(cursor_timestamp == cursor_value, Conversation.id < before_id),
+            timestamp_key < cursor_value,
+            and_(timestamp_key == cursor_value, Conversation.id < before_id),
         ))
     return (
-        query.order_by(Conversation.updated_at.desc(), Conversation.id.desc())
+        query.order_by(timestamp_key.desc(), Conversation.id.desc())
         .limit(limit)
         .all()
     )
