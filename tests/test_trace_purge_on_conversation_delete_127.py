@@ -31,7 +31,7 @@ from crud import trace as crud_trace
 from database import checkpointer
 from database import session as db_session
 from database.session import Base
-from model.models import ChatTraceSession, Conversation, KnowledgeBase, Message, User
+from model.models import ChatTraceSession, Conversation, KnowledgeBase, Message, RevokedToken, User
 from rag.learning_trace import TraceRecorder
 from router import chat as chat_router
 from router import checkpointer as checkpointer_router
@@ -105,7 +105,7 @@ def api(monkeypatch, tmp_path):
     Base.metadata.create_all(
         bind=engine,
         tables=[
-            User.__table__,
+            User.__table__, RevokedToken.__table__,
             KnowledgeBase.__table__,
             Conversation.__table__,
             Message.__table__,

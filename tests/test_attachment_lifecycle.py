@@ -40,7 +40,7 @@ from sqlalchemy.pool import StaticPool
 
 from database import session as db_session
 from database.session import Base
-from model.models import ChatAttachmentUpload, ChatTraceSession, Conversation, Message, User
+from model.models import ChatAttachmentUpload, ChatTraceSession, Conversation, Message, RevokedToken, User
 from router import chat as chat_router
 from router import user as user_router
 from schema.schemas import ChatRequest
@@ -147,7 +147,7 @@ def api(monkeypatch, tmp_path):
     Base.metadata.create_all(
         bind=engine,
         tables=[
-            User.__table__,
+            User.__table__, RevokedToken.__table__,
             Conversation.__table__,
             Message.__table__,
             ChatTraceSession.__table__,
@@ -603,7 +603,11 @@ def _run_stream_chat(api, monkeypatch, attachments) -> str:
         lambda db, knowledge_base_id, user_id: SimpleNamespace(id=1, name="kb", user_id=user_id),
     )
     monkeypatch.setattr(chat_service, "SessionLocal", lambda: api.db)
-    monkeypatch.setattr(chat_service, "decode_token", lambda authorization: api.alice.username)
+    monkeypatch.setattr(
+        chat_service,
+        "authenticate",
+        lambda db, authorization: db.query(User).filter_by(username=api.alice.username).first(),
+    )
     monkeypatch.setattr(chat_service, "TraceRecorder", _FakeChatTrace)
     monkeypatch.setattr(chat_service, "_build_effective_question", fake_build_effective_question)
     monkeypatch.setattr(chat_service, "_build_recent_memory_text", fake_recent_memory_text)

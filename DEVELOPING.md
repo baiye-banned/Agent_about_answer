@@ -116,10 +116,11 @@ ci(security): 加固 .gitignore 并引入密钥扫描门禁
 
 `.github/workflows/secret-scan.yml` 在每次 push（所有分支）与 pull request 上运行：
 先跑上面的脚本（内含 gitleaks 完整历史扫描），再用官方 gitleaks action 扫本次推送范围。
-任一环节发现疑似密钥，任务即为红色。`main` 上「Scan for secrets」已在必需检查名单内
-（2026-09-21 实读：共 9 条，`strict=false`，不要求分支先跟上 base）；`develop` 上未设必需
-检查，红色任务不会从技术上阻止合并，**红了就不要合**——先把命中处理掉（真密钥先轮换，
-误报按上节约定做精确豁免）。
+任一环节发现疑似密钥，任务即为红色。`main` 与 `develop` 上「Scan for secrets」都已在必需检查
+名单内（2026-09-22 实读：`main` 9 条、`develop` 8 条，`strict=false`，不要求分支先跟上
+base）；红色任务**会从技术上阻止合并**，**红了就不要合**——先把命中处理掉（真密钥先轮换，
+误报按上节约定做精确豁免）。`develop` 比 `main` 少的那条不是密钥扫描，而是 Dependabot
+例外的 `PR 描述必填节校验`，理由见 `BRANCHING.md` §2。
 
 「这道门禁真的会红吗」可以随时在 CI 上复现，不必往仓库里提交假密钥：
 
