@@ -15,9 +15,6 @@
 
 // 与后端 LIST_DEFAULT_LIMIT 保持一致：一页多少条由前端决定，后端只负责夹取上限。
 export const FILE_PAGE_SIZE = 50
-// 取页时多要一条：用「是否多出来」判断还有没有更早的文件。
-// 只取一页时无法区分「正好取满」和「已经取完」，会给出一个点了没反应的按钮。
-const FILE_FETCH_LIMIT = FILE_PAGE_SIZE + 1
 
 export function createFileListRequest({
   getKnowledgeBaseId,
@@ -38,6 +35,8 @@ export function createFileListRequest({
   // 与 chat / knowledge 两个 store 里的同名守卫同款。
   let moreAvailable = false
 
+  // 取一页的请求要多要一条（pageSize + 1）：用「是否多出来」判断还有没有更早的文件。
+  // 只取一页时无法区分「正好取满」和「已经取完」，会给出一个点了没反应的按钮。
   function splitPage(rows) {
     const hasMore = rows.length > pageSize
     // 后端按「新 -> 旧」返回：多出来的那条是最旧的一条，在末尾，丢掉它剩下正好一页。
