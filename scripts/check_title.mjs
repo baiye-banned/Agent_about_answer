@@ -49,7 +49,7 @@ try {
 }
 
 const title = raw
-  .replace(/^﻿/, '')
+  .replace(/^\uFEFF/, '')
   .split(/\r?\n/)
   .map((line) => line.trim())
   .find((line) => line.length > 0);
