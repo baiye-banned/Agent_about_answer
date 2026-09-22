@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { MAX_LINE, WRAP_WIDTH, findParagraphs, parseConflicts, reflow, unwrap, wrap } from '../scripts/tests_readme_magnet.mjs'
 
 // issue #202：tests/README.md 里两段「These tests cover …」登记清单原本各写成**一整行**
-// （改前 7676 / 15461 字符）。每次登记新测试都是在同一行尾部追加子句，于是任意两个同时打开的
+// （改前 8291 / 17210 字符）。每次登记新测试都是在同一行尾部追加子句，于是任意两个同时打开的
 // 登记 PR 都改到同一行 —— 行级三方合并没有可用的公共基线，必判冲突，冲突块等于整段全文，
 // 用「取一侧」解就会静默丢掉另一侧刚登记的条目（本仓一天实测为此解冲突 ≥7 次）。
 // 现在这两段按软换行折成正常宽度的多行（Markdown 段落内的软换行渲染成空格，折行前后渲染一致）。
@@ -170,6 +170,81 @@ test('union refuses when the legacy and wrapped sides diverge', () => {
   assert.equal(result.code, 1, '两侧互不包含时应当拒绝')
   assert.equal(result.after, file, '拒绝时不得改动文件')
   assert.match(result.output, /互不包含/)
+})
+
+test('union refuses when both sides are still legacy long lines and diverge', () => {
+  // PR #205 评审 F1（阻断级）：**两侧都**还是旧格式整段单行时，旧判据（两侧格式是否不同）
+  // 为 false，直接落到逐行并集分支 —— 而旧单行本身就含有对面那一份的全部文字，于是整段被写
+  // 两遍，`check` 与当时全部 8 条棘轮断言照样全绿。两条在途登记分支互相合并正是这个形状
+  //（各自在整段单行尾部追加了不同子句）。这种形状必须拒绝：拒绝即安全，写出错段落才致命。
+  const shared = `These tests cover ${'a shared clause that both branches carry verbatim, '.repeat(6)}`
+  const ours = `${shared}and the alpha clause that branch A registered (#901).`
+  const theirs = `${shared}and the beta clause that branch B registered (#902).`
+  assert.ok(ours.length > MAX_LINE && theirs.length > MAX_LINE, '样例两侧都必须真的停在旧格式（超长单行）')
+  assert.ok(!ours.includes(theirs) && !theirs.includes(ours), '样例两侧必须互不包含')
+
+  const file = [
+    '# Test Baseline',
+    '',
+    'Current files:',
+    '',
+    '- `a.test.js`',
+    '',
+    '<<<<<<< HEAD',
+    ours,
+    '=======',
+    theirs,
+    '>>>>>>> b',
+    '',
+    '## Python Tests',
+    '',
+  ].join('\n')
+
+  const result = runUnion(file)
+  assert.equal(result.code, 1, `两侧都旧格式且分歧时应当拒绝：${result.output}`)
+  assert.equal(result.after, file, '拒绝时不得改动文件（写出被写两遍的段落比拒绝更糟）')
+  assert.match(result.output, /互不包含/, '拒绝消息要点明判据：两侧互不包含')
+  assert.match(result.output, /写两遍/, '拒绝消息要点明拒绝的原因：机械拼接会把整段文字写两遍')
+})
+
+test('union takes the containing side when both sides are legacy long lines', () => {
+  // 上一条的对照臂：两侧都超长并不必然分歧 —— 一侧完整包含另一侧时仍可机械求解（取超集）。
+  // 把判据从「两侧格式不同」放宽到「任一侧超长」时，这条包含路径必须一起存活，否则
+  // 正常的「旧格式 base + 已折行改动」会从「可解」退化成「拒绝」。
+  const head = `These tests cover ${'a shared clause that both branches carry verbatim, '.repeat(5)}a shared tail both branches carry`
+  const ours = `${head}, and the alpha clause that branch A registered (#901).`
+  const theirs = head
+  assert.ok(ours.length > MAX_LINE && theirs.length > MAX_LINE, '样例两侧都必须真的停在旧格式（超长单行）')
+  assert.ok(ours.includes(theirs) && !theirs.includes(ours), '样例必须是「一侧完整包含另一侧」')
+
+  const file = [
+    '# Test Baseline',
+    '',
+    'Current files:',
+    '',
+    '- `a.test.js`',
+    '',
+    '<<<<<<< HEAD',
+    ours,
+    '=======',
+    theirs,
+    '>>>>>>> b',
+    '',
+    '## Python Tests',
+    '',
+  ].join('\n')
+
+  const result = runUnion(file)
+  assert.equal(result.code, 0, `两侧都超长但一侧包含另一侧时应当可解：${result.output}`)
+  assert.match(result.output, /完整包含另一侧/)
+  const flat = result.after.replace(/\s+/g, ' ')
+  assert.equal(flat.split('These tests cover').length - 1, 1, '整段被写了两遍')
+  assert.match(flat, /and the alpha clause that branch A registered \(#901\)\./, '包含侧的内容丢了')
+  assert.match(result.after, /\n## Python Tests\n$/, 'union 把冲突块之后的正文截掉了')
+  assert.ok(!/^<{7}|^={7}$|^>{7}/m.test(result.after), '并集后不该还留着冲突标记')
+  for (const line of result.after.split('\n')) {
+    assert.ok(line.length <= MAX_LINE, `并集后仍有超长行：${line.slice(0, 40)}`)
+  }
 })
 
 test('union refuses, and writes nothing, when one paragraph holds more than one conflict block', () => {

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // tests/README.md 的两段「These tests cover …」是测试登记清单（issue #202）。
-// 它们原本各写成**一整行**（改前 7676 / 15461 字符），于是任何两次并发登记都改到同一行：
+// 它们原本各写成**一整行**（改前 8291 / 17210 字符），于是任何两次并发登记都改到同一行：
 // 行级三方合并没有可用的公共基线，必判冲突，而冲突块等于整段全文 —— 「取一侧」会静默丢掉
 // 另一侧刚登记的条目。根治办法是把这两段按软换行折成正常宽度的多行：
 // Markdown 段落内的软换行渲染成空格，所以折行前后**渲染完全一致**，而追加点从「一行」变成
@@ -9,8 +9,9 @@
 //   node scripts/tests_readme_magnet.mjs check  [file]   # 门禁：两段内不得有超长行
 //   node scripts/tests_readme_magnet.mjs format [file]   # 按宽度重新折行（幂等）
 //   node scripts/tests_readme_magnet.mjs union  <file>   # 冲突后一条命令求并集，自带零丢失校验
-//                                                        # 两侧都折行 -> 逐行并集；一侧还是旧格式
-//                                                        # 单行 -> 取包含另一侧全文的那一份再折行
+//                                                        # 两侧都折行 -> 逐行并集；任一侧还是旧格式
+//                                                        # 单行 -> 取包含另一侧全文的那一份再折行，
+//                                                        # 互不包含则拒绝（含两侧都还是旧格式）
 //
 // 退出码：0 通过；1 违规；2 参数/IO 错误。
 
@@ -25,7 +26,7 @@ const DEFAULT_FILE = path.join(REPO_ROOT, 'tests/README.md');
 const PARAGRAPH_MARKER = 'These tests cover ';
 // 折行目标宽度：与本文件其余手写散文一致（p95 约 96 列）。
 const WRAP_WIDTH = 100;
-// 门禁宽度：留出人工编辑的余量，但仍比磁铁小三个数量级（15461 字符）。
+// 门禁宽度：留出人工编辑的余量，但仍比磁铁小三个数量级（17210 字符）。
 const MAX_LINE = 120;
 
 // 软换行会把行首的记号交给 Markdown 当块级语法解析，渲染结果就变了
@@ -213,25 +214,29 @@ const sideHasLongLine = (side) => side.some((line) => line.length > MAX_LINE);
 
 // 求解一个冲突块。返回 { lines, kept, note }；无法机械求解时返回 null。
 //
-// 两种形状分别处理：
-// 1) 两侧都已是折行格式 —— 逐行求并集：先取 ours，再补上 theirs 里 ours 没有的行。
-//    两次登记落在同一个追加点时，冲突块就是「双方各加了几行」，并集即两边都保留；
-//    相同行只留一份，避免重复登记。
-// 2) 一侧仍是旧格式整段单行（本 issue 落地期间，在途的登记 PR 与已合入的登记正是这个形状）——
-//    逐行求并集会把同一段文字写两遍，因为旧单行本身就包含了折行侧的全部内容。改用文本包含
-//    判据：一侧的正文被另一侧完全包含时，留下包含它的那一份（严格无丢失），由调用方重新折行；
-//    两侧互不包含说明内容确有分歧，返回 null 拒绝。
+// 判据的门槛是「**任一侧**是否还停在旧格式整段单行」，不是「两侧格式是否不同」：
+// 旧单行本身就包含了折行侧的全部内容，对它逐行求并集必然把同一段文字写两遍。所以只要有一侧
+// 超长，就一律走文本包含判据 —— 一侧完整包含另一侧时取包含它的那一份（严格无丢失），
+// 由调用方重新折行；**两侧都超长且互不包含时同样落到这里，返回 null 拒绝**（issue #202 期间
+// 两条在途登记分支互相合并正是这个形状：各自在整段单行尾部追加了不同子句）。
+// 旧判据只挡住了「一侧超长」，两侧都超长时掉进逐行并集分支，静默把整段写两遍而零丢失校验
+// 照样报绿（PR #205 评审 F1）—— 护栏只装了一半，这里补齐。
+//
+// 两侧都已是折行格式时才逐行求并集：先取 ours，再补上 theirs 里 ours 没有的行。
+// 两次登记落在同一个追加点时，冲突块就是「双方各加了几行」，并集即两边都保留；
+// 相同行只留一份，避免重复登记。
 function resolveSides(ours, theirs) {
-  if (sideHasLongLine(ours) !== sideHasLongLine(theirs)) {
-    const legacy = sideHasLongLine(ours) ? ours : theirs;
-    const wrapped = sideHasLongLine(ours) ? theirs : ours;
-    const legacyText = flatten(legacy.join(' '));
-    const wrappedText = flatten(wrapped.join(' '));
-    if (legacyText === wrappedText) {
-      return { lines: wrapped, kept: [], note: '两侧文字相同，取已折行的一侧' };
+  if (sideHasLongLine(ours) || sideHasLongLine(theirs)) {
+    const oursText = flatten(ours.join(' '));
+    const theirsText = flatten(theirs.join(' '));
+    if (oursText === theirsText) {
+      return { lines: ours, kept: [], note: '两侧文字相同，取任一侧后重新折行' };
     }
-    if (legacyText.includes(wrappedText)) {
-      return { lines: legacy, kept: [], note: '一侧仍是旧格式单行且完整包含另一侧，取该侧后重新折行' };
+    if (oursText.includes(theirsText)) {
+      return { lines: ours, kept: [], note: '一侧仍是旧格式单行且完整包含另一侧，取该侧后重新折行' };
+    }
+    if (theirsText.includes(oursText)) {
+      return { lines: theirs, kept: [], note: '一侧仍是旧格式单行且完整包含另一侧，取该侧后重新折行' };
     }
     return null;
   }
@@ -265,8 +270,9 @@ function cmdUnion(file) {
     const resolved = resolveSides(ours, theirs);
     if (resolved === null) {
       process.stderr.write(
-        `union: 第 ${block.start + 1} 行的冲突块两侧格式不同（一侧还是旧格式整段单行）且互不包含，\n` +
-          `  无法判断该保留哪一份 —— 机械拼接会把同一段文字写两遍。请人工合并；文件未被改动。\n`,
+        `union: 第 ${block.start + 1} 行的冲突块有一侧（或两侧都）仍是旧格式整段单行，且两侧互不包含，\n` +
+          `  无法判断该保留哪一份 —— 旧单行里已经含有折行侧的全部文字，逐行并集会把这同一段\n` +
+          `  文字写两遍。请人工合并；文件未被改动。\n`,
       );
       return 1;
     }
