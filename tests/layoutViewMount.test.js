@@ -18,7 +18,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mountSfc } from './helpers/vueMount.js'
-import { calls, callsOf, resetRequestStub, respond } from './helpers/stubApiRequest.js'
+import { calls, resetRequestStub, respond } from './helpers/stubApiRequest.js'
 
 const { createMemoryHistory, createRouter } = await import('vue-router')
 

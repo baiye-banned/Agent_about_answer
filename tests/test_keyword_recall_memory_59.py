@@ -19,7 +19,6 @@ import math
 import random
 import tracemalloc
 
-import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.ext.compiler import compiles
