@@ -19,6 +19,7 @@ from config import (
     MEMORY_WINDOW_TURNS,
 )
 from crud import chat as crud_chat
+from crud.pagination import LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT
 from database.session import SessionLocal, get_db
 from rag.learning_trace import TraceRecorder, compact_trace_reference
 from model.models import Conversation, Message, User, _new_id
@@ -33,6 +34,7 @@ from service.oss_service import (
     _put_oss_object,
     is_service_minted_key,
 )
+from service.pagination_service import resolve_conversation_cursor, resolve_list_limit
 from service.trace_service import _safe_trace_add, _safe_trace_attach, _safe_trace_finish, _trace_sse_payloads
 from service.utils_service import (
     CHAT_ATTACHMENT_MAX_BYTES,
@@ -85,9 +87,27 @@ def _serialize_conversation(conv: Conversation, user_id: int) -> dict:
     }
 
 
-def list_conversations(user: User = Depends(get_current_user),
-                       db: Session = Depends(get_db)):
-    rows = crud_chat.list_conversations(db, user.id)
+def list_conversations(
+    limit: Annotated[int, Query(ge=1, le=LIST_MAX_LIMIT)] = LIST_DEFAULT_LIMIT,
+    before_updated_at: Annotated[datetime | None, Query()] = None,
+    before_id: Annotated[str | None, Query()] = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """会话列表，按「最近活动」倒序分页返回。
+
+    游标是 (before_updated_at, before_id) 复合键，两个参数要么都不给（最新一页）、
+    要么都给；只给一个会被 resolve_conversation_cursor 判 422。取值直接回带上一次
+    响应里最后一条的 updated_at 与 id，语义与消息接口的 before_id 同族（键集游标，
+    不是 offset）。不传时返回最新一页，页大小默认 LIST_DEFAULT_LIMIT。
+    """
+    cursor = resolve_conversation_cursor(before_updated_at, before_id)
+    rows = crud_chat.list_conversations(
+        db,
+        user.id,
+        limit=resolve_list_limit(limit),
+        before=cursor,
+    )
     return [_serialize_conversation(c, user.id) for c in rows]
 
 

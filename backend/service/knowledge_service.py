@@ -3,9 +3,9 @@ import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from typing import Any, Callable
+from typing import Annotated, Any, Callable
 
-from fastapi import Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, File, Form, HTTPException, Query, Request, UploadFile
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -13,10 +13,12 @@ from config import KNOWLEDGE_INDEX_MAX_WORKERS, KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SE
 from rag.milvus_client import EmbeddingBackendError, add_chunks, delete_file_chunks
 from crud import knowledge_base as crud_knowledge_base
 from crud import knowledge_file as crud_knowledge_file
+from crud.pagination import LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT
 from database.session import SessionLocal, get_db
 from model.models import KnowledgeFile, User
 from schema.schemas import KnowledgeBaseRequest
 from service.auth_service import get_current_user
+from service.pagination_service import resolve_list_limit
 from service.utils_service import (
     KNOWLEDGE_UPLOAD_MAX_BYTES,
     KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE,
@@ -350,9 +352,26 @@ def _delete_file_vectors_or_500(file_id: int, *, scope: str, detail: str) -> Non
         raise HTTPException(500, detail)
 
 
-def list_knowledge_bases(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = crud_knowledge_base.list_knowledge_bases(db, user.id)
+def list_knowledge_bases(
+    limit: Annotated[int, Query(ge=1, le=LIST_MAX_LIMIT)] = LIST_DEFAULT_LIMIT,
+    after_id: Annotated[int | None, Query(ge=1)] = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """知识库列表，按创建顺序（旧 -> 新）分页返回。
+
+    游标 after_id 取上一次响应里最后一条的 id，返回它之后的那一页（键集游标，
+    不是 offset）；不传时返回第一页，页大小默认 LIST_DEFAULT_LIMIT。
+    """
+    rows = crud_knowledge_base.list_knowledge_bases(
+        db,
+        user.id,
+        limit=resolve_list_limit(limit),
+        after_id=after_id,
+    )
     # 文件数用一条 GROUP BY 聚合取回，避免逐库懒加载（那条语句会把 LONGTEXT content 整列读出来）。
+    # 上限落地后这里的 IN 列表长度也跟着有了界：页大小多大，这条聚合的参数列表就多长，
+    # 不再随知识库总数增长（issue #191）。
     file_counts = crud_knowledge_base.count_knowledge_files_by_base(db, [item.id for item in rows])
     return [
         crud_knowledge_base.serialize_knowledge_base(item, file_counts.get(item.id, 0))
@@ -432,9 +451,26 @@ def delete_knowledge_base(kid: int, user: User = Depends(get_current_user), db: 
     return {"message": "ok", "fallback_knowledge_base_id": target.id}
 
 
-def list_knowledge(knowledge_base_id: int | None = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def list_knowledge(
+    knowledge_base_id: int | None = None,
+    limit: Annotated[int, Query(ge=1, le=LIST_MAX_LIMIT)] = LIST_DEFAULT_LIMIT,
+    before_id: Annotated[int | None, Query(ge=1)] = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """知识库文件列表，按上传时间倒序（新 -> 旧）分页返回。
+
+    游标 before_id 取上一次响应里最后一条的 id，返回它之前（更早）的那一页，与消息接口
+    同族；不传时返回最新一页，页大小默认 LIST_DEFAULT_LIMIT。
+    """
     knowledge_base = resolve_knowledge_base(db, knowledge_base_id, user.id)
-    files = crud_knowledge_file.list_knowledge_files(db, knowledge_base.id, user.id)
+    files = crud_knowledge_file.list_knowledge_files(
+        db,
+        knowledge_base.id,
+        user.id,
+        limit=resolve_list_limit(limit),
+        before_id=before_id,
+    )
     return [crud_knowledge_file.serialize_knowledge_file(item) for item in files]
 
 

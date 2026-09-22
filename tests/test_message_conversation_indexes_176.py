@@ -161,8 +161,14 @@ def _plans(*, drop_indexes):
             )
             with_cursor = _explain(session, *_messages_sql(captured)[0])
 
-            conversations, captured = _capture(session, lambda: list_conversations(session, user_id=1))
-            assert len(conversations) == CONVERSATIONS
+            # issue #191：列表读口有页大小上限（默认一页、上限 LIST_MAX_LIMIT），一次调用取不回
+            # 全部种子行。本文件量的是执行计划，不是「返回全量」那条契约——后者的验收在
+            # tests/test_list_page_caps_191.py。这里显式取满一页（200 写死字面量，不跟实现同步漂移），
+            # 断言仍要咬住「索引只影响计划、不影响结果」：返回的正是从这 400 行里取出的一整页。
+            conversations, captured = _capture(
+                session, lambda: list_conversations(session, user_id=1, limit=200)
+            )
+            assert len(conversations) == 200
             conversation_list = _explain(session, *_conversations_sql(captured)[0])
 
         return {"first_page": first_page, "with_cursor": with_cursor, "conversation_list": conversation_list}

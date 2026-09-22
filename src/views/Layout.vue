@@ -116,6 +116,18 @@
             </el-popconfirm>
           </button>
 
+          <!-- 会话列表有页大小上限（issue #191）：更早的会话按需往后翻。
+               没有这个入口时，超出第一页的会话在侧栏里就是静默消失。 -->
+          <button
+            v-if="chatStore.hasMoreConversations"
+            type="button"
+            :disabled="chatStore.loadingMoreConversations"
+            class="mt-1 flex w-full items-center justify-center rounded-md px-3 py-2 text-xs font-medium text-brand-600 transition-colors hover:bg-brand-50 disabled:cursor-not-allowed disabled:text-slate-400"
+            @click="chatStore.loadMoreConversations()"
+          >
+            {{ chatStore.loadingMoreConversations ? '加载中…' : '加载更早的对话' }}
+          </button>
+
           <div
             v-if="!chatStore.conversations.length && !chatStore.loading"
             class="px-4 py-8 text-center text-xs text-slate-400"
