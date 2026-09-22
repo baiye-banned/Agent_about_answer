@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from config import (
     DEEPSEEK_API_KEY,
@@ -13,6 +14,10 @@ from model.models import Conversation, Message
 from rag.learning_trace import append_trace_event
 from rag.llm import call_chat_text
 from service.utils_service import _clip_text
+
+if TYPE_CHECKING:
+    # 只在类型检查期导入：`service.chat_service` 反过来 import 本模块，运行期导入会成环。
+    from service.chat_service import _ConversationState
 
 
 logger = logging.getLogger(__name__)
@@ -70,7 +75,7 @@ async def _build_recent_memory_text(
 
 
 def _build_memory_context(
-    conversation: Conversation,
+    conversation: "_ConversationState",
     recent_text: str | None = None,
 ) -> str:
     summary = (conversation.memory_summary or "").strip()
