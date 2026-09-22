@@ -47,7 +47,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENV_EXAMPLE = ROOT / ".env.example"
 
 # issue #183 验收 4 给的长度：200 个字符。
-LONG_PASSWORD = "p" * 200
+LONG_PASSWORD = "p" * 200  # scan-secrets:allow 合成的超长探测值，不是口令
 # 与 bcrypt 的输入上限对齐的边界值；下面有用例断言它和 schema 里的常量一致。
 BCRYPT_PASSWORD_LENGTH = 72
 ALICE_PASSWORD = "alice-pass-183"  # scan-secrets:allow in-memory test fixture password
