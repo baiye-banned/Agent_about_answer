@@ -111,7 +111,8 @@ async def _format_recent_memory_messages(messages: list[Message], trace_id: str 
     if len(joined_text) <= MEMORY_RECENT_MAX_CHARS:
         return joined_text
 
-    append_trace_event(
+    await asyncio.to_thread(
+        append_trace_event,
         trace_id,
         "recent_memory_compaction_triggered",
         "_format_recent_memory_messages",
@@ -126,7 +127,8 @@ async def _format_recent_memory_messages(messages: list[Message], trace_id: str 
     summary = await _summarize_recent_memory(joined_text)
     if summary:
         compacted = f"近期记忆压缩：\n{summary}"
-        append_trace_event(
+        await asyncio.to_thread(
+            append_trace_event,
             trace_id,
             "recent_memory_compacted",
             "_summarize_recent_memory",
@@ -137,7 +139,8 @@ async def _format_recent_memory_messages(messages: list[Message], trace_id: str 
         return _clip_text(compacted, MEMORY_RECENT_MAX_CHARS)
 
     fallback = _fallback_compact_recent_memory(rendered_turns)
-    append_trace_event(
+    await asyncio.to_thread(
+        append_trace_event,
         trace_id,
         "recent_memory_compaction_fallback",
         "_fallback_compact_recent_memory",
@@ -231,7 +234,8 @@ async def _update_memory_summary_from_sliding_window(conversation_id: str, trace
     try:
         window = await asyncio.to_thread(_read_conversation_window, conversation_id)
         if window is None:
-            append_trace_event(
+            await asyncio.to_thread(
+                append_trace_event,
                 trace_id,
                 "memory_summary_update_skipped",
                 "_update_memory_summary_from_sliding_window",
@@ -243,7 +247,8 @@ async def _update_memory_summary_from_sliding_window(conversation_id: str, trace
         current_summary, messages = window
         turns = _group_messages_into_turns(messages)
         if len(turns) <= MEMORY_WINDOW_TURNS:
-            append_trace_event(
+            await asyncio.to_thread(
+                append_trace_event,
                 trace_id,
                 "memory_summary_update_skipped",
                 "_update_memory_summary_from_sliding_window",
@@ -261,7 +266,8 @@ async def _update_memory_summary_from_sliding_window(conversation_id: str, trace
         slipped_messages = [message for turn in slipped_turns for message in turn]
         transcript = _format_messages_for_summary(slipped_messages)
         if not transcript:
-            append_trace_event(
+            await asyncio.to_thread(
+                append_trace_event,
                 trace_id,
                 "memory_summary_update_skipped",
                 "_update_memory_summary_from_sliding_window",
@@ -271,7 +277,8 @@ async def _update_memory_summary_from_sliding_window(conversation_id: str, trace
             return
 
         previous_summary = (current_summary or "").strip()
-        append_trace_event(
+        await asyncio.to_thread(
+            append_trace_event,
             trace_id,
             "memory_summary_update_triggered",
             "_update_memory_summary_from_sliding_window",
@@ -288,7 +295,8 @@ async def _update_memory_summary_from_sliding_window(conversation_id: str, trace
         next_summary = await _summarize_conversation_memory(previous_summary, transcript)
         if not next_summary:
             next_summary = _fallback_merge_summary(previous_summary, transcript)
-            append_trace_event(
+            await asyncio.to_thread(
+                append_trace_event,
                 trace_id,
                 "memory_summary_update_fallback",
                 "_fallback_merge_summary",
@@ -299,7 +307,8 @@ async def _update_memory_summary_from_sliding_window(conversation_id: str, trace
         summary_text = next_summary.strip()
         summary_upto = max(message.id for message in slipped_messages)
         await asyncio.to_thread(_write_memory_summary_text, conversation_id, summary_text, summary_upto)
-        append_trace_event(
+        await asyncio.to_thread(
+            append_trace_event,
             trace_id,
             "memory_summary_updated",
             "_summarize_conversation_memory",
@@ -322,7 +331,8 @@ async def _update_memory_summary_from_sliding_window(conversation_id: str, trace
             exc,
             exc_info=True,
         )
-        append_trace_event(
+        await asyncio.to_thread(
+            append_trace_event,
             trace_id,
             "memory_summary_update_failed",
             "_update_memory_summary_from_sliding_window",
@@ -351,7 +361,8 @@ async def _compact_summary_if_needed(conversation_id: str, trace_id: str | None 
     if not summary or summary_length <= MEMORY_SUMMARY_MAX_CHARS:
         return
 
-    append_trace_event(
+    await asyncio.to_thread(
+        append_trace_event,
         trace_id,
         "memory_summary_compaction_triggered",
         "_compact_summary_if_needed",
@@ -366,7 +377,8 @@ async def _compact_summary_if_needed(conversation_id: str, trace_id: str | None 
     if not next_summary:
         trimmed = _clip_text(summary, MEMORY_SUMMARY_MAX_CHARS)
         await asyncio.to_thread(_write_memory_summary_text, conversation_id, trimmed)
-        append_trace_event(
+        await asyncio.to_thread(
+            append_trace_event,
             trace_id,
             "memory_summary_compaction_failed",
             "_compact_summary_if_needed",
@@ -377,7 +389,8 @@ async def _compact_summary_if_needed(conversation_id: str, trace_id: str | None 
 
     compacted = next_summary.strip()
     await asyncio.to_thread(_write_memory_summary_text, conversation_id, compacted)
-    append_trace_event(
+    await asyncio.to_thread(
+        append_trace_event,
         trace_id,
         "memory_summary_compacted",
         "_compact_summary_if_needed",

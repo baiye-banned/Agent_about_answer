@@ -260,6 +260,7 @@ Current files:
 - `test_trace_crud.py`
 - `test_trace_index_after_conversation_delete_141.py`
 - `test_trace_purge_on_conversation_delete_127.py`
+- `test_trace_writeback_off_loop_201.py`
 - `test_upload_validation.py`
 - `test_uploads_anonymous_read_186.py`
 - `test_vision_outbound_guard_181.py`
@@ -441,7 +442,33 @@ existing assertions moved with the fix and are recorded here rather than quietly
 `stream_chat` no longer passes a Session to `retrieve_knowledge` (the new assertion is `is None`,
 and any revival of the old hand-off turns it red), and a streaming request no longer holds a pooled
 connection for the whole stream, so the precondition `test_sse_session_leak.py` used to assert at 1 -
-itself a leak detector - now asserts at 0 from the same property.
+itself a leak detector - now asserts at 0 from the same property. The same oracle then reaches the
+learning trace's own writeback, which #187 left outside its boundary (issue #201: with
+`LEARNING_TRACE_ENABLED` at its production default of true, `TraceRecorder`'s
+`__init__`/`add`/`attach`/`finish` opened their own synchronous `SessionLocal()` through
+`crud/trace.py` on whatever thread called them, which in `stream_chat`/`event_stream` is the event
+loop thread - measured on a copy of the pre-fix tree at 10 sync statements, calling thread identical
+to the loop thread, and 0 heartbeats in a 1521ms window; `add`/`attach`/`finish` are coroutines now
+and each hands its whole "open session, use it, close it" step to `asyncio.to_thread`, the
+constructor no longer writes because a constructor cannot be awaited and `persist_trace_session`
+already upserts, and the module-level `append_trace_event` - which `memory_service` and `ragas_eval`
+call from coroutines - is wrapped the same way at those call sites while the sites that already run
+in a worker thread or with no loop at all keep calling it directly; the cases intercept
+`crud.trace.SessionLocal` rather than `chat_service.SessionLocal`, because that module owns the
+session the previous gates could not see, and they run the real `stream_chat` end to end with the
+trace switched on rather than stubbed out, which is what turns red if only `_persist` is moved and
+the `add`/`attach`/`finish` chain is left behind; ordering and terminal state are pinned against the
+in-memory events after every await, so a fire-and-forget rewrite that returns before the row is
+written fails too, and the disconnect path is driven through `aclose()` to pin that the teardown
+write in the stream generator's `finally` still lands; six mutations were each reverted in an
+out-of-repo copy against a green control - the recorder's persist back on the loop, the constructor
+persisting again, `add` writing inline, one `memory_service` call site unwrapped, and each
+`_trace_add` helper writing inline - and every one turns the cases that name it red, with the two
+helper modules split into separate cases so that a single one regressing cannot hide behind the
+other's worker-thread sessions; the scan is a second gate over the five modules that reach the trace
+chain, with 2 positive and 5 negative self-checks, and a companion case pins that every `crud_trace`
+call in `learning_trace.py` sits in a synchronous payload while the recorder's write methods are
+coroutines).
 
 `conftest.py` puts `backend/` on `sys.path` so the tests can import application modules, and holds the test doubles shared by more than one test file: the `FakeQuery`/`FakeDb`/`FakeUser`/`FakeKnowledgeBase`/`FakeTraceRecorder` classes, the pytest fixtures built on them (`fake_user`, `fake_db`, `fake_knowledge_base`, `trace_recorder_cls`), and the SSE helpers (`collect_stream`, `parse_sse_frames`, `frames_of_type`, `streamed_content`). Test doubles used by a single file stay in that file.
 

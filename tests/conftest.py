@@ -80,7 +80,11 @@ class FakeKnowledgeBase:
 
 
 class FakeTraceRecorder:
-    """TraceRecorder 替身：真实构造器会写库，测试只保留内存事件与 SSE 游标。"""
+    """TraceRecorder 替身：真实实现把写库交给工作线程，测试只保留内存事件与 SSE 游标。
+
+    `add` / `attach` / `finish` 与真实实现同样是协程——调用方一律 `await`，替身若留在同步
+    形态，`await None` 会直接炸，反而看不清是哪条断言坏了。
+    """
 
     instances: list["FakeTraceRecorder"] = []
 
@@ -94,17 +98,17 @@ class FakeTraceRecorder:
         self._cursor = 0
         FakeTraceRecorder.instances.append(self)
 
-    def add(self, stage, function, **payload):
+    async def add(self, stage, function, **payload):
         event = {"index": len(self.events) + 1, "stage": stage, "function": function, **payload}
         self.events.append(event)
         return event
 
-    def attach(self, conversation_id=None, message_id=None, status=None):
+    async def attach(self, conversation_id=None, message_id=None, status=None):
         if status:
             self.status = status
         self.attachments = {"conversation_id": conversation_id, "message_id": message_id}
 
-    def finish(self, status="done", **extra):
+    async def finish(self, status="done", **extra):
         self.status = status
         self.finished = {"status": status, **extra}
 

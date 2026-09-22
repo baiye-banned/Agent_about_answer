@@ -360,7 +360,7 @@ def rename_conversation(cid: str, body: RenameRequest, user: User = Depends(get_
     return {"message": "ok"}
 
 
-def _attach_grounding_trace(
+async def _attach_grounding_trace(
     retrieval_trace: dict,
     trace: TraceRecorder,
     *,
@@ -374,7 +374,7 @@ def _attach_grounding_trace(
 
     grounding = _check_answer_grounding(answer, retrieved_contexts)
     retrieval_trace["grounding"] = grounding
-    _safe_trace_add(
+    await _safe_trace_add(
         trace,
         "grounding_checked",
         "_check_answer_grounding",
@@ -618,7 +618,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
         )
     try:
         trace = TraceRecorder(user_id=principal.user_id)
-        trace.add(
+        await trace.add(
             "request_received",
             "stream_chat",
             creates={"trace_id": trace.trace_id},
@@ -638,16 +638,16 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
         raw_question = (body.question or "").strip()
         display_question = raw_question or ("请分析这张图片" if body.attachments else "")
         if not display_question:
-            trace.add(
+            await trace.add(
                 "request_rejected",
                 "stream_chat",
                 uses={"raw_question": raw_question, "attachments_count": len(body.attachments or [])},
                 result={"error": "问题不能为空"},
                 note="没有文字问题，也没有图片附件，无法继续进入 RAG 流程。",
             )
-            trace.finish("failed")
+            await trace.finish("failed")
             raise HTTPException(400, "问题不能为空")
-        trace.add(
+        await trace.add(
             "input_normalized",
             "stream_chat",
             creates={"raw_question": raw_question, "display_question": display_question},
@@ -659,7 +659,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             raw_question,
             body.attachments,
         )
-        trace.add(
+        await trace.add(
             "effective_question_built",
             "_build_effective_question",
             params={"raw_question": raw_question, "attachments_count": len(body.attachments or [])},
@@ -672,14 +672,14 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             note="如果有图片，系统会先把图片转成文字描述，再与用户问题合并为真正用于检索和生成的问题。",
         )
         if body.attachments and image_analysis.get("status") == "failed" and not raw_question:
-            trace.add(
+            await trace.add(
                 "image_failed_directly",
                 "_build_effective_question",
                 uses={"attachments_count": len(body.attachments or [])},
                 result={"error": image_analysis.get("error", "")},
                 note="用户只发了图片但图片识别失败，因此不会进入知识库检索和模型回答。",
             )
-            trace.finish("failed")
+            await trace.finish("failed")
 
             async def failure_stream():
                 # 这条早退流同样占着一个并发槽，收尾必须归还（正常走完/被断开都走 finally）。
@@ -719,7 +719,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
         cid = conversation.id
         knowledge_base = conversation.knowledge_base
         if conversation.created:
-            trace.add(
+            await trace.add(
                 "conversation_created",
                 "stream_chat",
                 creates={"conversation_id": cid, "title": title},
@@ -727,14 +727,14 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 note="这是新对话，系统创建 conversation，并把它绑定到当前知识库。",
             )
         else:
-            trace.add(
+            await trace.add(
                 "conversation_loaded",
                 "stream_chat",
                 uses={"conversation_id": cid},
                 result={"knowledge_base_id": knowledge_base.id, "title": conversation.title},
                 note="这是已有对话，系统复用它原本绑定的知识库，避免会话中途串库。",
             )
-        trace.attach(conversation_id=cid)
+        await trace.attach(conversation_id=cid)
 
         # save user message
         accepted_attachments = _service_minted_attachments(body.attachments, cid)
@@ -745,7 +745,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             display_question,
             accepted_attachments,
         )
-        trace.add(
+        await trace.add(
             "user_message_saved",
             "Message",
             creates={"user_message_id": user_message_id},
@@ -766,7 +766,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             recent_text=recent_text,
         )
         retrieval_question = _build_memory_aware_retrieval_question(effective_question, memory_context)
-        trace.add(
+        await trace.add(
             "memory_built",
             "_build_memory_context",
             uses={
@@ -795,7 +795,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
         )
         need_rag = bool(rag_gate.get("need_rag", True))
         generation_mode = "rag" if need_rag else "direct"
-        trace.add(
+        await trace.add(
             "rag_gate_decided",
             "decide_need_rag",
             uses={
@@ -870,7 +870,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 retrieval_trace["image_analysis_status"] = image_analysis.get("status", "")
                 retrieval_trace["image_analysis_error"] = image_analysis.get("error", "")
                 retrieval_trace["image_description"] = image_analysis.get("description", "")
-            trace.add(
+            await trace.add(
                 "retrieval_completed",
                 "retrieve_knowledge",
                 params={"question": retrieval_question, "knowledge_base_id": knowledge_base.id},
@@ -890,7 +890,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 )
             sources = _build_sources(knowledge_chunks)
             retrieved_contexts = [c.get("content", "") for c in knowledge_chunks if c.get("content")]
-            trace.add(
+            await trace.add(
                 "context_built",
                 "_build_sources",
                 creates={"context": context, "sources": sources},
@@ -899,7 +899,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             )
         else:
             retrieval_trace["skip_reason"] = rag_gate.get("reason", "")
-            trace.add(
+            await trace.add(
                 "retrieval_skipped",
                 "decide_need_rag",
                 uses={
@@ -946,7 +946,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 if need_rag and sources:
                     data = json.dumps({"type": "sources", "sources": sources}, ensure_ascii=False)
                     yield f"data: {data}\n\n"
-                trace.add(
+                await trace.add(
                     "generation_started",
                     "stream_rag_answer",
                     params={
@@ -975,7 +975,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                     if isinstance(event, dict):
                         if event.get("type") == "error":
                             failed = True
-                            trace.add(
+                            await trace.add(
                                 "generation_failed",
                                 "_stream_deepseek_response",
                                 result={"message": event.get("message") or event.get("content") or "DeepSeek 网络请求失败"},
@@ -997,7 +997,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                             # 落库文本也从零重新累积，绝不与重置前的内容拼接。
                             full = ""
                             first_chunk_seen = False
-                            trace.add(
+                            await trace.add(
                                 "stream_reset",
                                 "_stream_openai_chat_chunks",
                                 params={"reason": event.get("reason") or ""},
@@ -1023,7 +1023,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                     if not failed:
                         if chunk and not first_chunk_seen:
                             first_chunk_seen = True
-                            trace.add(
+                            await trace.add(
                                 "first_content_chunk",
                                 "_stream_openai_chat_chunks",
                                 result={"chunk": chunk},
@@ -1035,7 +1035,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
 
                 # save assistant message
                 if full and not failed:
-                    _safe_trace_add(
+                    await _safe_trace_add(
                         trace,
                         "assistant_ready_to_save",
                         "Message",
@@ -1050,7 +1050,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                             else "模型完整回答成功，系统准备保存 assistant 消息，并启动 RAGAS 和摘要判断。"
                         ),
                     )
-                    _attach_grounding_trace(
+                    await _attach_grounding_trace(
                         retrieval_trace,
                         trace,
                         answer=full,
@@ -1073,7 +1073,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                     except Exception as exc:
                         logger.warning("Assistant message save failed after stream finished [trace_id=%s]: %s",
                                        trace.trace_id, exc, exc_info=True)
-                        _safe_trace_add(
+                        await _safe_trace_add(
                             trace,
                             "assistant_save_failed",
                             "Message",
@@ -1082,8 +1082,8 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                         )
 
                     if assistant_message_id is not None:
-                        _safe_trace_attach(trace, conversation_id=cid, message_id=assistant_message_id)
-                        _safe_trace_add(
+                        await _safe_trace_attach(trace, conversation_id=cid, message_id=assistant_message_id)
+                        await _safe_trace_add(
                             trace,
                             "assistant_message_saved",
                             "Message",
@@ -1100,7 +1100,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                                     retrieved_contexts,
                                     trace.trace_id,
                                 )
-                                _safe_trace_add(
+                                await _safe_trace_add(
                                     trace,
                                     "ragas_scheduled",
                                     "schedule_ragas_evaluation",
@@ -1115,7 +1115,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                             except Exception as exc:
                                 logger.warning("RAGAS schedule failed after stream finished [trace_id=%s]: %s",
                                                trace.trace_id, exc, exc_info=True)
-                                _safe_trace_add(
+                                await _safe_trace_add(
                                     trace,
                                     "ragas_schedule_failed",
                                     "schedule_ragas_evaluation",
@@ -1123,7 +1123,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                                     note="RAGAS 调度失败，但不影响主回答完成。",
                                 )
                         else:
-                            _safe_trace_add(
+                            await _safe_trace_add(
                                 trace,
                                 "ragas_skipped",
                                 "schedule_ragas_evaluation",
@@ -1132,7 +1132,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                             )
                         try:
                             _schedule_memory_summary_update(cid, trace.trace_id)
-                            _safe_trace_add(
+                            await _safe_trace_add(
                                 trace,
                                 "memory_summary_update_scheduled",
                                 "_schedule_memory_summary_update",
@@ -1142,7 +1142,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                         except Exception as exc:
                             logger.warning("Memory summary schedule failed after stream finished [trace_id=%s]: %s",
                                            trace.trace_id, exc, exc_info=True)
-                            _safe_trace_add(
+                            await _safe_trace_add(
                                 trace,
                                 "memory_summary_update_schedule_failed",
                                 "_schedule_memory_summary_update",
@@ -1158,7 +1158,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                             )
                         except Exception as exc:
                             logger.warning("Assistant trace reference update failed: %s", exc, exc_info=True)
-                    _safe_trace_finish(
+                    await _safe_trace_finish(
                         trace,
                         "done" if assistant_message_id is not None else "partial",
                         conversation_id=cid,
@@ -1167,14 +1167,14 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                     for payload in _trace_sse_payloads(trace):
                         yield payload
                 elif failed:
-                    _safe_trace_add(
+                    await _safe_trace_add(
                         trace,
                         "assistant_not_saved",
                         "Message",
                         result={"saved": False},
                         note="回答生成失败，遵循项目规则：不把失败内容保存为正式 assistant 消息。",
                     )
-                    _safe_trace_finish(trace, "failed", conversation_id=cid)
+                    await _safe_trace_finish(trace, "failed", conversation_id=cid)
                     for payload in _trace_sse_payloads(trace):
                         yield payload
                 yield "data: [DONE]\n\n"
@@ -1190,8 +1190,11 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 # #58 那条「断开必须归还连接池」的保证因此从「靠这段 finally」变成结构性成立。
                 try:
                     # 正常路径已把 status 写成 done/partial/failed，这里只兜断开等异常收尾。
+                    # 这一次写回是协程（issue #201），写库整段在工作线程里完成：断连时即使
+                    # 调用方在这个 `await` 上被打断，写入也已经交出去了、会在工作线程里跑完
+                    # 并关掉自己的会话——终态不会因为取消而丢，它不再是「借出去要还的连接」。
                     if getattr(trace, "status", None) == "running":
-                        _safe_trace_finish(trace, "failed", conversation_id=cid)
+                        await _safe_trace_finish(trace, "failed", conversation_id=cid)
                 except Exception as exc:
                     logger.warning("Learning trace teardown failed: %s", exc, exc_info=True)
                 finally:

@@ -134,7 +134,7 @@ async def retrieve_knowledge(
     trace_recorder: Any = None,
     query_plan: dict | None = None,
 ) -> tuple[list[dict], dict]:
-    _trace_add(
+    await _trace_add(
         trace_recorder,
         "retriever_started",
         "retrieve_knowledge",
@@ -238,7 +238,7 @@ async def retrieve_knowledge(
     reranked, rerank_trace = await rerank_chunks(ranking_question, fused[:12])
     trace["rerank"] = rerank_trace
     final_chunks = select_final_chunks(reranked or fused, keyword_chunks)
-    _trace_add(
+    await _trace_add(
         trace_recorder,
         "retriever_done",
         "retrieve_knowledge",
@@ -989,10 +989,15 @@ def _keyword_chunk_starts(
     return range(0, content_length, max(chunk_size - chunk_overlap, 1))
 
 
-def _trace_add(trace_recorder: Any, *args, **kwargs) -> None:
+async def _trace_add(trace_recorder: Any, *args, **kwargs) -> None:
+    """记录一条检索侧事件；失败静默，检索结果不受轨迹影响。
+
+    `TraceRecorder.add` 是协程（写库交给工作线程，issue #201）；`retrieve_knowledge` 是
+    事件循环线程上的协程，两个调用点都必须 await，否则写回又回到循环线程上。
+    """
     if not trace_recorder:
         return
     try:
-        trace_recorder.add(*args, **kwargs)
+        await trace_recorder.add(*args, **kwargs)
     except Exception:
         pass
