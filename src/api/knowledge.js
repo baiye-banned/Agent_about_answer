@@ -4,8 +4,9 @@ export const knowledgeAPI = {
   getList(params) {
     return request.get('/knowledge', { params })
   },
-  getBases() {
-    return request.get('/knowledge-bases')
+  // params 支持 { limit, after_id }：不传时后端只返回第一页（按创建顺序，旧 -> 新）。
+  getBases(params) {
+    return request.get('/knowledge-bases', { params })
   },
   createBase(name, config = {}) {
     return request.post('/knowledge-bases', { name }, config)
