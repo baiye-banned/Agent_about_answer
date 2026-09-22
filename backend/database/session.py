@@ -64,6 +64,8 @@ def _ensure_schema_columns():
         _ensure_mysql_text_column("messages", "ragas_scores", "TEXT")
         _ensure_mysql_text_column("messages", "ragas_error", "TEXT")
         _ensure_mysql_text_column("messages", "retrieval_trace", "LONGTEXT")
+        # conversation_id 早于本次改动就已存在，所以不能挂在上面那个「刚加列」的分支里。
+        _ensure_single_column_index("messages", "conversation_id", "ix_messages_conversation_id")
 
     if "conversations" in table_names:
         columns = {column["name"] for column in inspector.get_columns("conversations")}
@@ -82,6 +84,11 @@ def _ensure_schema_columns():
         _ensure_mysql_varchar_column("conversations", "id", 36, nullable=False)
         _ensure_mysql_varchar_column("conversations", "title", 200, nullable=False)
         _ensure_mysql_text_column("conversations", "memory_summary", "TEXT")
+        # 同样是先于本次改动就存在的列：老库只补列、不补索引。
+        _ensure_single_column_index("conversations", "user_id", "ix_conversations_user_id")
+        _ensure_single_column_index(
+            "conversations", "knowledge_base_id", "ix_conversations_knowledge_base_id"
+        )
 
     if "knowledge_files" in table_names:
         columns = {column["name"] for column in inspector.get_columns("knowledge_files")}
