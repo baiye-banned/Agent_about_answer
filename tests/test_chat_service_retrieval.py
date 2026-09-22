@@ -19,7 +19,7 @@ from conftest import (
     parse_sse_frames,
     streamed_content,
 )
-from model.models import Conversation
+from model.models import Conversation, User
 from schema.schemas import ChatRequest
 from service import chat_service
 from service.utils_service import _build_sources
@@ -66,7 +66,11 @@ def _patch_boundaries(monkeypatch, fake_db, trace_cls, *, real_generation):
     """只打桩真正的边界，返回调用记录；知识库解析/检索/生成被替换，其余协作者保持真实。"""
     calls = {"resolve": [], "retrieve": [], "stream": [], "gate": [], "ragas": [], "memory_summary": []}
 
-    monkeypatch.setattr(chat_service, "decode_token", lambda authorization: "alice")
+    monkeypatch.setattr(
+        chat_service,
+        "authenticate",
+        lambda db, authorization: db.query(User).filter_by(username="alice").first(),
+    )
     monkeypatch.setattr(chat_service, "SessionLocal", lambda: fake_db)
     monkeypatch.setattr(chat_service, "TraceRecorder", trace_cls)
 

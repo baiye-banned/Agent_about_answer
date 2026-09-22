@@ -24,7 +24,7 @@ from model.models import Conversation, Message, User, _new_id
 from rag.ragas_eval import schedule_ragas_evaluation
 from schema.schemas import ChatRequest, RenameRequest
 from service import rate_limit
-from service.auth_service import decode_token, get_current_user
+from service.auth_service import authenticate, get_current_user
 from service.oss_service import (
     ForeignObjectKeyError,
     _delete_oss_object,
@@ -414,12 +414,17 @@ async def upload_chat_attachment(file: UploadFile = File(...),
 
 
 async def stream_chat(body: ChatRequest, authorization: str = Header("")):
-    username = decode_token(authorization)
+    # 与 get_current_user 共用同一条鉴权链（验签 → 回查 → 世代 → 吊销登记）：这个入口
+    # 不走 FastAPI 依赖注入、自己开会话，早先直接调用 decode_token，于是任何挂在依赖上的
+    # 吊销判定都到不了这里（issue #184）。用户名改从鉴权后的那一行上取，不再单独解一次。
     db = SessionLocal()
-    user = db.query(User).filter_by(username=username).first()
-    if not user:
+    try:
+        user = authenticate(db, authorization)
+    except Exception:
+        # 鉴权失败也要把会话还回连接池：这条路径在拿到 user 之前就退出了。
         db.close()
-        raise HTTPException(401, "User not found")
+        raise
+    username = user.username
     # 认过身份再占并发槽：一次聊天流会一直占着服务端资源到上游结束，没上限时少量连接就能
     # 打满（issue #183）。满员时立刻拒绝，不排队——排队会把请求拖到上游超时才释放。
     slot = rate_limit.chat_stream_slots.try_acquire()

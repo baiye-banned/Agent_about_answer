@@ -34,7 +34,7 @@ import config
 from conftest import FakeKnowledgeBase, FakeTraceRecorder
 from database import session as db_session
 from database.session import Base
-from model.models import Conversation, Message, User
+from model.models import Conversation, Message, RevokedToken, User
 from router import auth as auth_router
 from router import chat as chat_router
 from router import user as user_router
@@ -86,7 +86,9 @@ def login_api():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-    Base.metadata.create_all(bind=engine, tables=[User.__table__])
+    # revoked_tokens 也建：issue #184 之后鉴权链要查吊销登记，改口令那条用例走真实
+    # `authenticate`，缺这张表会在鉴权依赖里直接 500。
+    Base.metadata.create_all(bind=engine, tables=[User.__table__, RevokedToken.__table__])
     TestingSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
     db = TestingSession()
     db.add_all(
@@ -218,9 +220,17 @@ def test_throttle_key_ignores_forwarded_headers():
 
 
 def _boundary_patches(monkeypatch, session_factory):
-    """只打桩真正的边界（鉴权/会话工厂/trace/知识库解析/检索门），其余跑真实实现。"""
+    """只打桩真正的边界（鉴权/会话工厂/trace/知识库解析/检索门），其余跑真实实现。
+
+    鉴权桩打在 `authenticate` 上（issue #184 之后流式入口走的那条链）：`decode_token`
+    已经不再是 `stream_chat` 的协作者，改从库里取那一行 alice，与本目录其它文件同形。
+    """
+
+    def fake_authenticate(db, authorization):
+        return db.query(User).filter_by(username="alice").first()
+
+    monkeypatch.setattr(chat_service, "authenticate", fake_authenticate)
     monkeypatch.setattr(chat_service, "SessionLocal", session_factory)
-    monkeypatch.setattr(chat_service, "decode_token", lambda authorization: "alice")
     monkeypatch.setattr(chat_service, "TraceRecorder", FakeTraceRecorder)
     monkeypatch.setattr(chat_service, "resolve_knowledge_base", lambda db, kid, user_id: FakeKnowledgeBase())
 
