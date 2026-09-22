@@ -262,6 +262,15 @@ CHAT_ATTACHMENT_SWEEP_BATCH_LIMIT = _env_int("CHAT_ATTACHMENT_SWEEP_BATCH_LIMIT"
 # 迟一点没有正确性代价，而每轮都要串行外呼 OSS。
 CHAT_ATTACHMENT_SWEEP_INTERVAL_SECONDS = _env_int("CHAT_ATTACHMENT_SWEEP_INTERVAL_SECONDS", 6 * 60 * 60)
 
+# 请求限流（issue #183）。计数器在进程内存里（见 service/rate_limit.py），多 worker / 多实例
+# 部署时每个进程各持一份，真实上限 = 配置值 × 进程数。登录侧按「账号 + 来源地址」计数：
+# 阈值内的正确口令不受影响，超阈值后连正确口令一起拒到窗口滑出（否则每次拒绝都要先跑一遍
+# bcrypt，攻击者照样能烧 CPU），窗口滑出即自动恢复，不做永久锁定。
+LOGIN_RATE_LIMIT_MAX_FAILURES = _env_int("LOGIN_RATE_LIMIT_MAX_FAILURES", 5)
+LOGIN_RATE_LIMIT_WINDOW_SECONDS = _env_int("LOGIN_RATE_LIMIT_WINDOW_SECONDS", 300)
+# 同一进程内同时在跑的 SSE 聊天流上限；超出的请求立刻 429，不排队等上游超时。
+CHAT_STREAM_MAX_CONCURRENCY = _env_int("CHAT_STREAM_MAX_CONCURRENCY", 8)
+
 # JWT
 # The literal below is a public placeholder shipped with the repository; anyone can
 # read it, so it must never be used as an actual HS256 signing key.
