@@ -43,7 +43,8 @@ async def evaluate_message_async(
     trace_id: str | None = None,
 ):
     if not RAGAS_ENABLED:
-        append_trace_event(
+        await asyncio.to_thread(
+            append_trace_event,
             trace_id,
             "ragas_disabled",
             "evaluate_message_async",
@@ -54,7 +55,8 @@ async def evaluate_message_async(
         return
 
     logger.info("RAGAS evaluation started: message_id=%s contexts=%s", message_id, len(contexts or []))
-    append_trace_event(
+    await asyncio.to_thread(
+        append_trace_event,
         trace_id,
         "ragas_running",
         "evaluate_message_async",
@@ -70,7 +72,8 @@ async def evaluate_message_async(
     try:
         prepared_answer = _truncate_text(answer, RAGAS_MAX_ANSWER_CHARS)
         prepared_contexts = _prepare_contexts(contexts)
-        append_trace_event(
+        await asyncio.to_thread(
+            append_trace_event,
             trace_id,
             "ragas_inputs_prepared",
             "evaluate_message_async",
@@ -89,7 +92,8 @@ async def evaluate_message_async(
         if scores:
             error_text = _format_metric_errors(errors)
             _mark_message(message_id, "done", scores, error_text)
-            append_trace_event(
+            await asyncio.to_thread(
+                append_trace_event,
                 trace_id,
                 "ragas_done",
                 "evaluate_message_async",
@@ -101,7 +105,8 @@ async def evaluate_message_async(
         else:
             error_text = _format_metric_errors(errors) or "RAGAS 评测失败：所有指标均未返回结果"
             _mark_message(message_id, "failed", {}, error_text)
-            append_trace_event(
+            await asyncio.to_thread(
+                append_trace_event,
                 trace_id,
                 "ragas_failed",
                 "evaluate_message_async",
@@ -114,7 +119,8 @@ async def evaluate_message_async(
         message = f"RAGAS 评测超时：超过 {RAGAS_TIMEOUT_SECONDS} 秒未完成，请稍后重试"
         logger.warning("RAGAS evaluation timeout: message_id=%s timeout=%s", message_id, RAGAS_TIMEOUT_SECONDS)
         _mark_message(message_id, "failed", {}, message)
-        append_trace_event(
+        await asyncio.to_thread(
+            append_trace_event,
             trace_id,
             "ragas_timeout",
             "evaluate_message_async",
@@ -128,7 +134,8 @@ async def evaluate_message_async(
         friendly = _friendly_error(exc)
         logger.warning("RAGAS evaluation failed: message_id=%s error=%s", message_id, exc, exc_info=True)
         _mark_message(message_id, "failed", {}, f"RAGAS 评测失败：{friendly}")
-        append_trace_event(
+        await asyncio.to_thread(
+            append_trace_event,
             trace_id,
             "ragas_failed",
             "evaluate_message_async",
