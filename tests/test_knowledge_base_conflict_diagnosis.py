@@ -21,7 +21,7 @@ from sqlalchemy.pool import StaticPool
 import main
 from database import session as db_session
 from database.session import Base
-from model.models import KnowledgeBase, User
+from model.models import KnowledgeBase, RevokedToken, User
 from router import knowledge as knowledge_router
 from service import auth_service, knowledge_service
 
@@ -44,7 +44,7 @@ def api():
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
 
-    Base.metadata.create_all(bind=engine, tables=[User.__table__, KnowledgeBase.__table__])
+    Base.metadata.create_all(bind=engine, tables=[User.__table__, RevokedToken.__table__, KnowledgeBase.__table__])
     db = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)()
 
     alice = User(username="alice", password_hash="x")

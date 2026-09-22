@@ -9,6 +9,7 @@ import asyncio
 
 import rag.llm as llm
 from conftest import FakeKnowledgeBase, collect_stream, frames_of_type, parse_sse_frames
+from model.models import User
 from schema.schemas import ChatRequest
 from service import chat_service
 
@@ -132,7 +133,11 @@ def test_fallback_disabled_still_reports_error_without_reset(monkeypatch):
 
 
 def _patch_chat_service_boundaries(monkeypatch, fake_db, trace_cls):
-    monkeypatch.setattr(chat_service, "decode_token", lambda authorization: "alice")
+    monkeypatch.setattr(
+        chat_service,
+        "authenticate",
+        lambda db, authorization: db.query(User).filter_by(username="alice").first(),
+    )
     monkeypatch.setattr(chat_service, "SessionLocal", lambda: fake_db)
     monkeypatch.setattr(chat_service, "TraceRecorder", trace_cls)
     monkeypatch.setattr(chat_service, "resolve_knowledge_base", lambda db, kid, user_id: FakeKnowledgeBase())

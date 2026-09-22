@@ -32,7 +32,7 @@ from sqlalchemy.pool import StaticPool
 from crud import chat as crud_chat
 from crud import trace as crud_trace
 from database.session import Base
-from model.models import ChatTraceSession, Conversation, KnowledgeBase, Message, User
+from model.models import ChatTraceSession, Conversation, KnowledgeBase, Message, RevokedToken, User
 from rag.learning_trace import TraceRecorder, append_trace_event
 
 
@@ -54,7 +54,7 @@ def api(monkeypatch):
     Base.metadata.create_all(
         bind=engine,
         tables=[
-            User.__table__,
+            User.__table__, RevokedToken.__table__,
             KnowledgeBase.__table__,
             Conversation.__table__,
             Message.__table__,

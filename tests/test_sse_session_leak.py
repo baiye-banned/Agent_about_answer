@@ -31,7 +31,7 @@ from sqlalchemy.pool import QueuePool
 import rag.llm as llm
 from conftest import FakeKnowledgeBase, collect_stream, parse_sse_frames, streamed_content
 from database.session import Base
-from model.models import Conversation, Message, User
+from model.models import Conversation, Message, RevokedToken, User
 from schema.schemas import ChatRequest
 from service import chat_service
 
@@ -47,7 +47,11 @@ def _compile_longtext_as_text(_type, _compiler, **_kwargs):
 
 def _patch_boundaries(monkeypatch, fake_db, trace_cls):
     """只打桩真正的边界（鉴权/会话工厂/trace/知识库解析/检索/模型），其余跑真实实现。"""
-    monkeypatch.setattr(chat_service, "decode_token", lambda authorization: "alice")
+    monkeypatch.setattr(
+        chat_service,
+        "authenticate",
+        lambda db, authorization: db.query(User).filter_by(username="alice").first(),
+    )
     monkeypatch.setattr(chat_service, "SessionLocal", lambda: fake_db)
     monkeypatch.setattr(chat_service, "TraceRecorder", trace_cls)
     monkeypatch.setattr(chat_service, "resolve_knowledge_base", lambda db, kid, user_id: FakeKnowledgeBase())
@@ -200,7 +204,7 @@ def test_disconnect_returns_connection_to_pool(monkeypatch, tmp_path, trace_reco
     )
     Base.metadata.create_all(
         bind=engine,
-        tables=[User.__table__, Conversation.__table__, Message.__table__],
+        tables=[User.__table__, RevokedToken.__table__, Conversation.__table__, Message.__table__],
     )
     with sessionmaker(bind=engine)() as seed:
         seed.add(User(id=7, username="alice", password_hash="x"))

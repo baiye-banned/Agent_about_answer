@@ -12,7 +12,13 @@ def serialize_user_profile(user: User) -> dict:
 
 
 def update_password_hash(db: Session, user: User, password_hash: str) -> User:
+    """换掉口令哈希，并把令牌世代 +1。
+
+    两件事必须在同一个事务里落库：只改哈希，改密前签发的 token 在剩余有效期内继续可用
+    （issue #184 的原始缺陷）；只加世代不改哈希，则用户以为改掉的口令其实没改。
+    """
     user.password_hash = password_hash
+    user.token_version = (user.token_version or 0) + 1
     db.commit()
     db.refresh(user)
     return user
