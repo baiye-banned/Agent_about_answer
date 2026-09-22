@@ -1,3 +1,5 @@
+import asyncio
+
 import rag.learning_trace as learning_trace
 from rag.learning_trace import TraceRecorder, sanitize_trace_value, summarize_messages, summarize_text
 
@@ -24,16 +26,21 @@ def test_trace_recorder_only_defaults_none_fields(monkeypatch):
     monkeypatch.setattr(learning_trace, "LEARNING_TRACE_ENABLED", False)
     recorder = TraceRecorder()
     recorder.enabled = True
-    recorder._safe_persist = lambda **kwargs: None
 
-    event = recorder.add(
+    async def _noop_persist(**_kwargs):
+        return None
+
+    # 写库那一段由 `_safe_persist` 交给工作线程（issue #201），替身保持同签名即可。
+    recorder._safe_persist = _noop_persist
+
+    event = asyncio.run(recorder.add(
         "stage",
         "function",
         creates=False,
         uses=0,
         params=[],
         result=None,
-    )
+    ))
 
     assert event["creates"] is False
     assert event["uses"] == 0

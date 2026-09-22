@@ -108,8 +108,13 @@ def _session_factory(monkeypatch, *, delay_seconds=0.0):
 def _silence_learning_trace(monkeypatch):
     """关掉学习轨迹并换掉 TraceRecorder。
 
-    轨迹写入走的是 `crud/trace.py` 自己开的会话，既不经过本用例的会话工厂、也不在 issue #187
-    的范围内；不关掉它，用例就会去连生产库，把「环境不可达」误读成「修复失败」。
+    轨迹写入走的是 `crud/trace.py` 自己开的会话，既不经过本用例的会话工厂、也不在本文件要
+    测的那两个模块里；不关掉它，用例就会去连生产库，把「环境不可达」误读成「修复失败」。
+
+    轨迹那条链**已经另有专测**：`test_trace_writeback_off_loop_201.py` 把 `crud.trace` 的
+    会话工厂也换到内存库上，并且是**开着** `LEARNING_TRACE_ENABLED` 跑的（含一次真实的
+    `stream_chat` 全流程）。本文件保持关闭，是为了让这里的每一条断言只归因于 #187 的两个
+    模块；两边的会话断言共用同一套「开 → 用 → 关 同线程」判据。
     """
     monkeypatch.setattr(learning_trace, "LEARNING_TRACE_ENABLED", False)
     monkeypatch.setattr(chat_service, "TraceRecorder", FakeTraceRecorder)

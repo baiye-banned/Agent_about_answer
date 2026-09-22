@@ -20,6 +20,7 @@
 `mid_stream`（流没收尾就删，issue 的复现形态）、`after_finish`（收尾后才删）。
 """
 
+import asyncio
 import json
 
 import pytest
@@ -103,26 +104,27 @@ def _assert_monotonic(db, trace_id, expected_count):
     )
 
 
-def _run_stream(api, *, delete_at=None, trace_id=None):
+async def _run_stream(api, *, delete_at=None, trace_id=None):
     """按生产时序跑一轮轨迹，`delete_at` 决定并发删除请求落在哪个时点。
 
-    每一步都对应 chat_service.py 的真实调用点，不使用替身。
+    每一步都对应 chat_service.py 的真实调用点，不使用替身。`add`/`attach`/`finish` 与生产
+    一样是协程，写库交给工作线程（issue #201），所以这里同样 await。
     """
     trace = TraceRecorder(user_id=api.alice.id)
     if trace_id:
         # 只固定 id 以拿到句柄；落库路径本身仍是生产路径。
         trace.trace_id = trace_id
         trace._persist()
-    trace.attach(conversation_id=CONVERSATION_ID)              # chat_service.py:371
-    trace.add("request_received", "stream_chat")               # 事件 1
-    trace.add("input_normalized", "stream_chat")               # 事件 2
+    await trace.attach(conversation_id=CONVERSATION_ID)        # chat_service.py:371
+    await trace.add("request_received", "stream_chat")         # 事件 1
+    await trace.add("input_normalized", "stream_chat")         # 事件 2
 
     if delete_at == "mid_stream":
         # 并发的 DELETE /api/chat/conversations/{cid} 请求：同一个事务里删轨迹行与会话行。
         crud_chat.delete_conversation(api.db, CONVERSATION_ID, api.alice.id)
 
     # 流收尾：chat_service.py:791（_safe_trace_finish(..., conversation_id=cid)）
-    trace.finish("done", conversation_id=CONVERSATION_ID, message_id=None)
+    await trace.finish("done", conversation_id=CONVERSATION_ID, message_id=None)
 
     if delete_at == "after_finish":
         crud_chat.delete_conversation(api.db, CONVERSATION_ID, api.alice.id)
@@ -134,7 +136,7 @@ def _run_stream(api, *, delete_at=None, trace_id=None):
 
 def test_live_conversation_keeps_indices_monotonic(api):
     """对照臂：会话存活时序号本就是 1、2、3——证明仪器可用，不是「恒绿」。"""
-    trace = _run_stream(api)
+    trace = asyncio.run(_run_stream(api))
 
     _assert_monotonic(api.db, trace.trace_id, 3)
     assert crud_trace.get_trace_snapshot(trace.trace_id) is not None, (
@@ -147,14 +149,14 @@ def test_delete_before_finish_keeps_indices_monotonic(api):
 
     修复前这里会拿到 [1, 2, 1]：补写经由读取守卫取长度，读不到就当成「没有事件」从 1 重排。
     """
-    trace = _run_stream(api, delete_at="mid_stream")
+    trace = asyncio.run(_run_stream(api, delete_at="mid_stream"))
 
     _assert_monotonic(api.db, trace.trace_id, 3)
 
 
 def test_delete_before_finish_still_hides_the_row(api):
     """读取面不得为序号让路：写回的行仍然读不出来（#127 锁住的行为原样保留）。"""
-    trace = _run_stream(api, delete_at="mid_stream")
+    trace = asyncio.run(_run_stream(api, delete_at="mid_stream"))
 
     assert crud_trace.get_trace_snapshot(trace.trace_id) is None, (
         "会话已删，重写的轨迹行不该重新变得可读——序号自洽不能靠放宽读取守卫来换"
@@ -163,7 +165,7 @@ def test_delete_before_finish_still_hides_the_row(api):
 
 def test_delete_after_finish_does_not_resurrect_the_row(api):
     """另一种时序：收尾之后才删。行随会话一起没了，此后的补写只能是无处可写的空操作。"""
-    trace = _run_stream(api, delete_at="after_finish")
+    trace = asyncio.run(_run_stream(api, delete_at="after_finish"))
 
     api.db.expire_all()
     row = api.db.query(ChatTraceSession).filter_by(id=trace.trace_id).first()
@@ -172,10 +174,14 @@ def test_delete_after_finish_does_not_resurrect_the_row(api):
 
 def test_repeated_background_appends_keep_indices_monotonic(api):
     """同一行上连续多次后台补写（RAGAS 在工作线程、记忆摘要在事件循环，同一个 trace_id）。"""
-    trace = TraceRecorder(user_id=api.alice.id)
-    trace.attach(conversation_id=CONVERSATION_ID)
-    trace.add("request_received", "stream_chat")
-    trace.finish("done", conversation_id=CONVERSATION_ID)
+    async def run():
+        recorder = TraceRecorder(user_id=api.alice.id)
+        await recorder.attach(conversation_id=CONVERSATION_ID)
+        await recorder.add("request_received", "stream_chat")
+        await recorder.finish("done", conversation_id=CONVERSATION_ID)
+        return recorder
+
+    trace = asyncio.run(run())
 
     for stage in ("ragas_running", "ragas_metric_done", "memory_summary_update_started"):
         append_trace_event(trace.trace_id, stage, "evaluate_message_async")
@@ -190,9 +196,13 @@ def test_append_path_does_not_consult_the_read_snapshot(api, monkeypatch):
     序号是可能靠落库侧兜对的——这条用例把根因本身钉住：写路径不许调用带会话存活守卫的
     `get_trace_snapshot`。
     """
-    trace = TraceRecorder(user_id=api.alice.id)
-    trace.attach(conversation_id=CONVERSATION_ID)
-    trace.add("request_received", "stream_chat")
+    async def run():
+        recorder = TraceRecorder(user_id=api.alice.id)
+        await recorder.attach(conversation_id=CONVERSATION_ID)
+        await recorder.add("request_received", "stream_chat")
+        return recorder
+
+    trace = asyncio.run(run())
 
     def _bomb(*_args, **_kwargs):
         raise AssertionError("补写路径调用了读取面的 get_trace_snapshot（#141 的根因）")

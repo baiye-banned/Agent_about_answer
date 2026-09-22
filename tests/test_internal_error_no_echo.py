@@ -127,8 +127,9 @@ def real_trace(monkeypatch):
         original_init(self, *args, **kwargs)
         collector.instances.append(self)
 
-    def spy_add(self, *args, **kwargs):
-        event = original_add(self, *args, **kwargs)
+    async def spy_add(self, *args, **kwargs):
+        # `add` 在 issue #201 之后是协程（写库交给工作线程），间谍必须照样 await 真实现。
+        event = await original_add(self, *args, **kwargs)
         if event:
             collector.events.append(event)
         return event

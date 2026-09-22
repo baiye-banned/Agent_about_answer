@@ -58,18 +58,18 @@ class _RecordingTrace:
             raise self.error
         return list(self.payloads)
 
-    def add(self, *args, **kwargs):
+    async def add(self, *args, **kwargs):
         if self.error is not None:
             raise self.error
         self.calls.append(("add", args, kwargs))
         return {"id": len(self.calls)}
 
-    def finish(self, *args, **kwargs):
+    async def finish(self, *args, **kwargs):
         if self.error is not None:
             raise self.error
         self.calls.append(("finish", args, kwargs))
 
-    def attach(self, *args, **kwargs):
+    async def attach(self, *args, **kwargs):
         if self.error is not None:
             raise self.error
         self.calls.append(("attach", args, kwargs))
@@ -103,9 +103,12 @@ def test_trace_sse_payloads_is_empty_when_nothing_drained():
 def test_safe_trace_wrappers_forward_calls_and_return_values():
     trace = _RecordingTrace()
 
-    assert trace_service._safe_trace_add(trace, "stage", "function", note="n") == {"id": 1}
-    trace_service._safe_trace_attach(trace, conversation_id=5)
-    trace_service._safe_trace_finish(trace, "done", message_id=9)
+    async def run():
+        assert await trace_service._safe_trace_add(trace, "stage", "function", note="n") == {"id": 1}
+        await trace_service._safe_trace_attach(trace, conversation_id=5)
+        await trace_service._safe_trace_finish(trace, "done", message_id=9)
+
+    asyncio.run(run())
 
     assert trace.calls == [
         ("add", ("stage", "function"), {"note": "n"}),
@@ -118,9 +121,12 @@ def test_safe_trace_wrappers_swallow_recorder_failures():
     trace = _RecordingTrace(error=RuntimeError("trace backend down"))
 
     # 轨迹失败不能影响主链路：包装器必须吞掉异常并给出兜底返回值
-    assert trace_service._safe_trace_add(trace, "stage", "function") == {}
-    assert trace_service._safe_trace_attach(trace, conversation_id=1) is None
-    assert trace_service._safe_trace_finish(trace, "done") is None
+    async def run():
+        assert await trace_service._safe_trace_add(trace, "stage", "function") == {}
+        assert await trace_service._safe_trace_attach(trace, conversation_id=1) is None
+        assert await trace_service._safe_trace_finish(trace, "done") is None
+
+    asyncio.run(run())
 
 
 # ---------------------------------------------------------------------------
