@@ -1,6 +1,10 @@
+from datetime import datetime
+
+from sqlalchemy import and_, literal, or_
 from sqlalchemy.orm import Session, selectinload
 
 from crud import trace as crud_trace
+from crud.pagination import LIST_DEFAULT_LIMIT, clamp_limit, datetime_cursor_value, seconds_text
 from model.models import ChatAttachmentUpload, ChatTraceSession, Conversation, Message
 from service.json_utils import load_json_value
 
@@ -32,13 +36,56 @@ def serialize_message(message: Message) -> dict:
     }
 
 
-def list_conversations(db: Session, user_id: int) -> list[Conversation]:
-    # 预加载知识库：序列化时每个会话都要读 conv.knowledge_base，逐行懒加载会让查询数随会话数增长。
-    return (
+def list_conversations(
+    db: Session,
+    user_id: int,
+    *,
+    limit: int = LIST_DEFAULT_LIMIT,
+    before: tuple[datetime, str] | None = None,
+) -> list[Conversation]:
+    """按 user_id 取一页会话，按「最近活动」倒序，与旧接口的数组顺序一致。
+
+    翻页语义（issue #191）：**键集游标**，不用 offset——offset 在翻页期间有新会话插入时
+    会整体位移，同一行会被翻到两次、另有一行永远翻不到。游标落在排序键本身上，
+    取「排在这条记录之后」的那一页，插入多少新行都不影响已经翻过的区间。
+
+    会话的排序键是 `(updated_at, 自增主键)` 的**复合键**，两个理由：
+    1) 会话主键是 uuid（`model/models.py` 的 `_new_id`），不是自增整数，按它排序等于乱序，
+       既不能当序键也不能当游标——这是会话列表与知识库/文件列表（都是自增整数主键）
+       在游标形态上不一样的原因；
+    2) `updated_at` 是秒级 DATETIME（`func.now()` 在 MySQL 上只到秒），同一秒内改动的多个
+       会话按它排序不稳定，翻页会重复或漏行。补一个唯一且不重复的主键做末位键，
+       `(updated_at, id)` 就是全序，游标比较才有确定答案。
+
+    已知边界：`updated_at` 是可变的（新消息、重命名都会改写它）。翻页途中被改写的那个会话
+    会跳到游标之前（用户已经翻过的区间），它要么已经在上一次响应里、要么要等下一次整表刷新
+    才出现——侧栏每次回答结束都会整表刷新，收敛得掉。反过来把序键换成不可变的 `created_at`
+    能彻底消掉这个边界，但侧栏会从「最近活动优先」变成「创建时间优先」，
+    属于本单之外的可见行为变更，不做。
+
+    `before` 是 (updated_at, id) 复合游标，两者必须同时给出（service 层负责拦半个游标）。
+    """
+    limit = clamp_limit(limit)
+    query = (
         db.query(Conversation)
+        # 预加载知识库：序列化时每个会话都要读 conv.knowledge_base，逐行懒加载会让查询数随会话数增长。
         .options(selectinload(Conversation.knowledge_base))
         .filter_by(user_id=user_id)
-        .order_by(Conversation.updated_at.desc())
+    )
+    if before is not None:
+        before_updated_at, before_id = before
+        # 等价于 (updated_at, id) < (before_updated_at, before_id) 的行值比较，写成展开式是为了
+        # SQLite 与 MySQL 共用同一段 SQL（两者都支持行值比较，但展开式在两边都不依赖方言支持）。
+        # 两档都要归一后再比：时间戳截到秒级文本（理由见 seconds_text），主键本来就是文本。
+        cursor_value = literal(datetime_cursor_value(before_updated_at))
+        cursor_timestamp = seconds_text(Conversation.updated_at)
+        query = query.filter(or_(
+            cursor_timestamp < cursor_value,
+            and_(cursor_timestamp == cursor_value, Conversation.id < before_id),
+        ))
+    return (
+        query.order_by(Conversation.updated_at.desc(), Conversation.id.desc())
+        .limit(limit)
         .all()
     )
 
