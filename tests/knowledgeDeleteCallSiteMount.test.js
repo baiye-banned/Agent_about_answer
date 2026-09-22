@@ -11,23 +11,34 @@
 //   tests/knowledgeViewWiring.test.js 静态读文件，证明「视图里写了这几行」
 //   本文件                             两者之间：视图真的跑起来之后，那几行有没有生效
 //
-// 两处替身都扎在**模块边界**上，被测代码本身照常真跑：
-//   api/request.js   -> stubApiRequest.js   只换 HTTP 出口；knowledgeAPI、
-//                                           fileListRequest、pinia store 与视图全是真货，
-//                                           所以「刷新」表现为真实发出的 GET
-//   utils/confirm.js -> stubConfirm.js      只换确认框；ElMessageBox 的 focus-trap
-//                                           在 jsdom 下缺全局（见该文件说明）
-// 断言因此落在「发了哪些请求」与「弹了哪些提示」上，而不是渲染兜底。
+// 替身只扎在**一个**模块边界上（issue #180 验收 4 之后的形态）：
+//   api/request.js -> stubApiRequest.js   只换 HTTP 出口；knowledgeAPI、
+//                                         fileListRequest、pinia store、utils/confirm.js
+//                                         与视图全是真货，所以「刷新」表现为真实发出的 GET
+//
+// **确认框不再打桩**：本文件此前把 `utils/confirm.js` 换成 tests/helpers/stubConfirm.js，
+// 于是「用户取消 -> 静默返回」这条分支从未在真实 `ElMessageBox` 下执行过，而
+// `runConfirmedDelete` 正是靠 `isConfirmCancellation` 识别真实弹窗那个 'cancel' 字符串的。
+// 打桩理由（stubConfirm.js 头注释记的 focus-trap 缺 `HTMLInputElement` 全局）**已经过期**：
+// vueMount.js 现在会把 jsdom 上的元素类逐个搬到 Node 全局，真开弹窗、点取消、点删除三条
+// 路径全部可跑。本文件因此改成真开弹窗、真点按钮 —— 归属断言（哪些请求、哪些提示）
+// 与弹窗实现一并被执行。
+//
+// 一处必须写明的取舍：**整个文件只能有一套模块替换表**。Node 的 ESM 缓存按 URL 记模块，
+// 同一个 SFC 在第二次挂载时不会重新解析依赖，所以「一部分用例用真实确认框、另一部分用替身」
+// 在同一个文件里做不到 —— 先挂载的那一套会被后来者继承。要么全真、要么全替身，
+// 这里选了全真。取消与确认两条出口分别由 a 节与 b/c 节覆盖。
+//
+// 断言因此落在「发了哪些请求」「弹了哪些提示」与「真实确认框的哪个按钮被点」上，
+// 而不是渲染兜底。
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mountSfc } from './helpers/vueMount.js'
 import { calls, resetRequestStub, respond } from './helpers/stubApiRequest.js'
-import { confirmations, resetConfirmStub, respondWith } from './helpers/stubConfirm.js'
 
 const MODULES = {
   'api/request.js': new URL('./helpers/stubApiRequest.js', import.meta.url).href,
-  'utils/confirm.js': new URL('./helpers/stubConfirm.js', import.meta.url).href,
 }
 
 const KB1 = { id: 'kb1', name: 'KB1' }
@@ -49,7 +60,6 @@ function createWorld({ bases = [KB1, KB2], files = ONE_FILE } = {}) {
 // remove 是 HTTP 边界的删除处理器；不传时删除一律成功。
 async function mountKnowledge({ world = createWorld(), remove } = {}) {
   resetRequestStub()
-  resetConfirmStub()
   respond('get', (url) => {
     if (url === '/knowledge-bases') return world.bases
     if (url === '/knowledge') return world.files
@@ -80,7 +90,7 @@ const settle = async (view) => {
 
 // 等一个可观测条件成立，超时就把当前状态原样交给后面的断言去报。
 // 比定长 flush 可靠：条件什么时候成立由实现决定，不由轮数决定。
-async function until(view, predicate, budgetMs = 1000) {
+async function until(view, predicate, budgetMs = 2000) {
   const deadline = Date.now() + budgetMs
   for (;;) {
     if (predicate()) return true
@@ -94,6 +104,43 @@ async function until(view, predicate, budgetMs = 1000) {
 // 挂载本身会打两次 GET，不划水位线就分不清「刷新」与「启动」。
 function requestsSince(mark) {
   return calls.slice(mark).map((entry) => `${entry.method} ${entry.args[0]}`)
+}
+
+// ---------------------------------------------------------------------------
+// 真实确认框的访问面
+// ---------------------------------------------------------------------------
+
+// 弹窗由 `utils/confirm.js` 的 `appendTo: 'body'` 交给 element-plus 自己 append，
+// 而**视图的 host 也在 body 里** —— 所以只能在 `.el-message-box` 范围内找按钮：
+// 页面上行内那排删除按钮的文案也叫「删除」，在 body 上全局找会打错目标。
+function messageBoxes() {
+  return [...globalThis.document.querySelectorAll('.el-message-box')]
+}
+
+function boxButton(box, label) {
+  return [...box.querySelectorAll('button')].find((node) => node.textContent.trim() === label)
+}
+
+async function untilMessageBox(view, count = 1) {
+  return until(view, () => messageBoxes().length >= count)
+}
+
+async function untilMessageBoxGone(view) {
+  return until(view, () => messageBoxes().length === 0)
+}
+
+// 开一次真实确认框并点其中一个按钮。
+// 打开与关闭都要等：ElMessageBox 是函数式调用（先 append 再挂载组件），关闭还带 leave 过渡。
+// 返回弹窗元素，便于调用方对文案再作断言。
+async function answerConfirm(view, label) {
+  assert.ok(await untilMessageBox(view), '点删除入口后应当开出真实的 ElMessageBox')
+  // 上一个弹窗若还在离场过渡里，body 里可能同时存在两个：取最后一个（本次开的那个）。
+  const box = messageBoxes().at(-1)
+  const button = boxButton(box, label)
+  assert.ok(button, `真实确认框里应当有「${label}」按钮`)
+  button.click()
+  assert.ok(await untilMessageBoxGone(view), '点完按钮后真实确认框应当关闭')
+  return box
 }
 
 async function close(view) {
@@ -111,7 +158,8 @@ const ENTRIES = [
   { label: '删除选中', target: 'delete /knowledge/f1', selectAll: true },
 ]
 
-async function hitEntry(view, entry) {
+// answer 是真实确认框上要点的按钮文案：'取消' 走放弃路径，'删除' 放行。
+async function hitEntry(view, entry, answer) {
   if (entry.selectAll) {
     // 表头全选框存在 = 文件列表已经从空态切到 el-table。点它之前先确认拿到的是
     // 真元素，否则后面的失败会伪装成「删除请求数为 0」，看不出是勾选没生效。
@@ -131,12 +179,14 @@ async function hitEntry(view, entry) {
   }
   const mark = calls.length
   view.buttonByText(entry.label).click()
+  // 真实确认框先开出来，再点 answer 指定的那个按钮。
+  const box = await answerConfirm(view, answer)
   await settle(view)
-  return mark
+  return { mark, box }
 }
 
 // ---------------------------------------------------------------------------
-// a. 取消确认：静默返回
+// a. 取消确认：三个入口都静默返回（真实确认框点「取消」）
 // ---------------------------------------------------------------------------
 
 test('取消确认：三个删除入口都静默返回，不删任何东西、不刷新、不提示', async () => {
@@ -147,13 +197,11 @@ test('取消确认：三个删除入口都静默返回，不删任何东西、�
     })
 
     try {
-      respondWith('cancel')
-      const mark = await hitEntry(view, entry)
+      const { mark } = await hitEntry(view, entry, '取消')
 
-      // 先钉住「确认框真的被问过一次」：否则下面三条静默断言可能只是因为
-      // 按钮压根没点动（比如禁用态），空转的绿灯。
-      assert.equal(confirmations.length, 1, `${entry.label}：应当先问一次确认`)
-
+      // 「确认框真的被问过一次」由 hitEntry 里的 untilMessageBox + 按钮点名断言保证：
+      // 弹窗没开出来、或里面没有那个按钮，那里就先红了。缺了这层，下面几条静默断言
+      // 可能只是因为按钮压根没点动（比如禁用态），是空转的绿灯。
       assert.deepEqual(requestsSince(mark), [], `${entry.label}：取消后不应发出任何请求`)
       assert.deepEqual(view.messages, [], `${entry.label}：取消是正常路径，不该有任何提示`)
       // 取消不该改动视图状态：知识库列表里那个知识库还在。
@@ -178,8 +226,7 @@ test('接口拒绝：两个单条删除入口都不进刷新分支，错误只�
     })
 
     try {
-      respondWith('confirm')
-      const mark = await hitEntry(view, entry)
+      const { mark } = await hitEntry(view, entry, '删除')
 
       // 短路要否掉的是**刷新**，不是删除本身：先把「删除已经真的发出去了」
       // 钉死，断言才落在短路那一行上，而不是退化成一堆“什么都没发生”。
@@ -208,8 +255,7 @@ test('接口拒绝：视图不假装删掉了，资料与选中状态都原样�
     },
   })
   try {
-    respondWith('confirm')
-    await hitEntry(single, ENTRIES[1])
+    await hitEntry(single, ENTRIES[1], '删除')
     assert.ok(single.text().includes('a.pdf'), '删除失败后资料不应从列表消失')
   } finally {
     await close(single)
@@ -224,8 +270,7 @@ test('接口拒绝：视图不假装删掉了，资料与选中状态都原样�
     },
   })
   try {
-    respondWith('confirm')
-    const mark = await hitEntry(batch, ENTRIES[2])
+    const { mark } = await hitEntry(batch, ENTRIES[2], '删除')
 
     assert.deepEqual(
       requestsSince(mark).sort(),
@@ -280,8 +325,7 @@ test('删除成功：文件删除与批量删除都会刷新列表', async () =>
     const view = await mountKnowledge({ world: createWorld({ files: spec.files }), remove: spec.remove })
 
     try {
-      respondWith('confirm')
-      const mark = await hitEntry(view, entry)
+      const { mark } = await hitEntry(view, entry, '删除')
 
       // 刷新承重：删完之后必须重新拉一次知识库列表与文件列表。
       // 批量的删除请求由 allSettled 并发发出，落地顺序不作断言（顺序无关语义）；
@@ -310,8 +354,7 @@ test('删除知识库成功：刷新后当前选中落到响应给的 fallback �
   })
 
   try {
-    respondWith('confirm')
-    const mark = await hitEntry(view, ENTRIES[0])
+    const { mark } = await hitEntry(view, ENTRIES[0], '删除')
 
     assert.deepEqual(requestsSince(mark), [
       'delete /knowledge-bases/kb1',
@@ -324,6 +367,38 @@ test('删除知识库成功：刷新后当前选中落到响应给的 fallback �
     // 后续上传/删除都会以 404 收场。
     assert.match(view.text(), /KB2（0）/, '删除后选中应当落到 fallback 知识库上')
     assert.doesNotMatch(view.text(), /KB1/, '已被删除的知识库不应再出现在视图里')
+  } finally {
+    await close(view)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// d. 真实确认框本身：文案与两个按钮都由视图传下去的参数决定
+// ---------------------------------------------------------------------------
+
+// 前几节用的是真实弹窗，但断言都落在「点完之后发生了什么」上。这一节反过来钉弹窗自己：
+// 视图传下去的文案与按钮文案真的到了 DOM 上 —— 否则「点了取消」可能只是点到一个
+// 文案对不上的按钮，用户看到的确认框和被测的那句话不是同一句。
+test('真实确认框：文案与「取消 / 删除」两个按钮都与调用点传入的一致', async () => {
+  const view = await mountKnowledge({ world: createWorld() })
+
+  try {
+    view.buttonByText('删除知识库').click()
+    assert.ok(await untilMessageBox(view), '点「删除知识库」应当开出真实的 ElMessageBox')
+
+    const box = messageBoxes().at(-1)
+    assert.match(
+      box.textContent,
+      /确定删除知识库「KB1」吗？该知识库下的资料会一并删除，已有对话将切换到其他知识库。/,
+      '【:589】确认框里应当是视图传进去的那句文案'
+    )
+    assert.ok(boxButton(box, '取消'), '真实确认框里应当有「取消」按钮')
+    assert.ok(boxButton(box, '删除'), '真实确认框里应当有「删除」按钮（对应 confirmButtonText）')
+
+    // 收尾：点取消关掉它，别把弹窗留给后面的用例。
+    boxButton(box, '取消').click()
+    assert.ok(await untilMessageBoxGone(view), '点「取消」后弹窗应当关闭')
+    assert.deepEqual(view.messages, [], '取消不该产生任何提示')
   } finally {
     await close(view)
   }
