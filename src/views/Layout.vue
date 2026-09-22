@@ -169,7 +169,6 @@ import {
 import { useChatStore } from '@/stores/chat'
 import { useUserStore } from '@/stores/user'
 import { confirmCenteredDelete } from '@/utils/confirm'
-import { normalizeApiAssetUrl } from '@/utils/url'
 
 const route = useRoute()
 const router = useRouter()
@@ -180,7 +179,8 @@ const activeMenu = computed(() => {
   if (route.path.startsWith('/knowledge')) return '/knowledge'
   return '/chat'
 })
-const avatarSrc = computed(() => normalizeApiAssetUrl(userStore.avatarUrl))
+// 直接取 store 里那一个（本地头像是带 token 取回后现做的 object URL，见 stores/user.js）。
+const avatarSrc = computed(() => userStore.avatarSrc)
 const allConversationsSelected = computed(() =>
   Boolean(chatStore.conversations.length) &&
   chatStore.selectedConversationIds.length === chatStore.conversations.length
