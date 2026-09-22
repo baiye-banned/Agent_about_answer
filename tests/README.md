@@ -11,13 +11,18 @@ truth; when a list and the tree disagree, `ls tests/*.test.js tests/test_*.py te
 and `python -m pytest tests --collect-only` win. (`tests/e2e/*.spec.mjs` is the Playwright suite
 run by `npm run test:e2e` and is deliberately in neither list.)
 
-The two `These tests cover ...` notes are soft-wrapped on purpose: every clause starts on its own
-line, so a registration adds lines instead of rewriting one 15k-character line - which is what made
-any two concurrent registrations collide on the same line and lose one side's entry to a
-"take one side" conflict resolution (issue #202). Add your clause on a new line and keep it within
-`120` characters; `node scripts/tests_readme_magnet.mjs format` re-wraps the notes for you. If a
-merge does conflict, `node scripts/tests_readme_magnet.mjs union <file>` merges both sides in one
-command and refuses to write when a clause from either side went missing.
+The two `These tests cover ...` notes are soft-wrapped on purpose: they are folded at `100` columns
+rather than one clause per line, so a registration adds a new line at the end of a note instead of
+rewriting one 15k-character line - which is what made any two concurrent registrations collide on
+the same line and lose one side's entry to a "take one side" conflict resolution (issue #202). Add
+your clause on a new line and then run `node scripts/tests_readme_magnet.mjs format`: the notes
+must sit in exactly the form that command produces, and `npm test` fails when they do not - so a
+hand edit that skips `format` turns CI red even when every line is under the cap. That cap is all
+`node scripts/tests_readme_magnet.mjs check` looks at: it is a quick editing-time helper for the
+gross regression (a note collapsing back into one line), not the gate. The gate is the
+`testsReadmeMagnet.test.js` ratchet, which runs under `npm test` in CI. If a merge does conflict,
+`node scripts/tests_readme_magnet.mjs union <file>` merges both sides in one command; it refuses to
+write - leaving the file untouched - whenever it cannot prove that neither side lost a clause.
 
 ## Node Tests
 
