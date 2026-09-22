@@ -12,8 +12,10 @@
   请求方法、URL 与签名头——替身若把被测函数整个换掉，就断不出「请求根本没发出去」；
 - 头像面用临时目录里的真实文件，断言旧文件在磁盘上确实消失。
 
-另有两条「护栏」用例（首传无旧文件、同秒同名重传）在修复前也通过：它们锁的是新删除
-路径不得误删，用来挡住「不分青红皂白 unlink」的粗暴实现。
+另有两条「护栏」用例（首传无旧文件、目标路径就是自己的新文件）在修复前也通过：它们锁的是
+新删除路径不得误删，用来挡住「不分青红皂白 unlink」的粗暴实现。原「同秒同名重传」那条锁的
+是旧的文件名生成方式，已随 issue #186 换成随机键而改写成
+`test_back_to_back_avatar_uploads_never_collide_on_the_same_name`。
 """
 
 import asyncio
@@ -22,7 +24,6 @@ import hashlib
 import hmac
 import json
 import logging
-from datetime import datetime
 from email.utils import formatdate
 from pathlib import Path
 from types import SimpleNamespace
@@ -117,29 +118,9 @@ class _RecordingOssClient:
         return [request["url"] for request in self.requests if request["method"] == "DELETE"]
 
 
-class _SteppingClock:
-    """替身时钟：每次 `now()` 前进一秒，让连续上传拿到可预期的文件名。
-
-    真实时间戳是秒级的，连续两次上传很容易落在同一秒——那样文件名相同、旧文件被覆盖
-    而不是替换，用例就断不出「旧文件被删」。这里把时间轴拉直。
-    """
-
-    def __init__(self, start=1_700_000_000):
-        self._timestamp = start
-
-    def now(self):
-        self._timestamp += 1
-        return datetime.fromtimestamp(self._timestamp)
-
-
-class _FrozenClock:
-    """替身时钟：`now()` 恒定，用来制造「同一秒内重复上传同扩展名」的覆盖场景。"""
-
-    def __init__(self, timestamp=1_700_000_000):
-        self._timestamp = timestamp
-
-    def now(self):
-        return datetime.fromtimestamp(self._timestamp)
+# 头像文件名换成了随机键（issue #186），上传接口不再读时钟：本文件里原来那两个替身时钟
+# （_SteppingClock / _FrozenClock）连同「同秒同名」那套前提一起删掉了，见下方
+# test_removal_guard_skips_a_path_that_is_its_own_replacement 的说明。
 
 
 @pytest.fixture()
@@ -183,7 +164,6 @@ def api(monkeypatch, tmp_path):
     avatar_dir = tmp_path / "avatars"
     avatar_dir.mkdir()
     monkeypatch.setattr(user_service, "AVATAR_DIR", avatar_dir)
-    monkeypatch.setattr(user_service, "datetime", _SteppingClock())
 
     # 会话删除还会清理 checkpointer 的 sqlite 文件；替换为空操作，避免用例写真实文件，
     # 同时保留「主流程仍然调用它」的断言能力。
@@ -414,15 +394,33 @@ def test_first_avatar_upload_skips_removal_without_previous_file(api):
     assert _avatar_file(api, response.json()["avatar"]).read_bytes() == b"only-avatar"
 
 
-def test_avatar_upload_same_second_does_not_delete_the_new_file(api, monkeypatch):
-    """护栏：同秒 + 同扩展名会落到同一个文件名，此时旧路径就是新文件，不得删除。"""
-    monkeypatch.setattr(user_service, "datetime", _FrozenClock())
+def test_back_to_back_avatar_uploads_never_collide_on_the_same_name(api):
+    """连传两次拿到两个键，最终只剩新的那一个。
 
-    first = _upload_avatar(api, b"same-second-first")
-    second = _upload_avatar(api, b"same-second-second")
+    修复前文件名是 `user_{id}_{秒}`：同一秒内的第二次上传会落到同一个名字上，后写覆盖先写，
+    旧文件根本没被「替换」过。换成随机键（issue #186）之后同秒也拿不到同一个名字，第二次走的
+    就是正常的替换路径——旧文件必须被删掉，而不是因为「以前这种情况不用删」而留成孤儿。
+    """
+    first = _upload_avatar(api, b"back-to-back-first")
+    second = _upload_avatar(api, b"back-to-back-second")
 
-    assert first.json()["avatar"] == second.json()["avatar"]
-    assert _avatar_file(api, second.json()["avatar"]).read_bytes() == b"same-second-second"
+    assert first.json()["avatar"] != second.json()["avatar"]
+    assert not _avatar_file(api, first.json()["avatar"]).exists()
+    assert _avatar_file(api, second.json()["avatar"]).read_bytes() == b"back-to-back-second"
+
+
+def test_removal_guard_skips_a_path_that_is_its_own_replacement(api):
+    """护栏：新旧路径相同时不得删除——那一刻这个路径就是刚写进去的新文件。
+
+    随机键之后这条分支在正常链路里已经够不着了（要 uuid4 撞上同一个值），所以直接调用删除
+    侧的函数来锁行为。留着它是有意的：这是「不误删」的最后一道闸，删掉它没有任何症状，
+    直到有一天名字生成方式又变回确定性的时候才会以「刚上传的头像立刻 404」的形式炸出来。
+    """
+    avatar_path = _upload_avatar(api, b"self-replacement").json()["avatar"]
+
+    user_service._remove_replaced_avatar(avatar_path, avatar_path)
+
+    assert _avatar_file(api, avatar_path).read_bytes() == b"self-replacement"
 
 
 def test_replaced_avatar_is_removed_only_after_the_new_path_is_stored(api, monkeypatch):
