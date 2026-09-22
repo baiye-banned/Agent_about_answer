@@ -21,7 +21,9 @@ issue 实测（本线在 `643d4a77` 的仓库外副本上复现，`_fix201/red_a
    收尾那一次写回也得真的落下去。
 4. **形态**：AST 门禁扫「事件循环线程上的轨迹写回」——async def 体内未被 await / 未被
    `asyncio.to_thread` 承载的 `add`/`attach`/`finish`/`_safe_trace_*`/`append_trace_event`。
-   扫描器自带 3 正 3 负自检，先证明有区分力再采信 0 命中。
+   扫描器自带 2 正 5 负自检（共 7 条），先证明有区分力再采信 0 命中。
+5. **取消语义**：两处包装层都只吞 `Exception`——`CancelledError` / `GeneratorExit` 必须
+   原样上抛，且在途的那一次写回不因取消而丢（§5，含正对照证明不是「什么异常都放行」）。
 
 注入的 sleep 是**放大器不是测量值**：本机内存 SQLite 一次查询是 µs 级，不加放大器时
 「心跳没被独占」与「压根没跑」不可区分。与耗时、与方言无关的结论来自线程记录。
@@ -52,7 +54,7 @@ from database.session import Base
 from model.models import ChatTraceSession, Conversation, KnowledgeBase, Message, User
 from rag.learning_trace import TraceRecorder
 from schema.schemas import ChatRequest
-from service import chat_service
+from service import chat_service, trace_service
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1] / "backend"
@@ -514,7 +516,7 @@ def test_trace_teardown_on_client_disconnect_still_lands(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 4) 形态门禁：事件循环线程上的轨迹写回（自带 3 正 3 负自检）
+# 4) 形态门禁：事件循环线程上的轨迹写回（自带 2 正 5 负自检，共 7 条）
 # ---------------------------------------------------------------------------
 
 _TRACE_WRITE_NAMES = {
@@ -680,3 +682,243 @@ def test_trace_recorder_persists_only_from_sync_payloads():
         f"TraceRecorder 的写回方法必须是协程，实际是 {sorted(async_methods)}："
         "同步方法没法把写库交给工作线程，调用方也就没法 await 它"
     )
+
+
+# ---------------------------------------------------------------------------
+# 5) 取消语义：写回路径只吞 Exception，取消/关流必须原样上抛
+# ---------------------------------------------------------------------------
+#
+# `learning_trace.py:189` 与 `trace_service.py:29` 都对外声明：包装层只吞 `Exception`，
+# `CancelledError` / `GeneratorExit` 照常上抛，断连语义不变。这条声明在本节之前没有任何
+# 用例承接——把 `rag/learning_trace.py::_safe_persist` 与
+# `service/trace_service.py::_safe_trace_finish` 的 `except Exception` 分别改成
+# `except BaseException`，上文的 16 例仍然全绿（两处变异存活）。本节按四层各钉一次：
+#
+#   * 单点（包装层）：`_safe_trace_*` 收到 BaseException 必须上抛——配 `Exception` 正对照，
+#     证明用例不是「什么异常都放行」。
+#   * 单点（recorder）：`_safe_persist` 的 `except Exception` 不得加宽；异常是从**工作线程**
+#     经 `to_thread` 的 future 传回事件循环的，这条传递链本身也在被测范围内。
+#   * 在途：取消正好落在「已经交给工作线程、还没跑完」的那次写回上——取消必须穿透，且那次
+#     写入仍要在工作线程里跑完落库（`chat_service.py:1193-1195` 依赖这条性质）。
+#   * 流式：真实 `stream_chat` + 真实 `TraceRecorder`，取消落在收尾写回的 `await` 上。
+
+
+class _BoomTrace:
+    """写回方法直接抛指定异常的替身：只替换 recorder，三个包装层跑真实实现。"""
+
+    def __init__(self, exc: BaseException):
+        self._exc = exc
+        self.calls: list[str] = []
+
+    async def add(self, *_args, **_kwargs):
+        self.calls.append("add")
+        raise self._exc
+
+    async def attach(self, *_args, **_kwargs):
+        self.calls.append("attach")
+        raise self._exc
+
+    async def finish(self, *_args, **_kwargs):
+        self.calls.append("finish")
+        raise self._exc
+
+
+@pytest.mark.parametrize(
+    "wrapper_name, exc_type",
+    [
+        (name, exc_type)
+        for name in ("_safe_trace_add", "_safe_trace_attach", "_safe_trace_finish")
+        for exc_type in (asyncio.CancelledError, GeneratorExit)
+    ],
+    ids=lambda value: getattr(value, "__name__", value),
+)
+def test_safe_trace_wrappers_let_cancellation_through(wrapper_name, exc_type):
+    """三个包装层都只吞 `Exception`：取消/关流原样上抛，普通失败仍要吞掉。
+
+    两个方向合在一条用例里是刻意的。只有「BaseException 上抛」时，把实现改成什么都不吞
+    （`raise` 一切）也会全绿；只有正对照时，宿主把 `except Exception` 加宽成
+    `except BaseException` 同样全绿——那正是 review 里 A/D 两条存活变异。
+    """
+    wrapper = getattr(trace_service, wrapper_name)
+
+    async def call():
+        # 正对照：轨迹后端出错不能影响主链路，Exception 必须被吞掉并给兜底返回值。
+        assert await wrapper(_BoomTrace(RuntimeError("trace backend down")), "stage", "fn") in ({}, None)
+        # 承重：取消语义不能被改写。
+        boom = _BoomTrace(exc_type())
+        with pytest.raises(exc_type):
+            await wrapper(boom, "stage", "fn")
+        assert boom.calls, "替身压根没被调用，本用例是空跑"
+
+    asyncio.run(call())
+
+
+def test_recorder_writeback_lets_cancellation_through(monkeypatch):
+    """`TraceRecorder._safe_persist` 的 `except Exception` 不得加宽为 `BaseException`。
+
+    异常由工作线程抛出、经 `to_thread` 的 future 传回事件循环——`CancelledError` 是
+    `Exception` 之外最要紧的那一类（客户端断连就是任务取消），正是这条分支的分界线。
+
+    本用例只用 `CancelledError`，**不是**漏了 `GeneratorExit`：后者的传递形状不同，
+    往一个挂起在 await 上的协程里 throw `GeneratorExit` 会走生成器关闭协议，实测（Python
+    3.10/3.11 一致）异常是在**调用方那一帧**冒出来的，根本不进 `_safe_persist` 的 try——
+    把 `except Exception` 改成 `except BaseException` 它照样上抛，是个打不响的臂。
+    `GeneratorExit` 由上面包装层那条用例与 `aclose()` 断连用例承接，那里能真正打到边界。
+    """
+    engine, _ = _session_factory(monkeypatch)
+    try:
+        def boom(exc_type):
+            def _raise(*_args, **_kwargs):
+                raise exc_type()
+            return _raise
+
+        # 正对照：普通写失败仍然只吞在轨迹这一侧（既有契约）
+        monkeypatch.setattr(crud_trace, "persist_trace_session", boom(RuntimeError))
+        recorder = TraceRecorder(user_id=7)
+
+        async def control():
+            assert await recorder.add("request_received", "stream_chat") != {}
+
+        asyncio.run(control())
+
+        # 承重：BaseException 必须穿过去
+        monkeypatch.setattr(crud_trace, "persist_trace_session", boom(asyncio.CancelledError))
+
+        async def call():
+            with pytest.raises(asyncio.CancelledError):
+                await recorder.add("input_normalized", "stream_chat")
+
+        asyncio.run(call())
+    finally:
+        engine.dispose()
+
+
+def test_cancelling_an_in_flight_writeback_surfaces_and_the_row_still_lands(monkeypatch):
+    """取消落在**已经交给工作线程**的那次写回上：取消要穿透，写入仍要落库。
+
+    两个断言缺一不可：只断「取消穿透」时，把写回改成同步调用（不进线程）也能过；只断
+    「写入落库」时，包装层吞掉取消同样能过——而吞掉取消就等于把 ASGI 栈已经收到的断连
+    信号抹掉。
+    """
+    engine, factory = _session_factory(monkeypatch)
+    entry = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    real_persist = crud_trace.persist_trace_session
+
+    def gated(trace_id, **kwargs):
+        if kwargs.get("status") == "failed" and not entry.is_set():
+            entry.set()
+            release.wait(10)      # 卡在写回**内部**：此刻调用方 await 的正是这一次写回
+            try:
+                return real_persist(trace_id, **kwargs)
+            finally:
+                finished.set()
+        return real_persist(trace_id, **kwargs)
+
+    monkeypatch.setattr(crud_trace, "persist_trace_session", gated)
+    recorder = TraceRecorder(user_id=7)
+
+    async def call():
+        await recorder.add("request_received", "stream_chat")
+        task = asyncio.create_task(recorder.finish("failed", conversation_id="conv-201"))
+        await asyncio.to_thread(entry.wait, 10)
+        assert entry.is_set(), "写回没有进入在途状态，本用例是空跑"
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.to_thread(finished.wait, 10)
+        assert finished.is_set(), "取消把已经交出去的写回弄丢了：它没有在工作线程里跑完"
+
+    try:
+        asyncio.run(call())
+        db = factory()
+        try:
+            row = db.query(ChatTraceSession).filter_by(id=recorder.trace_id).first()
+            assert row is not None, "取消之后那次写回没有落库"
+            assert row.status == "failed", f"终态没写回去：{row.status}"
+            assert row.conversation_id == "conv-201", "attach 的会话绑定没写回去"
+        finally:
+            db.close()
+    finally:
+        engine.dispose()
+
+
+def test_cancelling_the_stream_while_the_trace_writeback_is_in_flight(monkeypatch):
+    """真实流式路径：取消落在收尾写回的 `await` 上时，取消必须穿透到调用方。
+
+    比 `aclose()` 那条断连用例更贴近真实断连：`aclose()` 把 `GeneratorExit` 抛在挂起的
+    `yield` 上，收尾写回是在 finally 里**另起**的一次 await，取消并不会同时到达包装层；
+    这里让取消与写回在途**同时**发生（先卡住写回，再从外部 `task.cancel()`），取消因此
+    直接落进 `_safe_trace_finish` 的 await——包装层一旦加宽成 `except BaseException`，
+    这次取消就被吞掉，任务会照常跑到 `[DONE]`。
+    """
+    engine, factory = _session_factory(monkeypatch)
+    _seed_user_and_knowledge_base(factory)
+    _stub_stream_boundaries(monkeypatch, chunks=("第一段", "第二段", "第三段"))
+
+    entry = threading.Event()
+    release = threading.Event()
+    real_persist = crud_trace.persist_trace_session
+
+    def gated(trace_id, **kwargs):
+        result = real_persist(trace_id, **kwargs)   # 写回先落库，再把 await 卡住
+        if kwargs.get("status") == "done" and not entry.is_set():
+            entry.set()
+            release.wait(10)
+        return result
+
+    monkeypatch.setattr(crud_trace, "persist_trace_session", gated)
+
+    seen: list[str] = []
+    real_finish = trace_service._safe_trace_finish
+
+    async def spy(*args, **kwargs):
+        try:
+            return await real_finish(*args, **kwargs)
+        except BaseException as exc:      # 记录后原样上抛：委托型探针，包装层跑的还是真实实现
+            seen.append(type(exc).__name__)
+            raise
+
+    monkeypatch.setattr(trace_service, "_safe_trace_finish", spy)
+    monkeypatch.setattr(chat_service, "_safe_trace_finish", spy)
+
+    async def call():
+        response = await chat_service.stream_chat(
+            ChatRequest(question="迟到怎么罚款"), authorization="Bearer token"
+        )
+        iterator = response.body_iterator
+        chunks = []
+
+        async def consume():
+            async for chunk in iterator:
+                chunks.append(chunk)
+
+        task = asyncio.create_task(consume())
+        await asyncio.to_thread(entry.wait, 10)
+        assert entry.is_set(), "收尾写回没有进入在途状态，本用例是空跑"
+        task.cancel()
+        await asyncio.sleep(0.05)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return chunks
+
+    try:
+        chunks = asyncio.run(call())
+
+        assert chunks, "流一个 chunk 都没发出来，本用例没覆盖到流式路径"
+        assert seen == ["CancelledError"], (
+            f"取消没有落进包装层的 await（包装层看到的异常 = {seen}）："
+            "本用例已退化成只测「任务被取消」，钉不住 `except Exception` 这条边界"
+        )
+        db = factory()
+        try:
+            row = db.query(ChatTraceSession).order_by(ChatTraceSession.created_at.desc()).first()
+            assert row is not None, "取消时已经交出去的写回没有落库"
+            assert row.status == "done", f"在途那一次写回没有落到终态：{row.status}"
+        finally:
+            db.close()
+    finally:
+        engine.dispose()
