@@ -38,6 +38,13 @@ export default defineConfig({
         target: 'http://localhost:8002',
         changeOrigin: true,
       },
+      // 头像读取面带鉴权之后（issue #186），`/uploads/...` 不再由静态挂载匿名直出，而是前端
+      // 带着 token 去取。开发时这条要有代理才落到后端，否则请求打在 5173 上拿到的是前端页面；
+      // 与部署用 README 里 nginx 的 `location /uploads/` 是同一件事。
+      '/uploads': {
+        target: 'http://localhost:8002',
+        changeOrigin: true,
+      },
     },
   },
 })
