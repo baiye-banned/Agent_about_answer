@@ -18,7 +18,6 @@ import { MAX_LINE, WRAP_WIDTH, findParagraphs, parseConflicts, reflow, unwrap, w
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const README = path.join(REPO_ROOT, 'tests/README.md')
 const SCRIPT = path.join(REPO_ROOT, 'scripts/tests_readme_magnet.mjs')
-const MARKER = 'These tests cover '
 
 const WORK_DIR = mkdtempSync(path.join(tmpdir(), 'readme-magnet-'))
 let caseIndex = 0

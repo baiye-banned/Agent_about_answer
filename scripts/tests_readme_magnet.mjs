@@ -174,9 +174,7 @@ function cmdFormat(file) {
   return 0;
 }
 
-// 冲突块解析：<<<<<<< / ======= / >>>>>>>。返回 { ours, theirs } 边界。
-const CONFLICT = /^<{7}(?: .*)?$|^={7}$|^>{7}(?: .*)?$/;
-
+// 冲突块解析：<<<<<<< / ======= / >>>>>>>。返回每个冲突块的行号边界 { start, mid, end }。
 function parseConflicts(text) {
   const lines = text.split('\n');
   const blocks = [];
