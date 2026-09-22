@@ -4,7 +4,9 @@ name: 静态检查
 # 升级路线（改这里之前先确认不会把存量代码一次性判红）：
 #   1) 后端：ruff 选择集已经放宽到 E4,E7,E9,F。原先卡在这一档的 6 个历史告警
 #      （backend/main.py 2 个 F401、backend/service/chat_service.py 2 个 F401、
-#      backend/rag/milvus_client.py 2 个 E402）已清掉，所以这里可以直接开。
+#      backend/rag/milvus_client.py 2 个 E402）已消解：4 处 F401 直接删除，2 处 E402
+#      就地 noqa 豁免并注明 pymilvus 导入期冻结 MILVUS_URI 的约束（这两行导入不能上移），
+#      所以这里可以直接开。
 #      之后加仓库根 ruff.toml，逐步放开 E/W/F 全量，再逐个评估 I（import 排序）、
 #      B（bugbear）、UP（pyupgrade）、SIM 等规则集。
 #   2) 前端：node --check 保留为不依赖依赖安装的兜底语法门禁（只覆盖 src/**/*.js），
