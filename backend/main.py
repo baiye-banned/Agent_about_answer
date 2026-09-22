@@ -7,7 +7,11 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
 
-from config import REBUILD_KNOWLEDGE_INDEX_ON_STARTUP, ensure_secret_key_configured
+from config import (
+    REBUILD_KNOWLEDGE_INDEX_ON_STARTUP,
+    ensure_mysql_password_configured,
+    ensure_secret_key_configured,
+)
 from database.session import init_db
 from paths import UPLOAD_DIR
 from router.auth import router as auth_router
@@ -28,6 +32,7 @@ INTEGRITY_CONFLICT_MESSAGE = "数据冲突：本次操作与当前数据状态�
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ensure_secret_key_configured()
+    ensure_mysql_password_configured()
     init_db()
     seed_default_users()
     if REBUILD_KNOWLEDGE_INDEX_ON_STARTUP:

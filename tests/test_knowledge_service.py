@@ -584,7 +584,10 @@ def test_startup_rebuild_runs_off_the_event_loop(monkeypatch):
         calls.append(threading.get_ident())
         time.sleep(delay)
 
+    # 两条启动门禁都置空：本用例测的是重建是否离开事件循环，不测配置门禁，
+    # 而它跑在测试环境里（未配 MYSQL_PASSWORD），否则会死在门禁上而不是断言上。
     monkeypatch.setattr(main, "ensure_secret_key_configured", lambda: None)
+    monkeypatch.setattr(main, "ensure_mysql_password_configured", lambda: None)
     monkeypatch.setattr(main, "init_db", lambda: None)
     monkeypatch.setattr(main, "seed_default_users", lambda: None)
     monkeypatch.setattr(main, "REBUILD_KNOWLEDGE_INDEX_ON_STARTUP", True)
