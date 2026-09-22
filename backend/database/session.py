@@ -109,6 +109,14 @@ def _ensure_schema_columns():
         _ensure_knowledge_base_owner_unique_index()
 
     if "users" in table_names:
+        columns = {column["name"] for column in inspector.get_columns("users")}
+        # 令牌世代（issue #184）。NOT NULL DEFAULT 0 让存量行直接落在世代 0，与新建用户
+        # 一致，不需要单独的回填脚本。
+        if "token_version" not in columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
+                )
         _ensure_mysql_varchar_column("users", "username", 50, nullable=False)
         _ensure_mysql_varchar_column("users", "password_hash", 255, nullable=False)
         _ensure_mysql_varchar_column("users", "avatar", 500)
@@ -148,6 +156,7 @@ def _ensure_mysql_utf8mb4():
         "knowledge_files",
         "chat_trace_sessions",
         "chat_attachment_uploads",
+        "revoked_tokens",
     ):
         if table_name not in inspector.get_table_names():
             continue
