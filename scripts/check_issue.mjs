@@ -25,7 +25,7 @@ const EMPTY_VALUES = [
 ];
 // 占位文本可以带标点、写成多行或列表项（`暂无。`、`- 无`、`TODO（待补充）`），
 // 比对前统一去掉标点与空白，否则多加一个句号就能绕过去。长词优先，避免被短词先切走。
-const PUNCTUATION = /[\s　。．.!！?？~～、,，;；:：\-—_*`#（）()【】\[\]「」『』“”‘’"'…·|｜/\\]+/g;
+const PUNCTUATION = /[\s\u3000。．.!！?？~～、,，;；:：\-—_*`#（）()【】[\]「」『』“”‘’"'…·|｜/\\]+/g;
 const stripPunctuation = (text) => text.replace(PUNCTUATION, '').toLowerCase();
 const PLACEHOLDER_WORDS = EMPTY_VALUES.map(stripPunctuation)
   .filter((word) => word.length > 0)
@@ -164,7 +164,7 @@ try {
   usage(`无法读取文件 ${file}：${err.message}`);
 }
 
-const lines = raw.replace(/^﻿/, '').split(/\r?\n/);
+const lines = raw.replace(/^\uFEFF/, '').split(/\r?\n/);
 const titleIndex = lines.findIndex((line) => line.trim().length > 0);
 
 if (titleIndex === -1) {
