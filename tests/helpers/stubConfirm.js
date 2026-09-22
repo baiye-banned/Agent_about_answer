@@ -1,11 +1,18 @@
 // src/utils/confirm.js 的替身：把「删除确认框」换成可控的结果。
 //
-// 为什么替掉这一层：confirmCenteredDelete 只是 ElMessageBox.confirm 的一行包装
+// **当前没有任何用例在用它**（issue #180 验收 4 之后，唯一的使用方
+// tests/knowledgeDeleteCallSiteMount.test.js 已改成真开 ElMessageBox）。
+// 文件留在原地是因为本单不做删除；下次有人碰这一带时可以连带清掉。
+//
+// 为什么当初替掉这一层：confirmCenteredDelete 只是 ElMessageBox.confirm 的一行包装
 // （src/utils/confirm.js），被测的是**调用点胶水**——runConfirmedDelete 返回后
 // 那句 `if (status !== DELETE_SUCCEEDED) return` 与紧随其后的刷新。
-// 真开 ElMessageBox 会把用例拖进 Element Plus 的 focus-trap，它在 jsdom 下要
-// 挂载工具没装的全局（实测 HTMLInputElement is not defined，抛在 watcher 回调里），
-// 断言也就变成在测弹窗实现，与本线无关。
+// 当时真开 ElMessageBox 会把用例拖进 Element Plus 的 focus-trap，它在 jsdom 下要
+// 挂载工具没装的全局（实测 HTMLInputElement is not defined，抛在 watcher 回调里）。
+//
+// 这条理由**已经过期**：vueMount.js 的元素类清单后来把那些构造器都搬到了 Node 全局
+// （本就是为了开 el-dialog 那条路径），真开确认框、点取消、点删除三条路径实测都可跑。
+// 留着这段是因为它解释了替身的由来；**不要再把它当成「真弹窗不可用」的依据**。
 //
 // 替身必须忠实复制真实契约（element-plus 2.13.7 的 messageBox）：
 //   点「删除」-> resolve('confirm')

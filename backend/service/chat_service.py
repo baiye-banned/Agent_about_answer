@@ -24,6 +24,7 @@ from rag.learning_trace import TraceRecorder, compact_trace_reference
 from model.models import Conversation, Message, User, _new_id
 from rag.ragas_eval import schedule_ragas_evaluation
 from schema.schemas import ChatRequest, RenameRequest
+from service import rate_limit
 from service.auth_service import authenticate, get_current_user
 from service.oss_service import (
     ForeignObjectKeyError,
@@ -444,6 +445,16 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
         db.close()
         raise
     username = user.username
+    # 认过身份再占并发槽：一次聊天流会一直占着服务端资源到上游结束，没上限时少量连接就能
+    # 打满（issue #183）。满员时立刻拒绝，不排队——排队会把请求拖到上游超时才释放。
+    slot = rate_limit.chat_stream_slots.try_acquire()
+    if slot is None:
+        db.close()
+        raise HTTPException(
+            429,
+            "当前并发聊天请求已达上限，请稍后重试。",
+            headers={"Retry-After": "1"},
+        )
     trace = TraceRecorder(user_id=user.id)
     try:
         trace.add(
@@ -509,25 +520,29 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             db.close()
 
             async def failure_stream():
-                for payload in _trace_sse_payloads(trace):
-                    yield payload
-                analysis_data = json.dumps(
-                    {
-                        "type": "image_analysis",
-                        "analysis": image_analysis,
-                    },
-                    ensure_ascii=False,
-                )
-                yield f"data: {analysis_data}\n\n"
-                error_data = json.dumps(
-                    {
-                        "type": "error",
-                        "message": image_analysis.get("error") or "图片内容识别失败，请检查清晰度后重新上传。",
-                    },
-                    ensure_ascii=False,
-                )
-                yield f"data: {error_data}\n\n"
-                yield "data: [DONE]\n\n"
+                # 这条早退流同样占着一个并发槽，收尾必须归还（正常走完/被断开都走 finally）。
+                try:
+                    for payload in _trace_sse_payloads(trace):
+                        yield payload
+                    analysis_data = json.dumps(
+                        {
+                            "type": "image_analysis",
+                            "analysis": image_analysis,
+                        },
+                        ensure_ascii=False,
+                    )
+                    yield f"data: {analysis_data}\n\n"
+                    error_data = json.dumps(
+                        {
+                            "type": "error",
+                            "message": image_analysis.get("error") or "图片内容识别失败，请检查清晰度后重新上传。",
+                        },
+                        ensure_ascii=False,
+                    )
+                    yield f"data: {error_data}\n\n"
+                    yield "data: [DONE]\n\n"
+                finally:
+                    slot.release()
 
             return StreamingResponse(failure_stream(), media_type="text/event-stream")
         conv = db.query(Conversation).filter_by(id=cid, user_id=user.id).first() if cid else None
@@ -1028,8 +1043,13 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                     logger.warning("Learning trace teardown failed: %s", exc, exc_info=True)
                 finally:
                     db.close()
+                    # 并发槽跟数据库会话一样，必须在 finally 里归还：正常跑完、流里抛异常、
+                    # 客户端断开（CancelledError/GeneratorExit）三条路径都经过这里。漏掉任何
+                    # 一条，一次断连就会永久占着一个槽。
+                    slot.release()
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
     except Exception:
         db.close()
+        slot.release()
         raise
