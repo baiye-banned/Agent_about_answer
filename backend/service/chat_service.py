@@ -24,6 +24,7 @@ from rag.learning_trace import TraceRecorder, compact_trace_reference
 from model.models import Conversation, Message, User, _new_id
 from rag.ragas_eval import schedule_ragas_evaluation
 from schema.schemas import ChatRequest, RenameRequest
+from service import rate_limit
 from service.auth_service import authenticate, get_current_user
 from service.oss_service import (
     ForeignObjectKeyError,
@@ -586,578 +587,602 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
     # Session 对象既不跨线程传递，也不跨 await 长期持有。
     principal = await asyncio.to_thread(_authenticate_request, authorization)
     username = principal.username
-    trace = TraceRecorder(user_id=principal.user_id)
-    trace.add(
-        "request_received",
-        "stream_chat",
-        creates={"trace_id": trace.trace_id},
-        params={
-            "conversation_id": body.conversation_id,
-            "knowledge_base_id": body.knowledge_base_id,
-            "question": body.question,
-            "attachments_count": len(body.attachments or []),
-        },
-        result={"username": username},
-        note="后端收到一次聊天请求，先建立 trace_id，后续所有步骤都会挂到这次请求下面。",
-    )
-    cid = body.conversation_id
-    knowledge_base = await asyncio.to_thread(
-        _resolve_request_knowledge_base, body.knowledge_base_id, principal.user_id
-    )
-    raw_question = (body.question or "").strip()
-    display_question = raw_question or ("请分析这张图片" if body.attachments else "")
-    if not display_question:
+    # 认过身份再占并发槽：一次聊天流会一直占着服务端资源到上游结束，没上限时少量连接就能
+    # 打满（issue #183）。满员时立刻拒绝，不排队——排队会把请求拖到上游超时才释放。
+    slot = rate_limit.chat_stream_slots.try_acquire()
+    if slot is None:
+        raise HTTPException(
+            429,
+            "当前并发聊天请求已达上限，请稍后重试。",
+            headers={"Retry-After": "1"},
+        )
+    try:
+        trace = TraceRecorder(user_id=principal.user_id)
         trace.add(
-            "request_rejected",
+            "request_received",
             "stream_chat",
-            uses={"raw_question": raw_question, "attachments_count": len(body.attachments or [])},
-            result={"error": "问题不能为空"},
-            note="没有文字问题，也没有图片附件，无法继续进入 RAG 流程。",
-        )
-        trace.finish("failed")
-        raise HTTPException(400, "问题不能为空")
-    trace.add(
-        "input_normalized",
-        "stream_chat",
-        creates={"raw_question": raw_question, "display_question": display_question},
-        result={"knowledge_base_id": knowledge_base.id, "knowledge_base_name": knowledge_base.name},
-        note="系统整理用户输入，并确定本次请求要使用哪个知识库。",
-    )
-
-    effective_question, image_analysis = await _build_effective_question(
-        raw_question,
-        body.attachments,
-    )
-    trace.add(
-        "effective_question_built",
-        "_build_effective_question",
-        params={"raw_question": raw_question, "attachments_count": len(body.attachments or [])},
-        creates={
-            "effective_question": effective_question,
-            "image_analysis_status": image_analysis.get("status", ""),
-            "image_description": image_analysis.get("description", ""),
-        },
-        result={"image_analysis_error": image_analysis.get("error", "")},
-        note="如果有图片，系统会先把图片转成文字描述，再与用户问题合并为真正用于检索和生成的问题。",
-    )
-    if body.attachments and image_analysis.get("status") == "failed" and not raw_question:
-        trace.add(
-            "image_failed_directly",
-            "_build_effective_question",
-            uses={"attachments_count": len(body.attachments or [])},
-            result={"error": image_analysis.get("error", "")},
-            note="用户只发了图片但图片识别失败，因此不会进入知识库检索和模型回答。",
-        )
-        trace.finish("failed")
-
-        async def failure_stream():
-            for payload in _trace_sse_payloads(trace):
-                yield payload
-            analysis_data = json.dumps(
-                {
-                    "type": "image_analysis",
-                    "analysis": image_analysis,
-                },
-                ensure_ascii=False,
-            )
-            yield f"data: {analysis_data}\n\n"
-            error_data = json.dumps(
-                {
-                    "type": "error",
-                    "message": image_analysis.get("error") or "图片内容识别失败，请检查清晰度后重新上传。",
-                },
-                ensure_ascii=False,
-            )
-            yield f"data: {error_data}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(failure_stream(), media_type="text/event-stream")
-    title_source = raw_question or effective_question or display_question
-    title = title_source[:30] + ("..." if len(title_source) > 30 else "")
-    conversation = await asyncio.to_thread(
-        _load_or_create_conversation,
-        cid,
-        principal.user_id,
-        knowledge_base,
-        title,
-    )
-    cid = conversation.id
-    knowledge_base = conversation.knowledge_base
-    if conversation.created:
-        trace.add(
-            "conversation_created",
-            "stream_chat",
-            creates={"conversation_id": cid, "title": title},
-            result={"knowledge_base_id": knowledge_base.id},
-            note="这是新对话，系统创建 conversation，并把它绑定到当前知识库。",
-        )
-    else:
-        trace.add(
-            "conversation_loaded",
-            "stream_chat",
-            uses={"conversation_id": cid},
-            result={"knowledge_base_id": knowledge_base.id, "title": conversation.title},
-            note="这是已有对话，系统复用它原本绑定的知识库，避免会话中途串库。",
-        )
-    trace.attach(conversation_id=cid)
-
-    # save user message
-    accepted_attachments = _service_minted_attachments(body.attachments, cid)
-    user_message_id = await asyncio.to_thread(
-        _save_user_message,
-        cid,
-        principal.user_id,
-        display_question,
-        accepted_attachments,
-    )
-    trace.add(
-        "user_message_saved",
-        "Message",
-        creates={"user_message_id": user_message_id},
-        params={"content": display_question, "attachments_count": len(body.attachments or [])},
-        note="用户消息先写入数据库，后面的滑动窗口会排除这条当前消息，避免重复塞进 prompt。",
-    )
-
-    recent_text = await _build_recent_memory_text(
-        cid,
-        current_message_id=user_message_id,
-        # 上界取自上面那次会话快照：紧接着的用户消息写入不会推进它，取值与原先读同一个
-        # 会话对象等价，但读的位置从事件循环线程挪到了工作线程（issue #187）。
-        summary_upto=conversation.memory_summary_upto_message_id,
-        trace_id=trace.trace_id,
-    )
-    memory_context = _build_memory_context(
-        conversation,
-        recent_text=recent_text,
-    )
-    retrieval_question = _build_memory_aware_retrieval_question(effective_question, memory_context)
-    trace.add(
-        "memory_built",
-        "_build_memory_context",
-        uses={
-            "conversation_id": cid,
-            "memory_summary": conversation.memory_summary,
-            "summary_upto_message_id": conversation.memory_summary_upto_message_id,
-        },
-        creates={
-            "recent_text": recent_text,
-            "memory_context": memory_context,
-            "retrieval_question": retrieval_question,
-        },
-        result={
-            "memory_used": bool(memory_context),
-            "used_for_retrieval": retrieval_question != effective_question,
-            "window_turns": MEMORY_WINDOW_TURNS,
-        },
-        note="系统构造短期滑动窗口和长期摘要记忆，并生成真正用于 RAG 检索的问题。",
-    )
-
-    rag_gate = await decide_need_rag(
-        effective_question,
-        memory_context,
-        knowledge_base.name,
-        body.attachments,
-    )
-    need_rag = bool(rag_gate.get("need_rag", True))
-    generation_mode = "rag" if need_rag else "direct"
-    trace.add(
-        "rag_gate_decided",
-        "decide_need_rag",
-        uses={
-            "effective_question": effective_question,
-            "memory_context": memory_context,
-            "knowledge_base_name": knowledge_base.name,
-            "attachments_count": len(body.attachments or []),
-        },
-        creates={"rag_gate": rag_gate},
-        result={
-            "need_rag": need_rag,
-            "route": rag_gate.get("route", generation_mode),
-            "confidence": rag_gate.get("confidence", 0),
-            "source": rag_gate.get("source", ""),
-            "reason": rag_gate.get("reason", ""),
-        },
-        note="模型先判断这轮问题是否需要进入知识库检索。若判定为直答，则跳过 RAG，只用问题和会话记忆生成回答。",
-    )
-
-    context = ""
-    sources = []
-    retrieved_contexts = []
-    knowledge_chunks = []
-    retrieval_trace = {
-        # 同一份状态会随 retrieval_trace 落库并回查给用户：last_error 原文（上游地址 +
-        # 原始异常）只留服务端，轨迹里给固定文案。
-        "embedding": embedding_trace_status(embedding_backend_status()),
-        "query_plan": {},
-        "routes": [],
-        "rrf": [],
-        "rerank": {"status": "skipped", "items": []},
-        "memory": {
-            "used": bool(memory_context),
-            "used_for_retrieval": False,
-            "window_turns": MEMORY_WINDOW_TURNS,
-            "summary_available": bool(conversation.memory_summary),
-            "summary_upto_message_id": conversation.memory_summary_upto_message_id,
-        },
-        "rag_gate": rag_gate,
-        "mode": generation_mode,
-        "effective_question": effective_question,
-        "retrieval_question": retrieval_question,
-    }
-    if body.attachments:
-        retrieval_trace["image_analysis_status"] = image_analysis.get("status", "")
-        retrieval_trace["image_analysis_error"] = image_analysis.get("error", "")
-        retrieval_trace["image_description"] = image_analysis.get("description", "")
-
-    if need_rag:
-        knowledge_chunks, retrieval_trace = await retrieve_knowledge(
-            retrieval_question,
-            knowledge_base_id=knowledge_base.id,
-            # 关键词召回自带会话（issue #187）：stream_chat 不再持有请求级 Session，
-            # 由检索侧那一步自己「开 session → 用 → 关」，整段落在同一个工作线程里，
-            # 避免把 Session 对象递到别的线程上。
-            db=None,
-            trace_recorder=trace,
-        )
-        retrieval_trace = retrieval_trace or {}
-        retrieval_trace["memory"] = {
-            "used": bool(memory_context),
-            "used_for_retrieval": retrieval_question != effective_question,
-            "window_turns": MEMORY_WINDOW_TURNS,
-            "summary_available": bool(conversation.memory_summary),
-            "summary_upto_message_id": conversation.memory_summary_upto_message_id,
-        }
-        retrieval_trace["rag_gate"] = rag_gate
-        retrieval_trace["mode"] = generation_mode
-        retrieval_trace["effective_question"] = effective_question
-        retrieval_trace["retrieval_question"] = retrieval_question
-        if body.attachments:
-            retrieval_trace["image_analysis_status"] = image_analysis.get("status", "")
-            retrieval_trace["image_analysis_error"] = image_analysis.get("error", "")
-            retrieval_trace["image_description"] = image_analysis.get("description", "")
-        trace.add(
-            "retrieval_completed",
-            "retrieve_knowledge",
-            params={"question": retrieval_question, "knowledge_base_id": knowledge_base.id},
-            creates={
-                "query_plan": retrieval_trace.get("query_plan", {}),
-                "routes": retrieval_trace.get("routes", []),
-                "rrf": retrieval_trace.get("rrf", []),
-                "rerank": retrieval_trace.get("rerank", {}),
+            creates={"trace_id": trace.trace_id},
+            params={
+                "conversation_id": body.conversation_id,
+                "knowledge_base_id": body.knowledge_base_id,
+                "question": body.question,
+                "attachments_count": len(body.attachments or []),
             },
-            result={"final_chunks_count": len(knowledge_chunks)},
-            note="Advanced RAG retrieval completed with query planning, multi-route recall, RRF fusion, and rerank.",
+            result={"username": username},
+            note="后端收到一次聊天请求，先建立 trace_id，后续所有步骤都会挂到这次请求下面。",
         )
-        if knowledge_chunks:
-            context = "\n\n".join(
-                f"[来源: {c['file_name']}]\n{c['content']}"
-                for c in knowledge_chunks
+        cid = body.conversation_id
+        knowledge_base = await asyncio.to_thread(
+            _resolve_request_knowledge_base, body.knowledge_base_id, principal.user_id
+        )
+        raw_question = (body.question or "").strip()
+        display_question = raw_question or ("请分析这张图片" if body.attachments else "")
+        if not display_question:
+            trace.add(
+                "request_rejected",
+                "stream_chat",
+                uses={"raw_question": raw_question, "attachments_count": len(body.attachments or [])},
+                result={"error": "问题不能为空"},
+                note="没有文字问题，也没有图片附件，无法继续进入 RAG 流程。",
             )
-        sources = _build_sources(knowledge_chunks)
-        retrieved_contexts = [c.get("content", "") for c in knowledge_chunks if c.get("content")]
+            trace.finish("failed")
+            raise HTTPException(400, "问题不能为空")
         trace.add(
-            "context_built",
-            "_build_sources",
-            creates={"context": context, "sources": sources},
-            result={"sources_count": len(sources), "retrieved_contexts_count": len(retrieved_contexts)},
-            note="系统把最终选中的 chunk 拼成给大模型看的知识库上下文，并生成前端可展开的参考资料。",
+            "input_normalized",
+            "stream_chat",
+            creates={"raw_question": raw_question, "display_question": display_question},
+            result={"knowledge_base_id": knowledge_base.id, "knowledge_base_name": knowledge_base.name},
+            note="系统整理用户输入，并确定本次请求要使用哪个知识库。",
         )
-    else:
-        retrieval_trace["skip_reason"] = rag_gate.get("reason", "")
+
+        effective_question, image_analysis = await _build_effective_question(
+            raw_question,
+            body.attachments,
+        )
         trace.add(
-            "retrieval_skipped",
+            "effective_question_built",
+            "_build_effective_question",
+            params={"raw_question": raw_question, "attachments_count": len(body.attachments or [])},
+            creates={
+                "effective_question": effective_question,
+                "image_analysis_status": image_analysis.get("status", ""),
+                "image_description": image_analysis.get("description", ""),
+            },
+            result={"image_analysis_error": image_analysis.get("error", "")},
+            note="如果有图片，系统会先把图片转成文字描述，再与用户问题合并为真正用于检索和生成的问题。",
+        )
+        if body.attachments and image_analysis.get("status") == "failed" and not raw_question:
+            trace.add(
+                "image_failed_directly",
+                "_build_effective_question",
+                uses={"attachments_count": len(body.attachments or [])},
+                result={"error": image_analysis.get("error", "")},
+                note="用户只发了图片但图片识别失败，因此不会进入知识库检索和模型回答。",
+            )
+            trace.finish("failed")
+
+            async def failure_stream():
+                # 这条早退流同样占着一个并发槽，收尾必须归还（正常走完/被断开都走 finally）。
+                try:
+                    for payload in _trace_sse_payloads(trace):
+                        yield payload
+                    analysis_data = json.dumps(
+                        {
+                            "type": "image_analysis",
+                            "analysis": image_analysis,
+                        },
+                        ensure_ascii=False,
+                    )
+                    yield f"data: {analysis_data}\n\n"
+                    error_data = json.dumps(
+                        {
+                            "type": "error",
+                            "message": image_analysis.get("error") or "图片内容识别失败，请检查清晰度后重新上传。",
+                        },
+                        ensure_ascii=False,
+                    )
+                    yield f"data: {error_data}\n\n"
+                    yield "data: [DONE]\n\n"
+                finally:
+                    slot.release()
+
+            return StreamingResponse(failure_stream(), media_type="text/event-stream")
+        title_source = raw_question or effective_question or display_question
+        title = title_source[:30] + ("..." if len(title_source) > 30 else "")
+        conversation = await asyncio.to_thread(
+            _load_or_create_conversation,
+            cid,
+            principal.user_id,
+            knowledge_base,
+            title,
+        )
+        cid = conversation.id
+        knowledge_base = conversation.knowledge_base
+        if conversation.created:
+            trace.add(
+                "conversation_created",
+                "stream_chat",
+                creates={"conversation_id": cid, "title": title},
+                result={"knowledge_base_id": knowledge_base.id},
+                note="这是新对话，系统创建 conversation，并把它绑定到当前知识库。",
+            )
+        else:
+            trace.add(
+                "conversation_loaded",
+                "stream_chat",
+                uses={"conversation_id": cid},
+                result={"knowledge_base_id": knowledge_base.id, "title": conversation.title},
+                note="这是已有对话，系统复用它原本绑定的知识库，避免会话中途串库。",
+            )
+        trace.attach(conversation_id=cid)
+
+        # save user message
+        accepted_attachments = _service_minted_attachments(body.attachments, cid)
+        user_message_id = await asyncio.to_thread(
+            _save_user_message,
+            cid,
+            principal.user_id,
+            display_question,
+            accepted_attachments,
+        )
+        trace.add(
+            "user_message_saved",
+            "Message",
+            creates={"user_message_id": user_message_id},
+            params={"content": display_question, "attachments_count": len(body.attachments or [])},
+            note="用户消息先写入数据库，后面的滑动窗口会排除这条当前消息，避免重复塞进 prompt。",
+        )
+
+        recent_text = await _build_recent_memory_text(
+            cid,
+            current_message_id=user_message_id,
+            # 上界取自上面那次会话快照：紧接着的用户消息写入不会推进它，取值与原先读同一个
+            # 会话对象等价，但读的位置从事件循环线程挪到了工作线程（issue #187）。
+            summary_upto=conversation.memory_summary_upto_message_id,
+            trace_id=trace.trace_id,
+        )
+        memory_context = _build_memory_context(
+            conversation,
+            recent_text=recent_text,
+        )
+        retrieval_question = _build_memory_aware_retrieval_question(effective_question, memory_context)
+        trace.add(
+            "memory_built",
+            "_build_memory_context",
+            uses={
+                "conversation_id": cid,
+                "memory_summary": conversation.memory_summary,
+                "summary_upto_message_id": conversation.memory_summary_upto_message_id,
+            },
+            creates={
+                "recent_text": recent_text,
+                "memory_context": memory_context,
+                "retrieval_question": retrieval_question,
+            },
+            result={
+                "memory_used": bool(memory_context),
+                "used_for_retrieval": retrieval_question != effective_question,
+                "window_turns": MEMORY_WINDOW_TURNS,
+            },
+            note="系统构造短期滑动窗口和长期摘要记忆，并生成真正用于 RAG 检索的问题。",
+        )
+
+        rag_gate = await decide_need_rag(
+            effective_question,
+            memory_context,
+            knowledge_base.name,
+            body.attachments,
+        )
+        need_rag = bool(rag_gate.get("need_rag", True))
+        generation_mode = "rag" if need_rag else "direct"
+        trace.add(
+            "rag_gate_decided",
             "decide_need_rag",
             uses={
                 "effective_question": effective_question,
                 "memory_context": memory_context,
+                "knowledge_base_name": knowledge_base.name,
+                "attachments_count": len(body.attachments or []),
             },
+            creates={"rag_gate": rag_gate},
             result={
-                "need_rag": False,
-                "route": "direct",
+                "need_rag": need_rag,
+                "route": rag_gate.get("route", generation_mode),
                 "confidence": rag_gate.get("confidence", 0),
+                "source": rag_gate.get("source", ""),
                 "reason": rag_gate.get("reason", ""),
             },
-            note="本轮判定为直答，不进入知识库检索，也不启动 RAGAS。回答将只结合问题与会话记忆。",
+            note="模型先判断这轮问题是否需要进入知识库检索。若判定为直答，则跳过 RAG，只用问题和会话记忆生成回答。",
         )
 
-    async def event_stream():
-        try:
-            full = ""
-            failed = False
-            first_chunk_seen = False
-            conversation_data = json.dumps({
-                "type": "conversation",
-                "conversation": {
-                    "id": cid,
-                    "title": conversation.title,
-                    "knowledge_base_id": knowledge_base.id,
-                    "knowledge_base_name": knowledge_base.name,
-                },
-            }, ensure_ascii=False)
-            if body.attachments:
-                analysis_data = json.dumps(
-                    {
-                        "type": "image_analysis",
-                        "analysis": image_analysis,
-                    },
-                    ensure_ascii=False,
-                )
-                for payload in _trace_sse_payloads(trace):
-                    yield payload
-                yield f"data: {analysis_data}\n\n"
-            for payload in _trace_sse_payloads(trace):
-                yield payload
-            yield f"data: {conversation_data}\n\n"
-            if need_rag and sources:
-                data = json.dumps({"type": "sources", "sources": sources}, ensure_ascii=False)
-                yield f"data: {data}\n\n"
-            trace.add(
-                "generation_started",
-                "stream_rag_answer",
-                params={
-                    "question": effective_question,
-                    "memory_context": memory_context,
-                    "context": context,
-                    "mode": generation_mode,
-                },
-                note=(
-                    "开始调用文本模型。"
-                    if need_rag
-                    else "开始调用文本模型。当前问题被判定为直答，不进入知识库检索，只结合问题与会话记忆回答。"
-                ),
-            )
-            for payload in _trace_sse_payloads(trace):
-                yield payload
-            async for event in stream_rag_answer(
-                effective_question,
-                context,
-                memory_context,
-                trace,
-                use_rag=need_rag,
-            ):
-                for payload in _trace_sse_payloads(trace):
-                    yield payload
-                if isinstance(event, dict):
-                    if event.get("type") == "error":
-                        failed = True
-                        trace.add(
-                            "generation_failed",
-                            "_stream_deepseek_response",
-                            result={"message": event.get("message") or event.get("content") or "DeepSeek 网络请求失败"},
-                            note="模型生成阶段失败，系统会返回错误事件，并且不会保存失败 assistant 消息。",
-                        )
-                        for payload in _trace_sse_payloads(trace):
-                            yield payload
-                        data = json.dumps(
-                            {
-                                "type": "error",
-                                "message": event.get("message") or event.get("content") or "DeepSeek 网络请求失败",
-                            },
-                            ensure_ascii=False,
-                        )
-                        yield f"data: {data}\n\n"
-                        break
-                    if event.get("type") == "reset":
-                        # 后备模型从头重新生成整段回答：先作废已下发的增量，
-                        # 落库文本也从零重新累积，绝不与重置前的内容拼接。
-                        full = ""
-                        first_chunk_seen = False
-                        trace.add(
-                            "stream_reset",
-                            "_stream_openai_chat_chunks",
-                            params={"reason": event.get("reason") or ""},
-                            note="已下发 reset 事件作废此前流式内容，本轮回答改为只保留重置后重新生成的部分。",
-                        )
-                        for payload in _trace_sse_payloads(trace):
-                            yield payload
-                        data = json.dumps(
-                            {
-                                "type": "reset",
-                                "reason": event.get("reason") or "",
-                                "message": event.get("message") or "",
-                            },
-                            ensure_ascii=False,
-                        )
-                        yield f"data: {data}\n\n"
-                        continue
-                    chunk = event.get("content", "")
-                else:
-                    chunk = event
-                data = json.dumps({"content": chunk}, ensure_ascii=False)
-                yield f"data: {data}\n\n"
-                if not failed:
-                    if chunk and not first_chunk_seen:
-                        first_chunk_seen = True
-                        trace.add(
-                            "first_content_chunk",
-                            "_stream_openai_chat_chunks",
-                            result={"chunk": chunk},
-                            note="大模型开始返回第一段流式内容，前端会逐步拼接为正在生成的回答。",
-                        )
-                        for payload in _trace_sse_payloads(trace):
-                            yield payload
-                    full += chunk
+        context = ""
+        sources = []
+        retrieved_contexts = []
+        knowledge_chunks = []
+        retrieval_trace = {
+            # 同一份状态会随 retrieval_trace 落库并回查给用户：last_error 原文（上游地址 +
+            # 原始异常）只留服务端，轨迹里给固定文案。
+            "embedding": embedding_trace_status(embedding_backend_status()),
+            "query_plan": {},
+            "routes": [],
+            "rrf": [],
+            "rerank": {"status": "skipped", "items": []},
+            "memory": {
+                "used": bool(memory_context),
+                "used_for_retrieval": False,
+                "window_turns": MEMORY_WINDOW_TURNS,
+                "summary_available": bool(conversation.memory_summary),
+                "summary_upto_message_id": conversation.memory_summary_upto_message_id,
+            },
+            "rag_gate": rag_gate,
+            "mode": generation_mode,
+            "effective_question": effective_question,
+            "retrieval_question": retrieval_question,
+        }
+        if body.attachments:
+            retrieval_trace["image_analysis_status"] = image_analysis.get("status", "")
+            retrieval_trace["image_analysis_error"] = image_analysis.get("error", "")
+            retrieval_trace["image_description"] = image_analysis.get("description", "")
 
-            # save assistant message
-            if full and not failed:
-                _safe_trace_add(
-                    trace,
-                    "assistant_ready_to_save",
-                    "Message",
-                    uses={
-                        "full_answer": full,
-                        "sources_count": len(sources),
-                        "need_rag": need_rag,
+        if need_rag:
+            knowledge_chunks, retrieval_trace = await retrieve_knowledge(
+                retrieval_question,
+                knowledge_base_id=knowledge_base.id,
+                # 关键词召回自带会话（issue #187）：stream_chat 不再持有请求级 Session，
+                # 由检索侧那一步自己「开 session → 用 → 关」，整段落在同一个工作线程里，
+                # 避免把 Session 对象递到别的线程上。
+                db=None,
+                trace_recorder=trace,
+            )
+            retrieval_trace = retrieval_trace or {}
+            retrieval_trace["memory"] = {
+                "used": bool(memory_context),
+                "used_for_retrieval": retrieval_question != effective_question,
+                "window_turns": MEMORY_WINDOW_TURNS,
+                "summary_available": bool(conversation.memory_summary),
+                "summary_upto_message_id": conversation.memory_summary_upto_message_id,
+            }
+            retrieval_trace["rag_gate"] = rag_gate
+            retrieval_trace["mode"] = generation_mode
+            retrieval_trace["effective_question"] = effective_question
+            retrieval_trace["retrieval_question"] = retrieval_question
+            if body.attachments:
+                retrieval_trace["image_analysis_status"] = image_analysis.get("status", "")
+                retrieval_trace["image_analysis_error"] = image_analysis.get("error", "")
+                retrieval_trace["image_description"] = image_analysis.get("description", "")
+            trace.add(
+                "retrieval_completed",
+                "retrieve_knowledge",
+                params={"question": retrieval_question, "knowledge_base_id": knowledge_base.id},
+                creates={
+                    "query_plan": retrieval_trace.get("query_plan", {}),
+                    "routes": retrieval_trace.get("routes", []),
+                    "rrf": retrieval_trace.get("rrf", []),
+                    "rerank": retrieval_trace.get("rerank", {}),
+                },
+                result={"final_chunks_count": len(knowledge_chunks)},
+                note="Advanced RAG retrieval completed with query planning, multi-route recall, RRF fusion, and rerank.",
+            )
+            if knowledge_chunks:
+                context = "\n\n".join(
+                    f"[来源: {c['file_name']}]\n{c['content']}"
+                    for c in knowledge_chunks
+                )
+            sources = _build_sources(knowledge_chunks)
+            retrieved_contexts = [c.get("content", "") for c in knowledge_chunks if c.get("content")]
+            trace.add(
+                "context_built",
+                "_build_sources",
+                creates={"context": context, "sources": sources},
+                result={"sources_count": len(sources), "retrieved_contexts_count": len(retrieved_contexts)},
+                note="系统把最终选中的 chunk 拼成给大模型看的知识库上下文，并生成前端可展开的参考资料。",
+            )
+        else:
+            retrieval_trace["skip_reason"] = rag_gate.get("reason", "")
+            trace.add(
+                "retrieval_skipped",
+                "decide_need_rag",
+                uses={
+                    "effective_question": effective_question,
+                    "memory_context": memory_context,
+                },
+                result={
+                    "need_rag": False,
+                    "route": "direct",
+                    "confidence": rag_gate.get("confidence", 0),
+                    "reason": rag_gate.get("reason", ""),
+                },
+                note="本轮判定为直答，不进入知识库检索，也不启动 RAGAS。回答将只结合问题与会话记忆。",
+            )
+
+        async def event_stream():
+            try:
+                full = ""
+                failed = False
+                first_chunk_seen = False
+                conversation_data = json.dumps({
+                    "type": "conversation",
+                    "conversation": {
+                        "id": cid,
+                        "title": conversation.title,
+                        "knowledge_base_id": knowledge_base.id,
+                        "knowledge_base_name": knowledge_base.name,
+                    },
+                }, ensure_ascii=False)
+                if body.attachments:
+                    analysis_data = json.dumps(
+                        {
+                            "type": "image_analysis",
+                            "analysis": image_analysis,
+                        },
+                        ensure_ascii=False,
+                    )
+                    for payload in _trace_sse_payloads(trace):
+                        yield payload
+                    yield f"data: {analysis_data}\n\n"
+                for payload in _trace_sse_payloads(trace):
+                    yield payload
+                yield f"data: {conversation_data}\n\n"
+                if need_rag and sources:
+                    data = json.dumps({"type": "sources", "sources": sources}, ensure_ascii=False)
+                    yield f"data: {data}\n\n"
+                trace.add(
+                    "generation_started",
+                    "stream_rag_answer",
+                    params={
+                        "question": effective_question,
+                        "memory_context": memory_context,
+                        "context": context,
+                        "mode": generation_mode,
                     },
                     note=(
-                        "模型完整回答成功，系统准备保存 assistant 消息，并启动摘要判断。"
-                        if not need_rag
-                        else "模型完整回答成功，系统准备保存 assistant 消息，并启动 RAGAS 和摘要判断。"
+                        "开始调用文本模型。"
+                        if need_rag
+                        else "开始调用文本模型。当前问题被判定为直答，不进入知识库检索，只结合问题与会话记忆回答。"
                     ),
                 )
-                _attach_grounding_trace(
-                    retrieval_trace,
+                for payload in _trace_sse_payloads(trace):
+                    yield payload
+                async for event in stream_rag_answer(
+                    effective_question,
+                    context,
+                    memory_context,
                     trace,
-                    answer=full,
-                    retrieved_contexts=retrieved_contexts,
-                    need_rag=need_rag,
-                )
-                retrieval_trace["learning_trace"] = compact_trace_reference(trace.snapshot())
-                assistant_message_id = None
-                try:
-                    # 保存 assistant 消息是另一段同步 DB 工作，同样整段落在工作线程里；
-                    # 它自己的会话由 `_save_assistant_message` 收尾（失败即回滚）。
-                    assistant_message_id = await asyncio.to_thread(
-                        _save_assistant_message,
-                        cid,
-                        full,
-                        sources,
-                        "pending" if need_rag else "",
-                        retrieval_trace,
-                    )
-                except Exception as exc:
-                    logger.warning("Assistant message save failed after stream finished [trace_id=%s]: %s",
-                                   trace.trace_id, exc, exc_info=True)
-                    _safe_trace_add(
-                        trace,
-                        "assistant_save_failed",
-                        "Message",
-                        result={"error": ASSISTANT_SAVE_FAILED_MESSAGE, "trace_id": trace.trace_id},
-                        note="模型回答已经生成完毕，但保存 assistant 消息失败。系统仍会结束流，避免前端误报 network error。",
-                    )
-
-                if assistant_message_id is not None:
-                    _safe_trace_attach(trace, conversation_id=cid, message_id=assistant_message_id)
-                    _safe_trace_add(
-                        trace,
-                        "assistant_message_saved",
-                        "Message",
-                        creates={"assistant_message_id": assistant_message_id},
-                        result={"ragas_status": "pending" if need_rag else ""},
-                        note="assistant 消息保存成功，历史会话刷新后仍可从这条消息打开流程。",
-                    )
-                    if need_rag:
-                        try:
-                            schedule_ragas_evaluation(
-                                assistant_message_id,
-                                effective_question,
-                                full,
-                                retrieved_contexts,
-                                trace.trace_id,
+                    use_rag=need_rag,
+                ):
+                    for payload in _trace_sse_payloads(trace):
+                        yield payload
+                    if isinstance(event, dict):
+                        if event.get("type") == "error":
+                            failed = True
+                            trace.add(
+                                "generation_failed",
+                                "_stream_deepseek_response",
+                                result={"message": event.get("message") or event.get("content") or "DeepSeek 网络请求失败"},
+                                note="模型生成阶段失败，系统会返回错误事件，并且不会保存失败 assistant 消息。",
                             )
-                            _safe_trace_add(
-                                trace,
-                                "ragas_scheduled",
-                                "schedule_ragas_evaluation",
-                                params={
-                                    "message_id": assistant_message_id,
-                                    "question": effective_question,
-                                    "answer_chars": len(full),
-                                    "contexts_count": len(retrieved_contexts),
+                            for payload in _trace_sse_payloads(trace):
+                                yield payload
+                            data = json.dumps(
+                                {
+                                    "type": "error",
+                                    "message": event.get("message") or event.get("content") or "DeepSeek 网络请求失败",
                                 },
-                                note="RAGAS 在 assistant 保存后异步启动，不阻塞用户看到答案。",
+                                ensure_ascii=False,
                             )
-                        except Exception as exc:
-                            logger.warning("RAGAS schedule failed after stream finished [trace_id=%s]: %s",
-                                           trace.trace_id, exc, exc_info=True)
-                            _safe_trace_add(
-                                trace,
-                                "ragas_schedule_failed",
-                                "schedule_ragas_evaluation",
-                                result={"error": RAGAS_SCHEDULE_FAILED_MESSAGE, "trace_id": trace.trace_id},
-                                note="RAGAS 调度失败，但不影响主回答完成。",
+                            yield f"data: {data}\n\n"
+                            break
+                        if event.get("type") == "reset":
+                            # 后备模型从头重新生成整段回答：先作废已下发的增量，
+                            # 落库文本也从零重新累积，绝不与重置前的内容拼接。
+                            full = ""
+                            first_chunk_seen = False
+                            trace.add(
+                                "stream_reset",
+                                "_stream_openai_chat_chunks",
+                                params={"reason": event.get("reason") or ""},
+                                note="已下发 reset 事件作废此前流式内容，本轮回答改为只保留重置后重新生成的部分。",
                             )
+                            for payload in _trace_sse_payloads(trace):
+                                yield payload
+                            data = json.dumps(
+                                {
+                                    "type": "reset",
+                                    "reason": event.get("reason") or "",
+                                    "message": event.get("message") or "",
+                                },
+                                ensure_ascii=False,
+                            )
+                            yield f"data: {data}\n\n"
+                            continue
+                        chunk = event.get("content", "")
                     else:
-                        _safe_trace_add(
-                            trace,
-                            "ragas_skipped",
-                            "schedule_ragas_evaluation",
-                            result={"need_rag": False, "reason": rag_gate.get("reason", "")},
-                            note="当前问题被路由为直答，因此不启动 RAGAS。",
-                        )
+                        chunk = event
+                    data = json.dumps({"content": chunk}, ensure_ascii=False)
+                    yield f"data: {data}\n\n"
+                    if not failed:
+                        if chunk and not first_chunk_seen:
+                            first_chunk_seen = True
+                            trace.add(
+                                "first_content_chunk",
+                                "_stream_openai_chat_chunks",
+                                result={"chunk": chunk},
+                                note="大模型开始返回第一段流式内容，前端会逐步拼接为正在生成的回答。",
+                            )
+                            for payload in _trace_sse_payloads(trace):
+                                yield payload
+                        full += chunk
+
+                # save assistant message
+                if full and not failed:
+                    _safe_trace_add(
+                        trace,
+                        "assistant_ready_to_save",
+                        "Message",
+                        uses={
+                            "full_answer": full,
+                            "sources_count": len(sources),
+                            "need_rag": need_rag,
+                        },
+                        note=(
+                            "模型完整回答成功，系统准备保存 assistant 消息，并启动摘要判断。"
+                            if not need_rag
+                            else "模型完整回答成功，系统准备保存 assistant 消息，并启动 RAGAS 和摘要判断。"
+                        ),
+                    )
+                    _attach_grounding_trace(
+                        retrieval_trace,
+                        trace,
+                        answer=full,
+                        retrieved_contexts=retrieved_contexts,
+                        need_rag=need_rag,
+                    )
+                    retrieval_trace["learning_trace"] = compact_trace_reference(trace.snapshot())
+                    assistant_message_id = None
                     try:
-                        _schedule_memory_summary_update(cid, trace.trace_id)
-                        _safe_trace_add(
-                            trace,
-                            "memory_summary_update_scheduled",
-                            "_schedule_memory_summary_update",
-                            params={"conversation_id": cid},
-                            note="系统异步检查长期记忆是否超过上限，若超过则进行二次摘要。",
+                        # 保存 assistant 消息是另一段同步 DB 工作，同样整段落在工作线程里；
+                        # 它自己的会话由 `_save_assistant_message` 收尾（失败即回滚）。
+                        assistant_message_id = await asyncio.to_thread(
+                            _save_assistant_message,
+                            cid,
+                            full,
+                            sources,
+                            "pending" if need_rag else "",
+                            retrieval_trace,
                         )
                     except Exception as exc:
-                        logger.warning("Memory summary schedule failed after stream finished [trace_id=%s]: %s",
+                        logger.warning("Assistant message save failed after stream finished [trace_id=%s]: %s",
                                        trace.trace_id, exc, exc_info=True)
                         _safe_trace_add(
                             trace,
-                            "memory_summary_update_schedule_failed",
-                            "_schedule_memory_summary_update",
-                            result={"error": MEMORY_SUMMARY_SCHEDULE_FAILED_MESSAGE, "trace_id": trace.trace_id},
-                            note="长期记忆压缩调度失败，但不影响主回答完成。",
+                            "assistant_save_failed",
+                            "Message",
+                            result={"error": ASSISTANT_SAVE_FAILED_MESSAGE, "trace_id": trace.trace_id},
+                            note="模型回答已经生成完毕，但保存 assistant 消息失败。系统仍会结束流，避免前端误报 network error。",
                         )
-                    try:
-                        retrieval_trace["learning_trace"] = compact_trace_reference(trace.snapshot())
-                        await asyncio.to_thread(
-                            _update_assistant_message_trace,
-                            assistant_message_id,
-                            json.dumps(retrieval_trace, ensure_ascii=False),
-                        )
-                    except Exception as exc:
-                        logger.warning("Assistant trace reference update failed: %s", exc, exc_info=True)
-                _safe_trace_finish(
-                    trace,
-                    "done" if assistant_message_id is not None else "partial",
-                    conversation_id=cid,
-                    message_id=assistant_message_id,
-                )
-                for payload in _trace_sse_payloads(trace):
-                    yield payload
-            elif failed:
-                _safe_trace_add(
-                    trace,
-                    "assistant_not_saved",
-                    "Message",
-                    result={"saved": False},
-                    note="回答生成失败，遵循项目规则：不把失败内容保存为正式 assistant 消息。",
-                )
-                _safe_trace_finish(trace, "failed", conversation_id=cid)
-                for payload in _trace_sse_payloads(trace):
-                    yield payload
-            yield "data: [DONE]\n\n"
-        finally:
-            # 客户端断开时，Starlette 的 StreamingResponse 会取消正在跑流的任务，把
-            # CancelledError 抛进挂起的 yield（其它 ASGI 实现也可能用 aclose() → GeneratorExit）；
-            # CancelledError 与 GeneratorExit 都继承自 BaseException，外层 `except Exception`
-            # 兜不住，原先写在函数体末尾的收尾逻辑不会执行。只有放进 finally 才能保证
-            # 断连路径同样把 trace 落到终态。finally 中不得再 yield。
-            #
-            # 这里不再需要补关会话（issue #187）：每一次写库的 Session 都在它自己的工作线程里
-            # 「开 → 用 → 关」，断开路径上不存在「借出去还没还」的连接，
-            # #58 那条「断开必须归还连接池」的保证因此从「靠这段 finally」变成结构性成立。
-            try:
-                # 正常路径已把 status 写成 done/partial/failed，这里只兜断开等异常收尾。
-                if getattr(trace, "status", None) == "running":
-                    _safe_trace_finish(trace, "failed", conversation_id=cid)
-            except Exception as exc:
-                logger.warning("Learning trace teardown failed: %s", exc, exc_info=True)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+                    if assistant_message_id is not None:
+                        _safe_trace_attach(trace, conversation_id=cid, message_id=assistant_message_id)
+                        _safe_trace_add(
+                            trace,
+                            "assistant_message_saved",
+                            "Message",
+                            creates={"assistant_message_id": assistant_message_id},
+                            result={"ragas_status": "pending" if need_rag else ""},
+                            note="assistant 消息保存成功，历史会话刷新后仍可从这条消息打开流程。",
+                        )
+                        if need_rag:
+                            try:
+                                schedule_ragas_evaluation(
+                                    assistant_message_id,
+                                    effective_question,
+                                    full,
+                                    retrieved_contexts,
+                                    trace.trace_id,
+                                )
+                                _safe_trace_add(
+                                    trace,
+                                    "ragas_scheduled",
+                                    "schedule_ragas_evaluation",
+                                    params={
+                                        "message_id": assistant_message_id,
+                                        "question": effective_question,
+                                        "answer_chars": len(full),
+                                        "contexts_count": len(retrieved_contexts),
+                                    },
+                                    note="RAGAS 在 assistant 保存后异步启动，不阻塞用户看到答案。",
+                                )
+                            except Exception as exc:
+                                logger.warning("RAGAS schedule failed after stream finished [trace_id=%s]: %s",
+                                               trace.trace_id, exc, exc_info=True)
+                                _safe_trace_add(
+                                    trace,
+                                    "ragas_schedule_failed",
+                                    "schedule_ragas_evaluation",
+                                    result={"error": RAGAS_SCHEDULE_FAILED_MESSAGE, "trace_id": trace.trace_id},
+                                    note="RAGAS 调度失败，但不影响主回答完成。",
+                                )
+                        else:
+                            _safe_trace_add(
+                                trace,
+                                "ragas_skipped",
+                                "schedule_ragas_evaluation",
+                                result={"need_rag": False, "reason": rag_gate.get("reason", "")},
+                                note="当前问题被路由为直答，因此不启动 RAGAS。",
+                            )
+                        try:
+                            _schedule_memory_summary_update(cid, trace.trace_id)
+                            _safe_trace_add(
+                                trace,
+                                "memory_summary_update_scheduled",
+                                "_schedule_memory_summary_update",
+                                params={"conversation_id": cid},
+                                note="系统异步检查长期记忆是否超过上限，若超过则进行二次摘要。",
+                            )
+                        except Exception as exc:
+                            logger.warning("Memory summary schedule failed after stream finished [trace_id=%s]: %s",
+                                           trace.trace_id, exc, exc_info=True)
+                            _safe_trace_add(
+                                trace,
+                                "memory_summary_update_schedule_failed",
+                                "_schedule_memory_summary_update",
+                                result={"error": MEMORY_SUMMARY_SCHEDULE_FAILED_MESSAGE, "trace_id": trace.trace_id},
+                                note="长期记忆压缩调度失败，但不影响主回答完成。",
+                            )
+                        try:
+                            retrieval_trace["learning_trace"] = compact_trace_reference(trace.snapshot())
+                            await asyncio.to_thread(
+                                _update_assistant_message_trace,
+                                assistant_message_id,
+                                json.dumps(retrieval_trace, ensure_ascii=False),
+                            )
+                        except Exception as exc:
+                            logger.warning("Assistant trace reference update failed: %s", exc, exc_info=True)
+                    _safe_trace_finish(
+                        trace,
+                        "done" if assistant_message_id is not None else "partial",
+                        conversation_id=cid,
+                        message_id=assistant_message_id,
+                    )
+                    for payload in _trace_sse_payloads(trace):
+                        yield payload
+                elif failed:
+                    _safe_trace_add(
+                        trace,
+                        "assistant_not_saved",
+                        "Message",
+                        result={"saved": False},
+                        note="回答生成失败，遵循项目规则：不把失败内容保存为正式 assistant 消息。",
+                    )
+                    _safe_trace_finish(trace, "failed", conversation_id=cid)
+                    for payload in _trace_sse_payloads(trace):
+                        yield payload
+                yield "data: [DONE]\n\n"
+            finally:
+                # 客户端断开时，Starlette 的 StreamingResponse 会取消正在跑流的任务，把
+                # CancelledError 抛进挂起的 yield（其它 ASGI 实现也可能用 aclose() → GeneratorExit）；
+                # CancelledError 与 GeneratorExit 都继承自 BaseException，外层 `except Exception`
+                # 兜不住，原先写在函数体末尾的收尾逻辑不会执行。只有放进 finally 才能保证
+                # 断连路径同样把 trace 落到终态。finally 中不得再 yield。
+                #
+                # 这里不再需要补关会话（issue #187）：每一次写库的 Session 都在它自己的工作线程里
+                # 「开 → 用 → 关」，断开路径上不存在「借出去还没还」的连接，
+                # #58 那条「断开必须归还连接池」的保证因此从「靠这段 finally」变成结构性成立。
+                try:
+                    # 正常路径已把 status 写成 done/partial/failed，这里只兜断开等异常收尾。
+                    if getattr(trace, "status", None) == "running":
+                        _safe_trace_finish(trace, "failed", conversation_id=cid)
+                except Exception as exc:
+                    logger.warning("Learning trace teardown failed: %s", exc, exc_info=True)
+                finally:
+                    # 并发槽跟数据库会话一样，必须在 finally 里归还：正常跑完、流里抛异常、
+                    # 客户端断开（CancelledError/GeneratorExit）三条路径都经过这里。漏掉任何
+                    # 一条，一次断连就会永久占着一个槽。
+                    slot.release()
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+    except Exception:
+        # 鉴权之后、StreamingResponse 之前失败：生成器的 finally 够不到这条路径，
+        # 外层收尾必须把槽还回去，否则一次失败就永久占着一个槽（issue #183）。
+        slot.release()
+        raise
