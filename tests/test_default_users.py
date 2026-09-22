@@ -6,7 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from database.session import Base
-from model.models import User
+from model.models import RevokedToken, User
 from service.auth_service import pwd_context
 import service.user_service as user_service
 
@@ -18,7 +18,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[1] / "backend"
 
 def _bind_temp_session(monkeypatch):
     engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(bind=engine, tables=[User.__table__])
+    Base.metadata.create_all(bind=engine, tables=[User.__table__, RevokedToken.__table__])
     session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     monkeypatch.setattr(user_service, "SessionLocal", session_factory)
     return session_factory

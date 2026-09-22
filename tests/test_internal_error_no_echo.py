@@ -33,7 +33,7 @@ import rag.llm as llm
 from conftest import FakeKnowledgeBase
 from crud import knowledge_file
 from crud import chat as crud_chat
-from model.models import Message
+from model.models import Message, User
 from rag import milvus_client, vision_service
 from schema.schemas import ChatRequest
 from service import chat_service, oss_service
@@ -140,7 +140,11 @@ def real_trace(monkeypatch):
 
 def _patch_stream_boundaries(monkeypatch, fake_db):
     """只打桩真正的边界（鉴权/会话工厂/知识库解析/检索/模型），其余跑真实实现。"""
-    monkeypatch.setattr(chat_service, "decode_token", lambda authorization: "alice")
+    monkeypatch.setattr(
+        chat_service,
+        "authenticate",
+        lambda db, authorization: db.query(User).filter_by(username="alice").first(),
+    )
     monkeypatch.setattr(chat_service, "SessionLocal", lambda: fake_db)
     monkeypatch.setattr(chat_service, "resolve_knowledge_base", lambda db, kid, user_id: FakeKnowledgeBase())
 

@@ -20,7 +20,7 @@ from sqlalchemy.pool import StaticPool
 
 from database import session as db_session
 from database.session import Base
-from model.models import KnowledgeBase, KnowledgeFile, User
+from model.models import KnowledgeBase, KnowledgeFile, RevokedToken, User
 from router import auth as auth_router
 from router import knowledge as knowledge_router
 from service import auth_service, knowledge_service, utils_service
@@ -46,7 +46,7 @@ def api(monkeypatch):
     )
     Base.metadata.create_all(
         bind=engine,
-        tables=[User.__table__, KnowledgeBase.__table__, KnowledgeFile.__table__],
+        tables=[User.__table__, RevokedToken.__table__, KnowledgeBase.__table__, KnowledgeFile.__table__],
     )
     TestingSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
     db = TestingSession()

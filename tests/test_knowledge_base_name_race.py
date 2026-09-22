@@ -28,7 +28,7 @@ import main as main_module
 from crud import knowledge_base as crud_knowledge_base
 from database import session as db_session
 from database.session import Base
-from model.models import Conversation, KnowledgeBase, KnowledgeFile, User
+from model.models import Conversation, KnowledgeBase, KnowledgeFile, RevokedToken, User
 from router import knowledge as knowledge_router
 from service import knowledge_service
 from service.auth_service import get_current_user
@@ -52,7 +52,7 @@ def api(tmp_path, monkeypatch):
     )
     Base.metadata.create_all(
         bind=engine,
-        tables=[User.__table__, KnowledgeBase.__table__, KnowledgeFile.__table__, Conversation.__table__],
+        tables=[User.__table__, RevokedToken.__table__, KnowledgeBase.__table__, KnowledgeFile.__table__, Conversation.__table__],
     )
     TestingSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
     sessions = []
