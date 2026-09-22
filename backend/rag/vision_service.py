@@ -5,7 +5,7 @@ from typing import Optional
 import httpx
 
 from config import VISION_API_KEY, VISION_BASE_URL, VISION_MODEL
-from service.oss_service import _public_oss_url
+from service.oss_service import ForeignObjectKeyError, _public_oss_url
 from service.utils_service import _internal_error_detail
 from rag.llm import openai_chat_url
 
@@ -213,11 +213,34 @@ def _classify_image_analysis(description: str) -> tuple[str, str]:
 
 
 def _build_image_urls(attachments: list[dict]) -> list[str]:
-    urls = []
+    """把附件的对象键转成公开读 URL，非本服务铸造的键整条丢弃并记 warning。
+
+    形态判据只有一份，在构造 URL 的 `_public_oss_url` 里（护栏放在构造口而不是调用点，
+    见该函数说明），这里不重判一遍，只决定它拒绝之后的策略：丢弃这一条、继续处理其余
+    条目——与 `chat_service._service_minted_attachments` 在同一条污点的写库出口上的做法
+    一致。丢弃而不是上抛：附件列是客户端回带的，上抛会把「键不合规」变成整条聊天请求
+    500，而这些条目本来就取不到图（不是本服务写下的对象），没有一条正常链路会走到这里。
+
+    被丢掉的键只进服务端日志，便于按会话对账：合法请求这条日志恒不出现。
+    """
+    urls: list[str] = []
+    rejected: list[object] = []
     for item in attachments:
         object_key = item.get("object_key")
-        if object_key:
+        if not object_key:
+            continue
+        try:
             urls.append(_public_oss_url(object_key))
+        except ForeignObjectKeyError:
+            rejected.append(object_key)
+    if rejected:
+        logger.warning(
+            "vision attachments dropped: %d of %d entries carried no service-minted object_key "
+            "rejected_keys=%s",
+            len(rejected),
+            len(attachments),
+            [str(key)[:120] for key in rejected[:5]],
+        )
     return urls
 
 
