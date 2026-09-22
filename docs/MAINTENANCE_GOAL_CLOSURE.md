@@ -6,6 +6,11 @@ This report minimally closes the current phase of the long-running maintenance g
 
 The goal ran for about 14 hours and 47 minutes (`53275` seconds) and used about `8,992,476` tokens before this closure pass. This closure intentionally stops adding new optimizations. It records the current work, verification evidence, residual risks, and follow-up goals.
 
+This report carries two time points, and a reader should keep them apart:
+
+- The **`2026-06-02` snapshot**: the baseline below, the worktree shape, and the verification evidence table. Those rows describe the dirty worktree this report was written in, not `develop` today.
+- The **`2026-09-22` follow-up notes**: the residual risks, the follow-up goals, the acceptance test index and the known-gap dispositions. These were re-read against `develop` and say so where they supersede a snapshot statement.
+
 Snapshot baseline:
 
 - Date/time: `2026-06-02 15:39:31 +08:00`
@@ -13,7 +18,9 @@ Snapshot baseline:
 - HEAD: `1a99a9a`
 - Worktree state: dirty; this report records the current phase, not a clean release boundary.
 
-## Current Worktree Shape
+## Worktree Shape At The `2026-06-02` Snapshot
+
+Every row below describes the `2026-06-02` snapshot worktree, not `develop` today; the current shape of `develop` is what CI reports on it.
 
 - `git status --short` showed a large dirty tree at the snapshot: backend, frontend, docs, and config.
 - `git diff --stat` reports `45 files changed`, with `1296 insertions` and `2874 deletions` in tracked files.
@@ -47,14 +54,14 @@ Snapshot baseline:
 
 ## Verification Evidence
 
-Commands run from the repository root:
+Commands run from the repository root at the `2026-06-02` snapshot. Every row below is that snapshot's result on that dirty worktree, not a reading of `develop`; for the current numbers read the `python-tests`, `frontend-tests` and `build` runs in `.github/workflows/` instead of this table.
 
-| Command | Result |
+| Command (at the snapshot) | Result at the snapshot |
 | --- | --- |
-| `npm test` | Passed: `80` Node tests; script discovers `tests/**/*.test.js` |
+| `npm test` | Passed: `80` Node tests at that time; script discovers `tests/**/*.test.js`. The suite has grown since: the same command re-run on `2026-09-22` reports `205` passed |
 | `npm run build` | Passed: Vite build completed; retained existing `Chat` chunk > 500 kB warning |
-| `python -m pytest -q tests` | `206` passed, `1` failed of `207` collected; discovery fixed by `pytest.ini`. The failure (`test_env_example_parity.py::test_every_env_var_read_by_config_is_documented`) comes from upstream commit `483a070`: `backend/config.py` reads `EMBEDDING_TIMEOUT_SECONDS`, but `.env.example` does not document it |
-| `git status --short` | Dirty tree remains; see current worktree shape above |
+| `python -m pytest -q tests` | `206` passed, `1` failed of `207` collected; discovery fixed by `pytest.ini`. That one failure (`test_env_example_parity.py::test_every_env_var_read_by_config_is_documented`) came from upstream commit `483a070`: `backend/config.py` read `EMBEDDING_TIMEOUT_SECONDS` while `.env.example` did not document it. It was fixed by issue #43 - the key is documented now and the module passes (`3 passed`, `2026-09-22`) - so no failure is open from this row |
+| `git status --short` | Dirty tree remains; see the snapshot worktree shape above |
 | `git diff --stat` | `45 files changed`, `1296 insertions`, `2874 deletions` |
 | `git diff --check -- src backend package.json tests` | No whitespace errors reported; Git printed LF-to-CRLF working-copy warnings |
 | `git check-ignore -v .env .env.development node_modules dist backend/milvus.db backend/uploads backend/checkpointer.db frontend.log backend.log backend.pid` | All listed local env/build/data/log/pid paths are ignored |
@@ -64,7 +71,7 @@ Commands run from the repository root:
 - Node and Python test discovery have been made explicit in `package.json` and `pytest.ini`; future nested Node tests and Python `test_*.py` files under `tests/` should stay inside the baseline.
 - Milvus migration is the largest backend risk. Existing Chroma data is not automatically migrated. The upload/query/delete loop has since had its runtime acceptance pass: `tests/test_milvus_acceptance.py` ran green on `2026-09-22` (`7 passed` in `13.10s` locally) against a real Milvus Lite database created in a temporary directory, covering upload and re-upload replace, cosine query, delete, knowledge-base isolation, index rebuild, and the `top_k` / missing-collection window; the same module is part of the `507 passed` backend suite on the Python 3.10 CI runner. The boundary of that run is embedded Milvus Lite: a deployed Milvus server is still unverified, and the embedding function is a deterministic stand-in, so the real provider path is not covered here.
 - Several external providers are mocked in tests. DeepSeek, DashScope embedding, DashScope rerank, OSS, and RAGAS runtime behavior still need real-environment smoke checks.
-- Some terminal output showed mojibake for Chinese strings. Prior tests passed, but the final UI text should be checked in a browser or by reading files with confirmed UTF-8 handling.
+- Some terminal output showed mojibake for Chinese strings. That is a terminal display problem, not a file problem: the files are UTF-8, and a `2026-09-22` scan of `src/` and `backend/**/*.py` finds no U+FFFD replacement character, so the product copy is unaffected.
 - `Knowledge.vue` batch delete/upload feedback and `chat store` RAGAS polling/message merge are now covered by narrow behavior-level Node tests (`tests/knowledgeFeedback.test.js`, `tests/chatStore.test.js`). The view-side logic was extracted into `src/utils/knowledgeFeedback.js` to make it testable in plain Node, so the Vue SFC glue itself (which helper it calls, the toast level, `uploading`/`uploadPercent` reset) is still only verified by reading, not executed by tests.
 
 ## Follow-Up Small Goals
@@ -81,8 +88,35 @@ Next batch:
    - Acceptance tests: `tests/test_retrieval_acceptance.py` (see [Acceptance Test Index](#acceptance-test-index)).
 4. Rerank and provider goal: smoke-test DashScope rerank, LLM fallback, embedding, and DeepSeek connectivity in the target environment.
    - Acceptance tests: `tests/test_provider_smoke.py` plus the offline smoke entry point `scripts/smoke_providers.py` (`--live` for the real endpoints); see [Acceptance Test Index](#acceptance-test-index).
-5. Frontend behavior goal: partially done. Narrow tests for knowledge batch delete/upload feedback and chat RAGAS polling/message merge behavior were added (`tests/knowledgeFeedback.test.js`, `tests/chatStore.test.js`). The three delete entry points in `Knowledge.vue` (delete knowledge base, delete file, batch delete) now share `runConfirmedDelete`, which gives each of them an error branch: cancelling the confirm dialog returns silently instead of raising an unhandled rejection, and a rejected `knowledgeAPI` call emits an error message instead of leaving the view in its old state; `tests/knowledgeFeedback.test.js` covers all three outcomes (cancelled / failed / succeeded). Since then the view itself is mounted: `tests/knowledgeDeleteCallSiteMount.test.js` mounts `Knowledge.vue` and clicks all three delete entries through a stubbed HTTP boundary, so the call-site glue is now covered - cancelling or failing never gets past the `status !== DELETE_SUCCEEDED` short-circuit into the refresh, while a successful delete does issue one; `tests/traceVariableFlowMount.test.js` mounts `TraceVariableFlow.vue` the same way. Still open on the frontend: the upload path's call-site glue (progress wiring, skip/failure wording), the create/rename dialog and the detail-preview wiring still have behavior tests only at the `src/utils` level; `Chat.vue`, `Layout.vue`, `Login.vue`, `UserProfile.vue` and `MarkdownRenderer.vue` have no mount test at all; and the confirm dialog itself is stubbed at the `utils/confirm.js` seam, because Element Plus's focus trap needs globals the jsdom harness does not install.
+5. Frontend behavior goal: partially done. Narrow tests for knowledge batch delete/upload feedback and chat RAGAS polling/message merge behavior were added (`tests/knowledgeFeedback.test.js`, `tests/chatStore.test.js`). The three delete entry points in `Knowledge.vue` (delete knowledge base, delete file, batch delete) now share `runConfirmedDelete`, which gives each of them an error branch: cancelling the confirm dialog returns silently instead of raising an unhandled rejection, and a rejected `knowledgeAPI` call emits an error message instead of leaving the view in its old state; `tests/knowledgeFeedback.test.js` covers all three outcomes (cancelled / failed / succeeded). Since then the view itself is mounted: `tests/knowledgeDeleteCallSiteMount.test.js` mounts `Knowledge.vue` and clicks all three delete entries through a stubbed HTTP boundary, so the call-site glue is now covered - cancelling or failing never gets past the `status !== DELETE_SUCCEEDED` short-circuit into the refresh, while a successful delete does issue one; `tests/traceVariableFlowMount.test.js` mounts `TraceVariableFlow.vue` the same way.
+
+   Re-read against `develop` on `2026-09-22`, four of the gaps this item used to list are closed:
+
+   - the upload path's call-site glue (progress wiring, skip/failure wording): `tests/knowledgeUploadCallSiteMount.test.js` drives a real file selection and asserts on the full message array, so a failed refresh cannot re-label a successful upload;
+   - the create dialog: `tests/knowledgeCreateCallSiteMount.test.js` clicks through the real dialog, and `tests/knowledgeCreateDialogStaleSubmitMount.test.js` covers its stale-submit ordering;
+   - the detail-preview wiring: `tests/knowledgeViewWiring.test.js` pins the call site inside `Knowledge.vue` and `tests/detailPreview.test.js` covers the helper behind it;
+   - `TraceVariableFlow.vue`: mounted by `tests/traceVariableFlowMount.test.js`.
+
+   Four gaps are still open on the frontend, tracked by issue #180:
+
+   - the rename path in `Knowledge.vue` has no call-site test;
+   - `Chat.vue`, `Layout.vue`, `Login.vue` and `UserProfile.vue` have no mount test at all;
+   - `MarkdownRenderer.vue`'s own glue is not executed: `tests/markdownSanitize.test.js` imports `src/utils/sanitizeHtml.js`, the same pipeline as the component rather than the component;
+   - the confirm dialog is still stubbed at the `utils/confirm.js` seam, because Element Plus's focus trap needs globals the jsdom harness does not install.
 6. Documentation alignment goal: keep startup commands and environment variables consistent across README, docs, and project instructions.
+
+## Known Gaps And Their Disposition
+
+A maintenance audit re-checked six repository-level gaps against `develop` on `2026-09-22`. None of them is an oversight, but each needs a recorded decision so the next review does not file it again. The audit's lettering is kept for traceability; its A1 (a real-provider smoke run) is the open follow-up goal 4 above and is tracked by issue #178.
+
+| ID | Gap | Disposition (`2026-09-22`) |
+| --- | --- | --- |
+| A2 | The repository has no `LICENSE` file | Not added on purpose. `README.md` describes the repository as a personal learning and internship portfolio project and says a license should be added if it is turned into a publicly reusable project, so under that positioning the missing file is not a gap. Revisit when the positioning changes. |
+| A3 | No repository-root `ruff.toml`, so the lint gate stays at `E4,E7,E9,F` | Kept at the lowest tier on purpose. `.github/workflows/static-checks.yml` states that this gate only catches deterministic errors such as syntax errors and undefined names, and that it is not a style gate; the wider rule sets stay on the upgrade path that file describes. |
+| A4 | No `prettier` and no `vue-tsc` | Conditional follow-up rather than debt: the same workflow file lists them as "considered later", together with the rest of the frontend upgrade path. |
+| A5 | `develop` has no required status checks | Tracked separately by issue #182 (enable branch protection on `develop`). `main` already requires nine checks and every one of them has a matching workflow that runs on `develop` pull requests. |
+| A6 | CI never runs the `engines.node` floor (`>=22.15`) | Documented known item: `tests/README.md` records the policy - every workflow pins `node-version: "22"`, which resolves above the floor, and a local command covers the floor itself. A cost trade-off, not an oversight. |
+| A7 | The `ragas` dependency is pinned inside an advisory range and kept under an exemption | Blocked upstream: the advisory for it (`CVE-2026-6587` / `GHSA-95ww-475f-pr4f`) ends at `last_affected: 0.4.3` with no `fixed` event, so there is no release to upgrade to. `backend/requirements-ragas.txt` records the exemption and its reasoning; revisit when upstream publishes a fix. |
 
 ## Acceptance Test Index
 
@@ -146,16 +180,19 @@ explicit error event.
 - `test_rerank_timeout_reports_failed_trace` - a rerank timeout produces a failed trace with the provider and error.
 - `test_rerank_malformed_response_reports_failed_trace[no-results|index-out-of-range|non-numeric-index]` - malformed rerank responses fail loudly instead of degrading to an empty success.
 - `test_rerank_without_api_key_reports_failed_trace` - a missing rerank key fails without sending a request.
+- `test_smoke_rerank_check_rejects_a_fallback_served_request` - the `rerank` check fails instead of passing when the answer came from the LLM fallback, and the failure names the provider that answered plus the reason the primary one did not (issue #148).
+- `test_smoke_rerank_fallback_check_rejects_a_primary_served_request` - the mirror invariant: the `rerank-fallback` check fails when the trace claims the primary provider, which means the fallback was never verified.
 - `test_deepseek_model_configuration_contract` - DeepSeek client configuration: base URL normalization, model normalization, `timeout=60`, `max_retries=0`.
 - `test_deepseek_model_without_api_key_raises` / `test_text_fallback_model_without_api_key_raises` - missing credentials raise instead of degrading.
 - `test_answer_stream_reports_error_when_fallback_disabled` / `test_answer_stream_reports_error_when_fallback_unconfigured` - an unusable fallback emits an explicit error event.
 - `test_answer_stream_switches_to_text_fallback_model` - a failing DeepSeek stream switches to the text fallback model.
 - `test_smoke_script_runs_offline_and_reports_every_provider` - `scripts/smoke_providers.py` runs offline without credentials, reports every provider and exits 0.
 - `test_smoke_script_live_without_credentials_reports_skips_not_passes` - `--live` without credentials reports every provider as skipped and never claims a pass.
+- `test_smoke_script_rejects_an_abbreviated_live_flag[--li|--l]` - an abbreviated `--live` flag exits with the argument parser's usage error instead of running, so the LIVE banner can never sit on top of an offline credential set (issue #149).
 
 Live connectivity for that last goal is intentionally out of the offline test net: run
 `python scripts/smoke_providers.py --live` in the target environment for it.
 
 ## Closure Decision
 
-This phase is closed as a minimal maintenance-goal closure. The current state is verified by automated tests and build, but the original open-ended maintenance objective should not be treated as globally complete. Future work should use the follow-up goals above instead of continuing this broad goal indefinitely.
+This phase is closed as a minimal maintenance-goal closure, with the follow-ups listed above still open: real-provider smoke checks in the target environment (goal 4), the deployed-Milvus and real-embedding-provider boundary of goals 2 and 3, the four frontend coverage gaps (goal 5), and the known gaps catalogued above. What the automated tests and the build verify is the offline boundary those goals describe, so the original open-ended maintenance objective should not be treated as globally complete. Future work should use the follow-up goals above instead of continuing this broad goal indefinitely.
