@@ -66,6 +66,7 @@ Current files:
 
 - `chatApi.test.js`
 - `chatStore.test.js`
+- `chatStorePaging.test.js`
 - `chatViewMount.test.js`
 - `ciGateScripts.test.js`
 - `clipboard.test.js`
@@ -76,6 +77,7 @@ Current files:
 - `knowledgeDeleteCallSiteMount.test.js`
 - `knowledgeFeedback.test.js`
 - `knowledgeRenameCallSiteMount.test.js`
+- `knowledgeStore.test.js`
 - `knowledgeUploadCallSiteMount.test.js`
 - `knowledgeUploadTypes.test.js`
 - `knowledgeViewWiring.test.js`
@@ -176,7 +178,26 @@ from making older files disappear without a trace: the first request asks for on
 page so `exactly full` and `already exhausted` stay distinguishable, the cursor is the last id of
 the loaded range rather than of the array, a page that arrives stale after a knowledge-base switch
 is dropped instead of being appended to the new base's list, and once a short page has said there is
-nothing more, a further `loadMore` issues no request at all.
+nothing more, a further `loadMore` issues no request at all. `knowledgeStore.test.js` imports the
+knowledge store directly and closes the store-side half of the same issue: a second
+`fetchKnowledgeBases()` is served from the cache without touching the network and, because the
+short-circuit sits before the loading flag, must not flip `loading` either,
+`force`/`refreshKnowledgeBases` bypass the cache and replace the list wholesale,
+`upsertKnowledgeBase` merges in place on a known id (length and order unchanged) and appends on a
+new one, rows that normalise to null are filtered out of the list instead of being rendered, and the
+knowledge-base paging entry (`loadMoreKnowledgeBases`) takes its cursor from the page it just
+fetched rather than from the end of the array - which is what keeps it advancing instead of spinning
+in place when a whole page turns out to be already loaded - appends only ids it does not already
+hold, drops the `hasMore` flag as soon as a short page says there is nothing left, refuses a second
+request while one is in flight, and offers no "load more" entry at all when the page's last row has
+no id to build a cursor from. `chatStorePaging.test.js` is the sidebar half of issue #191, whose
+review asked for exactly this coverage: the first request asks for one row more than a page so
+`exactly full` and `already exhausted` stay distinguishable, the cursor it hands back is the `{id,
+updated_at}` pair of the page's last row (a conversation id alone cannot order a uuid-keyed list),
+overlapping rows that a refresh or a stream tail inserted are dropped id by id rather than
+duplicated, a page whose last row carries no `updated_at` produces no entry at all instead of a
+button that does nothing, and re-fetching replaces the list with the newest page and resets the
+cursor rather than continuing from the stale one.
 
 ## Python Tests
 

@@ -2,11 +2,20 @@ import js from '@eslint/js'
 import pluginVue from 'eslint-plugin-vue'
 import globals from 'globals'
 
-// 作用域与 static-checks.yml 的前端门禁一致：src/。这也是原来 node --check 覆盖的范围，
-// 换上 eslint 后多出 .vue 与真正的规则检查，只强不弱。
-// 范围外的 tests/ 与 scripts/ 本次不动，留作后续单独一轮。实测 `npx eslint .` 全仓 71 处，
-// 全部落在 src/ 之外（tests/ 33、scripts/ 38）：no-undef 62（process / Buffer / document 这类
-// 环境全局量）、no-irregular-whitespace 5、no-useless-escape 2、no-unused-vars 2。
+// 作用域与 static-checks.yml 的前端门禁一致：src/（全部 .js 与 .vue）、tests/、scripts/。
+// 这也是原来 node --check 覆盖的范围，换上 eslint 后多出 .vue 与真正的规则检查，只强不弱。
+//
+// tests/ 与 scripts/ 是 issue #203 补上的。此前这两处不在任何静态检查范围内——包括
+// scripts/check_*.mjs 这几个门禁实现体自己。纳入前实测（eslint 10.11.0）共 155 处：
+// tests/ 117、scripts/ 38。其中 145 处是 no-undef，且**全部**是环境全局量
+// （tests/ 114：document / localStorage / Event / MouseEvent / File / URL / setTimeout /
+// process / Buffer ...；scripts/ 31：console / process），属于声明缺失而非代码问题，
+// 由下面两个 files 块的 globals 解决。
+// 剩下 10 处是真问题，已就地最小修复：tests/ 3 处 no-unused-vars（去掉多余绑定与未用导入），
+// scripts/ 7 处 no-irregular-whitespace + no-useless-escape（正则里的 U+3000 / U+FEFF 隐形
+// 字符与冗余 \[ 转义，改写成语义等价的 \uXXXX 转义；改写前后用 30 条语料做过匹配行为比对，
+// 差异为 0）。
+// 这条待办到此关闭，不存在「以后再说」的残留。
 
 // eslint-plugin-vue 的 flat/recommended 比 flat/essential 多出 33 条规则，其中 26 条在本仓库
 // 一次都没触发。真正会命中的 7 条里，5 条只管空白与排版（singleline-html-element-content-newline
@@ -53,6 +62,20 @@ export default [
     // AbortController / TextDecoder 等浏览器全局量，不声明的话 no-undef 会误报。
     files: ['src/**/*.{js,vue}'],
     languageOptions: { globals: { ...globals.browser } },
+  },
+  {
+    // 用例跑在 Node 里（node --test + node:module），但挂载类用例会把 jsdom 的一批浏览器
+    // 全局量装到 globalThis 上再跑（见 tests/helpers/vueMount.js 的说明与它注入的键），
+    // 所以两边的全局量都要声明：少声明哪一边，都会把合法引用报成 no-undef。
+    files: ['tests/**/*.{js,mjs}'],
+    languageOptions: { globals: { ...globals.node, ...globals.browser } },
+  },
+  {
+    // 门禁脚本（scripts/check_*.mjs 等）是纯粹的命令行 Node 程序。这里**只**声明 Node
+    // 全局量、不给浏览器全局量：脚本里出现 document / localStorage 一定是笔误，
+    // 放行反而会把真错藏起来。
+    files: ['scripts/**/*.{js,mjs}'],
+    languageOptions: { globals: { ...globals.node } },
   },
   {
     ignores: ['dist/**', 'coverage/**', 'playwright-report/**', 'test-results/**'],
