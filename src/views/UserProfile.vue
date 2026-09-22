@@ -107,13 +107,13 @@ import { useUserStore } from '@/stores/user'
 import { userAPI } from '@/api/user'
 import { ACCEPTED_IMAGE_INPUT, validateImageFile } from '@/utils/fileValidation'
 import { getApiErrorMessage } from '@/utils/httpError'
-import { normalizeApiAssetUrl } from '@/utils/url'
 import { formatDateTime } from '@/utils'
 
 const userStore = useUserStore()
 const formRef = ref(null)
 const submitting = ref(false)
-const avatarSrc = computed(() => normalizeApiAssetUrl(userStore.avatarUrl))
+// 直接取 store 里那一个（本地头像是带 token 取回后现做的 object URL，见 stores/user.js）。
+const avatarSrc = computed(() => userStore.avatarSrc)
 
 const form = reactive({
   oldPassword: '',
