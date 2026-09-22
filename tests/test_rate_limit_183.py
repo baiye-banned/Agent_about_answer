@@ -197,21 +197,118 @@ def test_threshold_is_read_from_the_limiter_not_hardcoded_in_the_route(login_api
     )
 
 
+def _login_request(headers=(), client=("10.0.0.9", 5555)):
+    """登录路由会看到的那类 Request：对端地址在 scope 里，其余头由调用方给。"""
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/auth/login",
+            "headers": list(headers),
+            "client": client,
+            "server": ("testserver", 80),
+            "scheme": "http",
+            "query_string": b"",
+        }
+    )
+
+
 def test_throttle_key_ignores_forwarded_headers():
     """限流键取对端地址而不是 X-Forwarded-For：那个头由客户端伪造，拿它做键等于把键交给攻击者。"""
-    scope = {
-        "type": "http",
-        "method": "POST",
-        "path": "/api/auth/login",
-        "headers": [(b"x-forwarded-for", b"203.0.113.7")],
-        "client": ("10.0.0.9", 5555),
-        "server": ("testserver", 80),
-        "scheme": "http",
-        "query_string": b"",
-    }
-    request = Request(scope)
+    request = _login_request(headers=[(b"x-forwarded-for", b"203.0.113.7")])
 
     assert auth_service._login_throttle_key(request, "Alice") == ("alice", "10.0.0.9")
+
+
+def test_throttle_key_folds_accent_variants_onto_one_account():
+    """账号键要折叠重音：库侧 `utf8mb4_unicode_ci` 认不出 `café` 与 `cafe` 的区别。
+
+    只折叠不分解是关不住的——`é` 可以写成单码位（U+00E9）也可以写成 `e` + 组合记号
+    （U+0065 U+0301），两种写法的字节不同、折叠前各开一桶。
+    """
+    request = _login_request()
+
+    def key(name):
+        return auth_service._login_throttle_key(request, name)
+
+    # 显式写出分解形：预组合形与分解形在源码里长得一样，只有字节不同。
+    decomposed = "café"
+    assert decomposed != "café" and len(decomposed) == 5, (
+        "本用例要求分解形与预组合形字节不同，否则下面这条断言是空的"
+    )
+
+    assert key("café") == key("cafe") == key(decomposed)
+    assert key("CAFÉ") == key(" Café ") == key("cafe")
+
+
+def test_throttle_key_does_not_collapse_unrelated_accounts():
+    """阳性对照：折叠只能合并「库侧也认不出区别」的写法，不能把不相关账号并成一桶。
+
+    这条挡的是把非 ASCII 一律丢掉的那种实现——它会把所有中文账号压成同一个键，
+    于是一个人被撞就锁死一屋子人。
+    """
+    request = _login_request()
+
+    def key(name):
+        return auth_service._login_throttle_key(request, name)
+
+    assert key("用户名一")[0] == "用户名一", "非 ASCII 账号被削掉了，折叠过头"
+    assert key("用户名一") != key("用户名二")
+    assert key("cafe") != key("caféx")
+    assert key("alice") != key("alice2")
+
+
+def test_accent_variants_share_one_login_failure_budget(login_api):
+    """路由级：换重音写法撞同一个账号，失败预算不能被变体数放大。
+
+    阈值 5、变体 4 个。若每种写法各开一桶，5 次失败摊到 4 个桶上最多攒到 2 次，
+    第 6 次仍是普通 401；只有折叠成一桶才会在这里出现 429。
+    """
+    limit = rate_limit.login_failures.max_failures
+    variants = ["cafe", "café", "café", "CAFÉ"]
+    assert len({auth_service._normalize_login_account(v) for v in variants}) == 1, (
+        "前提不成立：这些写法没有被折叠成一个键，本用例测不到路由层"
+    )
+
+    for attempt in range(limit):
+        name = variants[attempt % len(variants)]
+        response = _login(login_api, "wrong-password", username=name)
+        assert response.status_code == 401, (
+            f"第 {attempt + 1}/{limit} 次用 {name!r} 撞失败返回 {response.status_code}，阈值内不该被限流"
+        )
+
+    throttled = _login(login_api, "wrong-password", username="cafe")
+    assert throttled.status_code == 429, (
+        f"轮换重音写法撞了 {limit} 次仍是 {throttled.status_code}：每种写法各开一桶，"
+        "攻击者只要换重音就能把撞库预算乘以变体数"
+    )
+    assert throttled.headers.get("Retry-After") is not None, "限流响应缺少 Retry-After"
+
+
+def test_one_accounts_failures_do_not_lock_a_different_account(login_api):
+    """阳性对照：折叠不能粗到让一个账号的失败把另一个账号锁在门外。
+
+    一对账号名都用含非 ASCII 的写法：凡是把非 ASCII 一律丢掉的实现都会把它们压成
+    同一个键，于是这边刚撞满阈值，那边就跟着 429。ASCII 名字测不出这一点。
+    """
+    limit = rate_limit.login_failures.max_failures
+    victim, bystander = "用户名一", "用户名二"
+    assert auth_service._normalize_login_account(victim) != auth_service._normalize_login_account(bystander), (
+        "前提不成立：这两个账号名已经被折叠成同一个键，本用例测不到误锁"
+    )
+
+    for _ in range(limit):
+        assert _login(login_api, "wrong-password", username=victim).status_code == 401
+    assert _login(login_api, "wrong-password", username=victim).status_code == 429
+
+    other = _login(login_api, "wrong-password", username=bystander)
+    assert other.status_code == 401, (
+        f"不相关的账号 {bystander!r} 被 {victim!r} 的失败锁住了（{other.status_code}）："
+        "限流键折叠过头，把互不相干的账号并成了一桶"
+    )
+
+    # 真有账号的那一路也一样：别人的失败不该影响正常登录。
+    assert _login(login_api, ALICE_PASSWORD, username="alice").status_code == 200
 
 
 # ---------------------------------------------------------------------------

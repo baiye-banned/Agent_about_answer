@@ -1,4 +1,5 @@
 
+import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -110,17 +111,42 @@ def get_current_user(authorization: str = Header(""), db: Session = Depends(get_
 # ---------------------------------------------------------------------------
 
 
+def _normalize_login_account(username: str) -> str:
+    """把一个账号折叠到「库侧认不出区别」的那一档：去首尾空白、去大小写、去重音。
+
+    为什么不能只做 `strip().lower()`：用户名的查库比对走的是库的排序规则，本仓在
+    `database/session.py` 里把 users 表钉成 `utf8mb4_unicode_ci`——它大小写不敏感、**重音也
+    不敏感**，`café` 与 `cafe` 查的是同一行。键若比库的等价类更细，攻击者只要换重音写法就能
+    各开一个桶，把撞库预算乘以变体数。
+
+    做法是 NFKD 分解后丢掉组合记号（ccc != 0），`café`/`cafe`/`cafe\\u0301`/`CAFÉ` 因此同键。
+    只丢组合记号，**不丢非 ASCII 字符**：若改用 `encode("ascii", "ignore")`，所有中文账号会
+    一起压成空串，把互不相干的账号并成一桶，限流就变成了互相误锁。
+
+    代价写清楚：折叠只会让键**变粗**（合并桶），不会变细，所以关不掉的是「误锁」而不是
+    「绕过」。而键粗于库的等价类时才会误锁不同账号，本仓库侧就是 `utf8mb4_unicode_ci`，
+    被并到一起的写法在库里本来就是同一个账号，故不引入新的误锁面。
+
+    仍有残余：`ø`/`đ`/`ł`/`ß` 这类「不做分解分解、靠次级权重区分」的字母，NFKD 拆不开，与
+    库侧的等价类仍有缝。要彻底对齐得改用查库后的规范标识（用户主键），代价是把查库挪到
+    闸门之前——本函数是能覆盖常见重音写法的收敛口径。
+    """
+    decomposed = unicodedata.normalize("NFKD", username.strip())
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+
+
 def _login_throttle_key(request: Request, username: str):
     """登录节流的键：规范化后的账号 + 来源地址（issue #183 的「同一账号 + 同一来源」）。
 
     - 用 ASGI scope 里的对端地址，**不读 X-Forwarded-For**：那个头由客户端自由伪造，拿它做键
       等于把「换个值就能继续撞」的开关交出去。反代之后取到的是反代地址，等价于按账号全局限流，
       只会更严，不会更松。
-    - 账号按小写归一：MySQL 的默认排序规则对用户名大小写不敏感，只按原样做键可以用大小写绕开。
+    - 账号按 `_normalize_login_account` 折叠：库侧对用户名大小写与重音都不敏感，只按原样做键
+      可以用大小写、也可以用重音变体绕开。
     """
     client = getattr(request, "client", None)
     host = getattr(client, "host", "") or "unknown"
-    return (username.strip().lower(), host)
+    return (_normalize_login_account(username), host)
 
 
 def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
