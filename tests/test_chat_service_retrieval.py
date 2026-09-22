@@ -104,6 +104,19 @@ def _patch_boundaries(monkeypatch, fake_db, trace_cls, *, real_generation):
             },
         )
 
+    # learning_trace 引用分两次落库：保存 assistant 消息时带一份快照，流结束时再补一次
+    # 带学习轨迹终态的 UPDATE。issue #187 之后第二次写由 `_update_assistant_message_trace`
+    # 在自己的工作线程里直接改库（不再顺手改内存里的 ORM 对象），所以终态只能从这次调用上取。
+    trace_updates = []
+    real_update_assistant_trace = chat_service._update_assistant_message_trace
+
+    def recording_update_assistant_trace(message_id, retrieval_trace_json):
+        trace_updates.append(json.loads(retrieval_trace_json))
+        return real_update_assistant_trace(message_id, retrieval_trace_json)
+
+    calls["trace_updates"] = trace_updates
+    monkeypatch.setattr(chat_service, "_update_assistant_message_trace", recording_update_assistant_trace)
+
     monkeypatch.setattr(chat_service, "resolve_knowledge_base", fake_resolve_knowledge_base)
     monkeypatch.setattr(chat_service, "_build_recent_memory_text", fake_recent_memory_text)
     monkeypatch.setattr(chat_service, "decide_need_rag", fake_decide_need_rag)
@@ -156,7 +169,10 @@ def test_stream_chat_uses_direct_advanced_rag_retriever(monkeypatch, fake_db, tr
     assert len(calls["retrieve"]) == 1
     assert calls["retrieve"][0]["question"] == EXPECTED_RETRIEVAL_QUESTION
     assert calls["retrieve"][0]["knowledge_base_id"] == 3
-    assert calls["retrieve"][0]["db"] is fake_db
+    # 检索不再接收 stream_chat 的请求级 Session（issue #187）：那个 Session 现在根本不存在，
+    # 关键词召回那一步自己在工作线程里「开 session → 用 → 关」。断言从 `is fake_db` 改成
+    # `is None` 是这次修法的**目标**，不是放宽：任何把会话对象递回检索入口的写法都会红。
+    assert calls["retrieve"][0]["db"] is None
     assert calls["retrieve"][0]["trace_recorder"] is trace
 
     # RAG 网关拿到的是真实记忆上下文，而不是空串
@@ -217,7 +233,13 @@ def test_stream_chat_uses_direct_advanced_rag_retriever(monkeypatch, fake_db, tr
     assert retrieval_trace["grounding"]["unsupported_count"] == 0
     assert retrieval_trace["grounding"]["unsupported_claims"] == []
     assert retrieval_trace["learning_trace"]["trace_id"] == "trace-test"
-    assert retrieval_trace["learning_trace"]["event_count"] == len(trace.events)
+    # 随消息落库的是**保存那一刻**的轨迹快照，因此只会是最终事件数的前缀
+    assert 0 < retrieval_trace["learning_trace"]["event_count"] <= len(trace.events)
+
+    # 流结束时补写的那一次必须带上学习轨迹终态——原先在内存对象上断言的那条不变式
+    assert len(calls["trace_updates"]) == 1
+    assert calls["trace_updates"][0]["learning_trace"]["trace_id"] == "trace-test"
+    assert calls["trace_updates"][0]["learning_trace"]["event_count"] == len(trace.events)
     assert retrieval_trace["rerank"]["status"] == "done"
 
     # 异步任务按真实参数调度
