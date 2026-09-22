@@ -23,6 +23,7 @@ jobs:
     # 标题门禁（Conventional Commits）没有跳过，对 Dependabot 仍然生效。
     if: github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: 检出 PR 合并结果（脚本兜底来源）
         uses: actions/checkout@v7
