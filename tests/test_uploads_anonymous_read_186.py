@@ -33,7 +33,7 @@ from sqlalchemy.pool import StaticPool
 import main
 from database import session as db_session
 from database.session import Base
-from model.models import User
+from model.models import RevokedToken, User
 from service import auth_service, user_service
 
 
@@ -70,7 +70,7 @@ def api(monkeypatch, tmp_path):
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-    Base.metadata.create_all(bind=engine, tables=[User.__table__])
+    Base.metadata.create_all(bind=engine, tables=[User.__table__, RevokedToken.__table__])
     db = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)()
 
     alice = User(username="alice", password_hash="x")
