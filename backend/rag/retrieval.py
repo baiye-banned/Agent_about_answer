@@ -11,6 +11,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from config import RETRIEVAL_ROUTE_TOP_K
+from database.session import SessionLocal
 from model.models import KnowledgeFile
 from rag.llm import call_chat_json, call_router_json
 from rag.milvus_client import (
@@ -129,7 +130,7 @@ async def build_query_plan(question: str) -> dict:
 async def retrieve_knowledge(
     question: str,
     knowledge_base_id: int,
-    db: Session,
+    db: Session | None,
     trace_recorder: Any = None,
     query_plan: dict | None = None,
 ) -> tuple[list[dict], dict]:
@@ -185,7 +186,9 @@ async def retrieve_knowledge(
             (
                 "keyword",
                 " ".join(keyword_terms),
-                asyncio.to_thread(keyword_recall, db, knowledge_base_id, keyword_terms, RETRIEVAL_ROUTE_TOP_K),
+                asyncio.to_thread(
+                    _keyword_recall_step, db, knowledge_base_id, keyword_terms, RETRIEVAL_ROUTE_TOP_K
+                ),
             )
         )
 
@@ -301,6 +304,30 @@ def _append_route(route_specs: list[tuple[str, str]], route: str, query: str) ->
     if any(_normalize_for_match(existing_query) == normalized for _, existing_query in route_specs):
         return
     route_specs.append((route, text))
+
+
+def _keyword_recall_step(
+    db: Session | None,
+    knowledge_base_id: int,
+    keywords: list[str],
+    top_k: int,
+) -> list[dict]:
+    """关键词召回这一步的会话归属（issue #187）。
+
+    `db` 为 None 表示调用方没有请求级 Session 可以借用——`stream_chat` 在 #187 之后不再持有
+    它，因为那个 Session 一路被 `db.query/commit/close` 用在事件循环线程上。这时这一步自带
+    会话：`SessionLocal()` 与 `close()` 都发生在 `asyncio.to_thread` 的工作线程里，
+    「开 session → 用 → 关」整段不跨线程。
+
+    传了 `db` 的调用方（启动重建、用例里的真实库）沿用它原来的会话，行为不变。
+    """
+    if db is not None:
+        return keyword_recall(db, knowledge_base_id, keywords, top_k)
+    own_session = SessionLocal()
+    try:
+        return keyword_recall(own_session, knowledge_base_id, keywords, top_k)
+    finally:
+        own_session.close()
 
 
 def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top_k: int) -> list[dict]:

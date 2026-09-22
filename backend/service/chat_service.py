@@ -1,9 +1,10 @@
 
+import asyncio
 import json
 import logging
 import threading
 from datetime import datetime, timedelta
-from typing import Annotated
+from typing import Annotated, NamedTuple
 from uuid import uuid4
 
 from fastapi import Depends, File, Header, HTTPException, Query, UploadFile
@@ -413,30 +414,190 @@ async def upload_chat_attachment(file: UploadFile = File(...),
     }
 
 
+class _RequestIdentity(NamedTuple):
+    """鉴权结果的标量副本：ORM 行连同它的 Session 都不离开工作线程。"""
+
+    user_id: int
+    username: str
+
+
+class _KnowledgeBaseRef(NamedTuple):
+    """知识库的 (id, name) 标量副本。"""
+
+    id: int
+    name: str
+
+
+class _ConversationState(NamedTuple):
+    """`stream_chat` 后续步骤真正会用到的会话字段。"""
+
+    id: str
+    title: str
+    knowledge_base: _KnowledgeBaseRef
+    memory_summary: str
+    memory_summary_upto_message_id: int
+    created: bool
+
+
+def _authenticate_request(authorization: str) -> _RequestIdentity:
+    """整条鉴权链（验签 → 回查用户 → 校验世代 → 查吊销登记）在一个工作线程里跑完。
+
+    `stream_chat` 早先自己开一个请求级 Session 并用到底，于是这些同步 DB 调用全落在事件
+    循环线程上（issue #187）。改成每一段同步 DB 工作各自「开 session → 用 → 关」整段留在
+    同一个工作线程里：Session 不跨线程传递，也不跨 await 长期持有。
+
+    鉴权失败时 HTTPException 照常上抛，`finally` 保证连接先还回池——这正是原先那个
+    `except: db.close(); raise` 要保证的事。
+    """
+    db = SessionLocal()
+    try:
+        user = authenticate(db, authorization)
+        return _RequestIdentity(user.id, user.username)
+    finally:
+        db.close()
+
+
+def _resolve_request_knowledge_base(knowledge_base_id: int | None, user_id: int) -> _KnowledgeBaseRef:
+    """解析本次请求使用的知识库；解析不出来时抛 HTTPException(404)，语义与原先一致。"""
+    db = SessionLocal()
+    try:
+        knowledge_base = resolve_knowledge_base(db, knowledge_base_id, user_id)
+        return _KnowledgeBaseRef(knowledge_base.id, knowledge_base.name)
+    finally:
+        db.close()
+
+
+def _load_or_create_conversation(
+    cid: str | None,
+    user_id: int,
+    requested_knowledge_base: _KnowledgeBaseRef,
+    title: str,
+) -> _ConversationState:
+    """读会话（没有就建一条），并把后续步骤要用的字段一次复制成标量。
+
+    「只复用当前用户自己的知识库绑定，遗留的跨用户绑定回退到本次解析结果」这条判定也放在
+    这里：它要读 `conversation.knowledge_base`，而那是**懒加载**关系。放在协程里读会变成
+    事件循环线程上的一次隐式 SELECT，放到线程外读又会撞 DetachedInstanceError——只有在
+    会话还活着的这个工作线程里读，才是既有语义又不额外欠一次查询。
+    """
+    db = SessionLocal()
+    try:
+        conversation = db.query(Conversation).filter_by(id=cid, user_id=user_id).first() if cid else None
+        created = conversation is None
+        if created:
+            conversation = Conversation(
+                id=_new_id(),
+                user_id=user_id,
+                knowledge_base_id=requested_knowledge_base.id,
+                title=title,
+            )
+            db.add(conversation)
+            db.commit()
+
+        knowledge_base = requested_knowledge_base
+        if not created:
+            bound = conversation.knowledge_base
+            if bound and bound.user_id == user_id:
+                knowledge_base = _KnowledgeBaseRef(bound.id, bound.name)
+
+        return _ConversationState(
+            id=conversation.id,
+            title=conversation.title,
+            knowledge_base=knowledge_base,
+            memory_summary=conversation.memory_summary or "",
+            memory_summary_upto_message_id=conversation.memory_summary_upto_message_id or 0,
+            created=created,
+        )
+    finally:
+        db.close()
+
+
+def _save_user_message(cid: str, user_id: int, display_question: str,
+                       accepted_attachments: list[dict]) -> int:
+    """写入用户消息并返回它的 id。"""
+    db = SessionLocal()
+    try:
+        user_message = Message(
+            conversation_id=cid,
+            role="user",
+            content=display_question,
+            attachments=json.dumps(accepted_attachments, ensure_ascii=False),
+        )
+        db.add(user_message)
+        # 附件从「待确认」转为「正式引用」：这次消费必须与消息行同一次提交。两者分开时，
+        # 「消息已落库、登记行还在」的中间态会让清扫任务把这条活消息引用的对象当成孤儿
+        # 删掉（对象存储没有回收站），反过来则是消息没落库却把对象永久钉在登记表里。
+        # 早于本次修复就存在的键没有登记行，消费不到是正常的——它们由消息驱动那条既有的
+        # 回收路径负责，与这里无关。
+        crud_chat.confirm_attachment_uploads(
+            db,
+            [item.get("object_key") for item in accepted_attachments],
+            user_id,
+        )
+        db.commit()
+        db.refresh(user_message)
+        return user_message.id
+    finally:
+        db.close()
+
+
+def _save_assistant_message(cid: str, answer: str, sources: list[dict], ragas_status: str,
+                            retrieval_trace: dict) -> int:
+    """写入 assistant 消息并返回它的 id；失败时由 `finally` 里的 close 回滚这次事务。"""
+    db = SessionLocal()
+    try:
+        assistant_message = Message(
+            conversation_id=cid,
+            role="assistant",
+            content=answer,
+            sources=json.dumps(sources, ensure_ascii=False),
+            ragas_status=ragas_status,
+            retrieval_trace=json.dumps(retrieval_trace, ensure_ascii=False),
+        )
+        db.add(assistant_message)
+        db.commit()
+        db.refresh(assistant_message)
+        return assistant_message.id
+    finally:
+        db.close()
+
+
+def _update_assistant_message_trace(message_id: int, retrieval_trace_json: str) -> None:
+    """回答落库后补一次 retrieval_trace（学习轨迹引用）；消息已不在时静默跳过。"""
+    db = SessionLocal()
+    try:
+        message = db.query(Message).filter_by(id=message_id).first()
+        if message is None:
+            return
+        message.retrieval_trace = retrieval_trace_json
+        db.commit()
+    finally:
+        db.close()
+
+
 async def stream_chat(body: ChatRequest, authorization: str = Header("")):
     # 与 get_current_user 共用同一条鉴权链（验签 → 回查 → 世代 → 吊销登记）：这个入口
     # 不走 FastAPI 依赖注入、自己开会话，早先直接调用 decode_token，于是任何挂在依赖上的
     # 吊销判定都到不了这里（issue #184）。用户名改从鉴权后的那一行上取，不再单独解一次。
-    db = SessionLocal()
-    try:
-        user = authenticate(db, authorization)
-    except Exception:
-        # 鉴权失败也要把会话还回连接池：这条路径在拿到 user 之前就退出了。
-        db.close()
-        raise
-    username = user.username
+    #
+    # 鉴权（连同它自己的 Session）整段交给工作线程，本函数不再持有请求级 Session：
+    # 早先那句 `db = SessionLocal()` 之后，`query`/`add`/`commit`/`close` 全部落在事件循环
+    # 线程上，一次网络 DB 往返期间同进程所有并发请求的 token 流都被冻住（issue #187）。
+    # 现在每一段同步 DB 工作都是一个「开 session → 用 → 关」整段在工作线程里完成的步骤，
+    # Session 对象既不跨线程传递，也不跨 await 长期持有。
+    principal = await asyncio.to_thread(_authenticate_request, authorization)
+    username = principal.username
     # 认过身份再占并发槽：一次聊天流会一直占着服务端资源到上游结束，没上限时少量连接就能
     # 打满（issue #183）。满员时立刻拒绝，不排队——排队会把请求拖到上游超时才释放。
     slot = rate_limit.chat_stream_slots.try_acquire()
     if slot is None:
-        db.close()
         raise HTTPException(
             429,
             "当前并发聊天请求已达上限，请稍后重试。",
             headers={"Retry-After": "1"},
         )
-    trace = TraceRecorder(user_id=user.id)
     try:
+        trace = TraceRecorder(user_id=principal.user_id)
         trace.add(
             "request_received",
             "stream_chat",
@@ -451,7 +612,9 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             note="后端收到一次聊天请求，先建立 trace_id，后续所有步骤都会挂到这次请求下面。",
         )
         cid = body.conversation_id
-        knowledge_base = resolve_knowledge_base(db, body.knowledge_base_id, user.id)
+        knowledge_base = await asyncio.to_thread(
+            _resolve_request_knowledge_base, body.knowledge_base_id, principal.user_id
+        )
         raw_question = (body.question or "").strip()
         display_question = raw_question or ("请分析这张图片" if body.attachments else "")
         if not display_question:
@@ -497,7 +660,6 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 note="用户只发了图片但图片识别失败，因此不会进入知识库检索和模型回答。",
             )
             trace.finish("failed")
-            db.close()
 
             async def failure_stream():
                 # 这条早退流同样占着一个并发槽，收尾必须归还（正常走完/被断开都走 finally）。
@@ -525,20 +687,18 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                     slot.release()
 
             return StreamingResponse(failure_stream(), media_type="text/event-stream")
-        conv = db.query(Conversation).filter_by(id=cid, user_id=user.id).first() if cid else None
-        if not conv:
-            # create new conversation
-            cid = _new_id()
-            title_source = raw_question or effective_question or display_question
-            title = title_source[:30] + ("..." if len(title_source) > 30 else "")
-            conv = Conversation(
-                id=cid,
-                user_id=user.id,
-                knowledge_base_id=knowledge_base.id,
-                title=title,
-            )
-            db.add(conv)
-            db.commit()
+        title_source = raw_question or effective_question or display_question
+        title = title_source[:30] + ("..." if len(title_source) > 30 else "")
+        conversation = await asyncio.to_thread(
+            _load_or_create_conversation,
+            cid,
+            principal.user_id,
+            knowledge_base,
+            title,
+        )
+        cid = conversation.id
+        knowledge_base = conversation.knowledge_base
+        if conversation.created:
             trace.add(
                 "conversation_created",
                 "stream_chat",
@@ -547,55 +707,42 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 note="这是新对话，系统创建 conversation，并把它绑定到当前知识库。",
             )
         else:
-            # 只复用当前用户自己的知识库绑定，遗留的跨用户绑定回退到本次解析结果
-            if conv.knowledge_base and conv.knowledge_base.user_id == user.id:
-                knowledge_base = conv.knowledge_base
             trace.add(
                 "conversation_loaded",
                 "stream_chat",
                 uses={"conversation_id": cid},
-                result={"knowledge_base_id": knowledge_base.id, "title": conv.title},
+                result={"knowledge_base_id": knowledge_base.id, "title": conversation.title},
                 note="这是已有对话，系统复用它原本绑定的知识库，避免会话中途串库。",
             )
         trace.attach(conversation_id=cid)
 
         # save user message
         accepted_attachments = _service_minted_attachments(body.attachments, cid)
-        user_message = Message(
-            conversation_id=cid,
-            role="user",
-            content=display_question,
-            attachments=json.dumps(accepted_attachments, ensure_ascii=False),
+        user_message_id = await asyncio.to_thread(
+            _save_user_message,
+            cid,
+            principal.user_id,
+            display_question,
+            accepted_attachments,
         )
-        db.add(user_message)
-        # 附件从「待确认」转为「正式引用」：这次消费必须与消息行同一次提交。两者分开时，
-        # 「消息已落库、登记行还在」的中间态会让清扫任务把这条活消息引用的对象当成孤儿
-        # 删掉（对象存储没有回收站），反过来则是消息没落库却把对象永久钉在登记表里。
-        # 早于本次修复就存在的键没有登记行，消费不到是正常的——它们由消息驱动那条既有的
-        # 回收路径负责，与这里无关。
-        crud_chat.confirm_attachment_uploads(
-            db,
-            [item.get("object_key") for item in accepted_attachments],
-            user.id,
-        )
-        db.commit()
-        db.refresh(user_message)
         trace.add(
             "user_message_saved",
             "Message",
-            creates={"user_message_id": user_message.id},
+            creates={"user_message_id": user_message_id},
             params={"content": display_question, "attachments_count": len(body.attachments or [])},
             note="用户消息先写入数据库，后面的滑动窗口会排除这条当前消息，避免重复塞进 prompt。",
         )
 
         recent_text = await _build_recent_memory_text(
-            db,
-            conv,
-            current_message_id=user_message.id,
+            cid,
+            current_message_id=user_message_id,
+            # 上界取自上面那次会话快照：紧接着的用户消息写入不会推进它，取值与原先读同一个
+            # 会话对象等价，但读的位置从事件循环线程挪到了工作线程（issue #187）。
+            summary_upto=conversation.memory_summary_upto_message_id,
             trace_id=trace.trace_id,
         )
         memory_context = _build_memory_context(
-            conv,
+            conversation,
             recent_text=recent_text,
         )
         retrieval_question = _build_memory_aware_retrieval_question(effective_question, memory_context)
@@ -604,8 +751,8 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             "_build_memory_context",
             uses={
                 "conversation_id": cid,
-                "memory_summary": conv.memory_summary or "",
-                "summary_upto_message_id": conv.memory_summary_upto_message_id or 0,
+                "memory_summary": conversation.memory_summary,
+                "summary_upto_message_id": conversation.memory_summary_upto_message_id,
             },
             creates={
                 "recent_text": recent_text,
@@ -664,8 +811,8 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 "used": bool(memory_context),
                 "used_for_retrieval": False,
                 "window_turns": MEMORY_WINDOW_TURNS,
-                "summary_available": bool(conv.memory_summary),
-                "summary_upto_message_id": conv.memory_summary_upto_message_id or 0,
+                "summary_available": bool(conversation.memory_summary),
+                "summary_upto_message_id": conversation.memory_summary_upto_message_id,
             },
             "rag_gate": rag_gate,
             "mode": generation_mode,
@@ -681,7 +828,10 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             knowledge_chunks, retrieval_trace = await retrieve_knowledge(
                 retrieval_question,
                 knowledge_base_id=knowledge_base.id,
-                db=db,
+                # 关键词召回自带会话（issue #187）：stream_chat 不再持有请求级 Session，
+                # 由检索侧那一步自己「开 session → 用 → 关」，整段落在同一个工作线程里，
+                # 避免把 Session 对象递到别的线程上。
+                db=None,
                 trace_recorder=trace,
             )
             retrieval_trace = retrieval_trace or {}
@@ -689,8 +839,8 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 "used": bool(memory_context),
                 "used_for_retrieval": retrieval_question != effective_question,
                 "window_turns": MEMORY_WINDOW_TURNS,
-                "summary_available": bool(conv.memory_summary),
-                "summary_upto_message_id": conv.memory_summary_upto_message_id or 0,
+                "summary_available": bool(conversation.memory_summary),
+                "summary_upto_message_id": conversation.memory_summary_upto_message_id,
             }
             retrieval_trace["rag_gate"] = rag_gate
             retrieval_trace["mode"] = generation_mode
@@ -754,7 +904,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                     "type": "conversation",
                     "conversation": {
                         "id": cid,
-                        "title": conv.title,
+                        "title": conversation.title,
                         "knowledge_base_id": knowledge_base.id,
                         "knowledge_base_name": knowledge_base.name,
                     },
@@ -888,21 +1038,19 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                         need_rag=need_rag,
                     )
                     retrieval_trace["learning_trace"] = compact_trace_reference(trace.snapshot())
-                    assistant_message = None
+                    assistant_message_id = None
                     try:
-                        assistant_message = Message(
-                            conversation_id=cid,
-                            role="assistant",
-                            content=full,
-                            sources=json.dumps(sources, ensure_ascii=False),
-                            ragas_status="pending" if need_rag else "",
-                            retrieval_trace=json.dumps(retrieval_trace, ensure_ascii=False),
+                        # 保存 assistant 消息是另一段同步 DB 工作，同样整段落在工作线程里；
+                        # 它自己的会话由 `_save_assistant_message` 收尾（失败即回滚）。
+                        assistant_message_id = await asyncio.to_thread(
+                            _save_assistant_message,
+                            cid,
+                            full,
+                            sources,
+                            "pending" if need_rag else "",
+                            retrieval_trace,
                         )
-                        db.add(assistant_message)
-                        db.commit()
-                        db.refresh(assistant_message)
                     except Exception as exc:
-                        db.rollback()
                         logger.warning("Assistant message save failed after stream finished [trace_id=%s]: %s",
                                        trace.trace_id, exc, exc_info=True)
                         _safe_trace_add(
@@ -913,20 +1061,20 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                             note="模型回答已经生成完毕，但保存 assistant 消息失败。系统仍会结束流，避免前端误报 network error。",
                         )
 
-                    if assistant_message:
-                        _safe_trace_attach(trace, conversation_id=cid, message_id=assistant_message.id)
+                    if assistant_message_id is not None:
+                        _safe_trace_attach(trace, conversation_id=cid, message_id=assistant_message_id)
                         _safe_trace_add(
                             trace,
                             "assistant_message_saved",
                             "Message",
-                            creates={"assistant_message_id": assistant_message.id},
+                            creates={"assistant_message_id": assistant_message_id},
                             result={"ragas_status": "pending" if need_rag else ""},
                             note="assistant 消息保存成功，历史会话刷新后仍可从这条消息打开流程。",
                         )
                         if need_rag:
                             try:
                                 schedule_ragas_evaluation(
-                                    assistant_message.id,
+                                    assistant_message_id,
                                     effective_question,
                                     full,
                                     retrieved_contexts,
@@ -937,7 +1085,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                                     "ragas_scheduled",
                                     "schedule_ragas_evaluation",
                                     params={
-                                        "message_id": assistant_message.id,
+                                        "message_id": assistant_message_id,
                                         "question": effective_question,
                                         "answer_chars": len(full),
                                         "contexts_count": len(retrieved_contexts),
@@ -983,16 +1131,18 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                             )
                         try:
                             retrieval_trace["learning_trace"] = compact_trace_reference(trace.snapshot())
-                            assistant_message.retrieval_trace = json.dumps(retrieval_trace, ensure_ascii=False)
-                            db.commit()
+                            await asyncio.to_thread(
+                                _update_assistant_message_trace,
+                                assistant_message_id,
+                                json.dumps(retrieval_trace, ensure_ascii=False),
+                            )
                         except Exception as exc:
-                            db.rollback()
                             logger.warning("Assistant trace reference update failed: %s", exc, exc_info=True)
                     _safe_trace_finish(
                         trace,
-                        "done" if assistant_message else "partial",
+                        "done" if assistant_message_id is not None else "partial",
                         conversation_id=cid,
-                        message_id=assistant_message.id if assistant_message else None,
+                        message_id=assistant_message_id,
                     )
                     for payload in _trace_sse_payloads(trace):
                         yield payload
@@ -1013,16 +1163,18 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 # CancelledError 抛进挂起的 yield（其它 ASGI 实现也可能用 aclose() → GeneratorExit）；
                 # CancelledError 与 GeneratorExit 都继承自 BaseException，外层 `except Exception`
                 # 兜不住，原先写在函数体末尾的收尾逻辑不会执行。只有放进 finally 才能保证
-                # 断连路径同样关闭会话、把 trace 落到终态。finally 中不得再 yield。
+                # 断连路径同样把 trace 落到终态。finally 中不得再 yield。
+                #
+                # 这里不再需要补关会话（issue #187）：每一次写库的 Session 都在它自己的工作线程里
+                # 「开 → 用 → 关」，断开路径上不存在「借出去还没还」的连接，
+                # #58 那条「断开必须归还连接池」的保证因此从「靠这段 finally」变成结构性成立。
                 try:
                     # 正常路径已把 status 写成 done/partial/failed，这里只兜断开等异常收尾。
-                    # 用 getattr：trace 是尽力而为的旁路记录，不能因为它缺字段而漏掉 db.close()。
                     if getattr(trace, "status", None) == "running":
                         _safe_trace_finish(trace, "failed", conversation_id=cid)
                 except Exception as exc:
                     logger.warning("Learning trace teardown failed: %s", exc, exc_info=True)
                 finally:
-                    db.close()
                     # 并发槽跟数据库会话一样，必须在 finally 里归还：正常跑完、流里抛异常、
                     # 客户端断开（CancelledError/GeneratorExit）三条路径都经过这里。漏掉任何
                     # 一条，一次断连就会永久占着一个槽。
@@ -1030,6 +1182,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
     except Exception:
-        db.close()
+        # 鉴权之后、StreamingResponse 之前失败：生成器的 finally 够不到这条路径，
+        # 外层收尾必须把槽还回去，否则一次失败就永久占着一个槽（issue #183）。
         slot.release()
         raise
