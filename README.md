@@ -597,7 +597,7 @@ npm run build
 | `.github/workflows/python-tests.yml` | 后端测试 pytest (Python 3.10) | 版本对齐 `runtime.txt`（`python-3.10.11`），`pip install -r backend/requirements.txt` + `pytest`，跑 `python -m pytest -q tests` |
 | `.github/workflows/frontend-tests.yml` | 前端测试 node --test (Node 22) | `npm ci` 后跑 `npm test` |
 | `.github/workflows/build.yml` | 前端构建 vite build (Node 22) | `npm run build`，产物 `dist/` 上传为 artifact |
-| `.github/workflows/static-checks.yml` | 静态检查 (最低档) | 后端 `python -m compileall -q backend tests scripts` + `ruff check --select E4,E7,E9,F backend tests scripts`；前端 `node --check`（`src`、`tests`、`scripts` 下的 `.js`/`.mjs`）+ `npx eslint src tests scripts` |
+| `.github/workflows/static-checks.yml` | 静态检查 (最低档) | 后端 `python -m compileall -q backend tests scripts` + `ruff check --select E4,E7,E9,F backend tests scripts`；前端 `node --check`（仓库根与 `src`、`tests`、`scripts` 下的 `.js`/`.mjs`）+ `npx eslint .` |
 | `.github/workflows/e2e.yml` | 端到端验收 Playwright e2e (chromium) | 起 MySQL 8.0 服务容器 + 本地模型桩（`tests/e2e/stub_llm_server.py`，替掉全部模型上游）→ 构建前端并以 `vite preview` 托管 → 真实浏览器跑 `tests/e2e/chat.spec.mjs` → 用桩的请求日志确认检索链路真被走到（`tests/e2e/check_stub_calls.py`）→ 截图与各服务日志上传为 artifact |
 
 说明：
