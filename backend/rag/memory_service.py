@@ -1,8 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime
-
-from sqlalchemy.orm import Session
+from typing import TYPE_CHECKING
 
 from config import (
     DEEPSEEK_API_KEY,
@@ -16,6 +15,10 @@ from rag.learning_trace import append_trace_event
 from rag.llm import call_chat_text
 from service.utils_service import _clip_text
 
+if TYPE_CHECKING:
+    # 只在类型检查期导入：`service.chat_service` 反过来 import 本模块，运行期导入会成环。
+    from service.chat_service import _ConversationState
+
 
 logger = logging.getLogger(__name__)
 
@@ -24,29 +27,55 @@ logger = logging.getLogger(__name__)
 MEMORY_SUMMARY_UPDATE_FAILED_MESSAGE = "长期记忆更新失败"
 
 
+def _read_recent_messages(conversation_id: str, current_message_id: int, summary_upto: int) -> list[Message]:
+    """读最近窗口的消息。
+
+    整段同步 DB 工作（开 session → 查询 → 关 session）都发生在这个函数里，调用方一律经
+    `asyncio.to_thread` 进来，于是它整段跑在同一个工作线程上：Session 既不在事件循环线程上
+    开，也不跨线程传递（issue #187；`retrieval.py:163-166` 是本仓对该形态的成文规范）。
+
+    返回的 Message 已经是 detached 只读快照：`close()` 只释放连接、不抹掉已加载的列，
+    调用方只读 `id`/`role`/`content` 这些查询时就带回来的标量列，不会触发懒加载。
+    """
+    db = SessionLocal()
+    try:
+        return (
+            db.query(Message)
+            .filter(
+                Message.conversation_id == conversation_id,
+                Message.id < current_message_id,
+                Message.id > summary_upto,
+            )
+            .order_by(Message.id.desc())
+            .limit(max(MEMORY_WINDOW_TURNS, 1) * 2)
+            .all()
+        )
+    finally:
+        db.close()
+
+
 async def _build_recent_memory_text(
-    db: Session,
-    conversation: Conversation,
+    conversation_id: str,
     current_message_id: int,
+    summary_upto: int = 0,
     trace_id: str | None = None,
 ) -> str:
-    summary_upto = conversation.memory_summary_upto_message_id or 0
-    recent_messages = (
-        db.query(Message)
-        .filter(
-            Message.conversation_id == conversation.id,
-            Message.id < current_message_id,
-            Message.id > summary_upto,
-        )
-        .order_by(Message.id.desc())
-        .limit(max(MEMORY_WINDOW_TURNS, 1) * 2)
-        .all()
+    """构造最近窗口文本。
+
+    早先这个协程自己接一个请求级 `Session`，查询直接跑在事件循环线程上；现在它只收标量，
+    真正的查询交给 `_read_recent_messages` 在工作线程里完成。
+    """
+    recent_messages = await asyncio.to_thread(
+        _read_recent_messages,
+        conversation_id,
+        current_message_id,
+        summary_upto or 0,
     )
     return await _format_recent_memory_messages(list(reversed(recent_messages)), trace_id=trace_id)
 
 
 def _build_memory_context(
-    conversation: Conversation,
+    conversation: "_ConversationState",
     recent_text: str | None = None,
 ) -> str:
     summary = (conversation.memory_summary or "").strip()
@@ -133,20 +162,17 @@ def _schedule_memory_summary_update(conversation_id: str, trace_id: str | None =
         )
 
 
-async def _update_memory_summary_from_sliding_window(conversation_id: str, trace_id: str | None = None):
+def _read_conversation_window(conversation_id: str) -> tuple[str, list[Message]] | None:
+    """读「会话当前摘要 + 摘要上界之后的消息」。
+
+    整段同步 DB 工作跑在工作线程里（见 `_read_recent_messages` 的说明）。会话不存在返回
+    None，让调用方区分「没有会话」与「摘要为空」。消息同样是 detached 只读快照。
+    """
     db = SessionLocal()
     try:
         conversation = db.query(Conversation).filter_by(id=conversation_id).first()
         if not conversation:
-            append_trace_event(
-                trace_id,
-                "memory_summary_update_skipped",
-                "_update_memory_summary_from_sliding_window",
-                result={"reason": "conversation_not_found"},
-                note="长期记忆更新跳过：会话不存在。",
-            )
-            return
-
+            return None
         summary_upto = conversation.memory_summary_upto_message_id or 0
         messages = (
             db.query(Message)
@@ -157,6 +183,64 @@ async def _update_memory_summary_from_sliding_window(conversation_id: str, trace
             .order_by(Message.id.asc())
             .all()
         )
+        return conversation.memory_summary or "", messages
+    finally:
+        db.close()
+
+
+def _read_memory_summary(conversation_id: str) -> str | None:
+    """读会话当前的长期摘要（已 strip）。会话不存在返回 None，同样是为了区分两种「空」。"""
+    db = SessionLocal()
+    try:
+        conversation = db.query(Conversation).filter_by(id=conversation_id).first()
+        if not conversation:
+            return None
+        return (conversation.memory_summary or "").strip()
+    finally:
+        db.close()
+
+
+def _write_memory_summary_text(conversation_id: str, summary: str, summary_upto_message_id: int | None = None) -> None:
+    """把新的长期摘要写回会话，整段同步 DB 工作在工作线程里完成。
+
+    `summary_upto_message_id` 为 None 表示只改摘要文本（二次压缩不动上界）。会话在读取与
+    写入之间被删掉时静默跳过——这条链路本来就是尽力而为的旁路，不该让主回答失败。
+    """
+    db = SessionLocal()
+    try:
+        conversation = db.query(Conversation).filter_by(id=conversation_id).first()
+        if not conversation:
+            return
+        conversation.memory_summary = summary
+        if summary_upto_message_id is not None:
+            conversation.memory_summary_upto_message_id = summary_upto_message_id
+        conversation.memory_updated_at = datetime.now()
+        db.commit()
+    finally:
+        db.close()
+
+
+async def _update_memory_summary_from_sliding_window(conversation_id: str, trace_id: str | None = None):
+    """把滑出最近窗口的轮次并进长期摘要。
+
+    读、写两段同步 DB 工作各自在自己的工作线程里「开 session → 用 → 关」：中间夹着一次模型
+    外呼（`await _summarize_conversation_memory`），跨不过去一个 Session，所以这里按「每步用
+    短生命周期 session」落地（issue #187 验收第 3 条给的两种修法之一）。早先的写法是把一个
+    请求级 Session 一直握在协程里，`db.query/commit/close` 全部落在事件循环线程上。
+    """
+    try:
+        window = await asyncio.to_thread(_read_conversation_window, conversation_id)
+        if window is None:
+            append_trace_event(
+                trace_id,
+                "memory_summary_update_skipped",
+                "_update_memory_summary_from_sliding_window",
+                result={"reason": "conversation_not_found"},
+                note="长期记忆更新跳过：会话不存在。",
+            )
+            return
+
+        current_summary, messages = window
         turns = _group_messages_into_turns(messages)
         if len(turns) <= MEMORY_WINDOW_TURNS:
             append_trace_event(
@@ -170,7 +254,7 @@ async def _update_memory_summary_from_sliding_window(conversation_id: str, trace
                 },
                 note="长期记忆更新跳过：未摘要轮次仍在最近窗口内，没有会话滑出。",
             )
-            await _compact_summary_if_needed(db, conversation, trace_id)
+            await _compact_summary_if_needed(conversation_id, trace_id)
             return
 
         slipped_turns = turns[: -MEMORY_WINDOW_TURNS]
@@ -186,7 +270,7 @@ async def _update_memory_summary_from_sliding_window(conversation_id: str, trace
             )
             return
 
-        previous_summary = (conversation.memory_summary or "").strip()
+        previous_summary = (current_summary or "").strip()
         append_trace_event(
             trace_id,
             "memory_summary_update_triggered",
@@ -212,26 +296,25 @@ async def _update_memory_summary_from_sliding_window(conversation_id: str, trace
                 note="模型摘要失败，系统使用可读文本兜底合并，避免滑出窗口记忆直接丢失。",
             )
 
-        conversation.memory_summary = next_summary.strip()
-        conversation.memory_summary_upto_message_id = max(message.id for message in slipped_messages)
-        conversation.memory_updated_at = datetime.now()
-        db.commit()
+        summary_text = next_summary.strip()
+        summary_upto = max(message.id for message in slipped_messages)
+        await asyncio.to_thread(_write_memory_summary_text, conversation_id, summary_text, summary_upto)
         append_trace_event(
             trace_id,
             "memory_summary_updated",
             "_summarize_conversation_memory",
             creates={
-                "memory_summary": conversation.memory_summary,
-                "summary_upto_message_id": conversation.memory_summary_upto_message_id,
+                "memory_summary": summary_text,
+                "summary_upto_message_id": summary_upto,
             },
             result={
-                "summary_chars": len(conversation.memory_summary or ""),
+                "summary_chars": len(summary_text),
                 "slipped_turns": len(slipped_turns),
             },
             note="滑出最近窗口的会话已写入长期记忆，并推进 summary_upto_message_id，避免后续重复摘要。",
         )
 
-        await _compact_summary_if_needed(db, conversation, trace_id)
+        await _compact_summary_if_needed(conversation_id, trace_id)
     except Exception as exc:
         logger.warning(
             "Conversation memory summary update failed: conversation_id=%s error=%s",
@@ -246,23 +329,24 @@ async def _update_memory_summary_from_sliding_window(conversation_id: str, trace
             result={"error": MEMORY_SUMMARY_UPDATE_FAILED_MESSAGE},
             note="滑出窗口长期记忆更新失败，但不会影响主回答完成。",
         )
-    finally:
-        db.close()
 
 
 async def _maybe_compact_memory_summary(conversation_id: str, trace_id: str | None = None):
-    db = SessionLocal()
-    try:
-        conversation = db.query(Conversation).filter_by(id=conversation_id).first()
-        if not conversation:
-            return
-        await _compact_summary_if_needed(db, conversation, trace_id)
-    finally:
-        db.close()
+    """会话存在时检查长期摘要是否超过上限。会话不存在由 `_compact_summary_if_needed` 静默返回。"""
+    await _compact_summary_if_needed(conversation_id, trace_id)
 
 
-async def _compact_summary_if_needed(db: Session, conversation: Conversation, trace_id: str | None = None) -> None:
-    summary = (conversation.memory_summary or "").strip()
+async def _compact_summary_if_needed(conversation_id: str, trace_id: str | None = None) -> None:
+    """长期摘要超过上限时再做一次压缩。
+
+    早先这个协程接的是「调用方手里的 `db` + `Conversation` 对象」，于是它必然在事件循环
+    线程上写库——正是 issue #187 边界一节点名的那个坑（调用方把同一个 `db` 一路传下来）。
+    改成只收 `conversation_id`，摘要的读与写各自在自己那一段工作线程里完成，
+    「开 session → 用 → 关」不跨线程，也不再和调用方共用会话。
+    """
+    summary = await asyncio.to_thread(_read_memory_summary, conversation_id)
+    if summary is None:
+        return
     summary_length = len(summary)
     if not summary or summary_length <= MEMORY_SUMMARY_MAX_CHARS:
         return
@@ -280,9 +364,8 @@ async def _compact_summary_if_needed(db: Session, conversation: Conversation, tr
     )
     next_summary = await _summarize_conversation_memory("", summary)
     if not next_summary:
-        conversation.memory_summary = _clip_text(summary, MEMORY_SUMMARY_MAX_CHARS)
-        conversation.memory_updated_at = datetime.now()
-        db.commit()
+        trimmed = _clip_text(summary, MEMORY_SUMMARY_MAX_CHARS)
+        await asyncio.to_thread(_write_memory_summary_text, conversation_id, trimmed)
         append_trace_event(
             trace_id,
             "memory_summary_compaction_failed",
@@ -292,14 +375,13 @@ async def _compact_summary_if_needed(db: Session, conversation: Conversation, tr
         )
         return
 
-    conversation.memory_summary = next_summary.strip()
-    conversation.memory_updated_at = datetime.now()
-    db.commit()
+    compacted = next_summary.strip()
+    await asyncio.to_thread(_write_memory_summary_text, conversation_id, compacted)
     append_trace_event(
         trace_id,
         "memory_summary_compacted",
         "_compact_summary_if_needed",
-        creates={"memory_summary": conversation.memory_summary},
+        creates={"memory_summary": compacted},
         note="长期记忆已完成二次摘要并压缩到上限内。",
     )
 
