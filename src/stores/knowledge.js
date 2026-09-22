@@ -26,8 +26,12 @@ export const useKnowledgeStore = defineStore('knowledge', () => {
   // 已取回区间的末位 id（不是列表末位）：loadMoreKnowledgeBases 的游标。
   let knowledgeBaseCursor = null
 
+  // 归一化守卫：非对象、以及「是对象但 id 缺失」同样属于脏数据（issue #209）。
+  // 后者会穿透成 `{ id: undefined, ... }`：它既没法按 id 合并，也当不了翻页游标，
+  // 落进列表就是一条点不开、也没名字的空条目，还会把 hasKnowledgeBases 空态打成 true。
+  // 判据只认 `== null`（undefined / null），空串与 0 都是调用方给的明确 id，照常入库。
   function normalizeKnowledgeBase(base) {
-    if (!base || typeof base !== 'object') {
+    if (!base || typeof base !== 'object' || base.id == null) {
       return null
     }
 
@@ -84,12 +88,16 @@ export const useKnowledgeStore = defineStore('knowledge', () => {
         after_id: knowledgeBaseCursor,
       })
       const { page, hasMore } = splitKnowledgeBasePage(Array.isArray(response) ? response : [])
+      // 游标与首屏同源：取自**归一化后**那一页的末位，而不是原始末位。取原始末位时，
+      // 一个缺 id 的脏行落在页尾就会让游标算不出来（issue #209），这一页之后的内容
+      // 从此再也加载不出来 —— 脏行已经被丢掉不入列，却仍旧把翻页入口静默掐断。
+      const normalized = page.map(normalizeKnowledgeBase).filter(Boolean)
       const known = new Set(knowledgeBases.value.map((item) => item.id))
-      const fresh = page.map(normalizeKnowledgeBase).filter((item) => item && !known.has(item.id))
+      const fresh = normalized.filter((item) => !known.has(item.id))
       if (fresh.length) {
         knowledgeBases.value = [...knowledgeBases.value, ...fresh]
       }
-      const nextCursor = page[page.length - 1]?.id ?? null
+      const nextCursor = normalized[normalized.length - 1]?.id ?? null
       if (nextCursor !== null) knowledgeBaseCursor = nextCursor
       hasMoreKnowledgeBases.value = hasMore && nextCursor !== null
       return fresh
