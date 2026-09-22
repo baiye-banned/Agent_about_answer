@@ -17,6 +17,18 @@ function streamFromChunks(chunks) {
   })
 }
 
+function streamFromBytes(chunks) {
+  return new ReadableStream({
+    pull(controller) {
+      if (!chunks.length) {
+        controller.close()
+        return
+      }
+      controller.enqueue(chunks.shift())
+    },
+  })
+}
+
 test('extractSseDataLines reads data lines and ignores non-data lines', () => {
   assert.deepEqual(
     extractSseDataLines('event: message\ndata: hello\ndata: world\nid: 1'),
@@ -95,6 +107,118 @@ test('readStreamEvents returns false when stream ends without done marker', asyn
   const body = streamFromChunks(['data: hello\n\n'])
 
   assert.equal(await readStreamEvents(body, () => {}), false)
+})
+
+// issue #134：连接在某个 data: 帧中途断开时，残帧不得当作正文追加进回答。
+// 注意与「有意的纯文本 data: 载荷」区分：纯文本兜底本身是受支持的（见上一个用例），
+// 被丢弃的只是「长得像协议帧却解析不出来」的那一类。
+test('readStreamEvents 丢弃 JSON 中途被截断的末帧，不把协议原文当正文（#134）', async () => {
+  const messages = []
+  const body = streamFromChunks([
+    'data: {"type":"token","content":"答案第一句。"}\n\n',
+    'data: {"type":"token","content":"答案第二句，然后服务器在帧',
+  ])
+
+  const doneReceived = await readStreamEvents(body, (content, event) => messages.push([content, event]))
+
+  assert.equal(doneReceived, false)
+  assert.deepEqual(messages, [['答案第一句。', { type: 'token', content: '答案第一句。' }]])
+
+  // 同一用例内锁定：flush 尾帧这件事本身是有意为之，不能被一起改掉——
+  // 正常收尾的 data: [DONE] 也常常不带尾随空行。
+  const doneMessages = []
+  const doneBody = streamFromChunks([
+    'data: {"type":"token","content":"答案"}\n\n',
+    'data: [DONE]',
+  ])
+
+  assert.equal(
+    await readStreamEvents(doneBody, (content, event) => doneMessages.push([content, event])),
+    true
+  )
+  assert.deepEqual(doneMessages, [['答案', { type: 'token', content: '答案' }]])
+})
+
+test('readStreamEvents 丢弃被截断的控制帧，既不降级为正文也不投递控制事件（#134）', async () => {
+  const fragments = [
+    'data: {"type":"sources","sources":[',
+    'data: {"type":"error","mess',
+    'data: {"type":"reset","rea',
+  ]
+
+  for (const fragment of fragments) {
+    const messages = []
+    const doneReceived = await readStreamEvents(
+      streamFromChunks([fragment]),
+      (content, event) => messages.push([content, event])
+    )
+
+    assert.equal(doneReceived, false, `${fragment} 不得被当作流结束标记`)
+    assert.deepEqual(messages, [], `${fragment} 不得进入正文或控制事件`)
+  }
+})
+
+test('readStreamEvents 丢弃已成帧却 JSON 非法的协议帧，后续帧照常派发（#134）', async () => {
+  const messages = []
+  const body = streamFromChunks([
+    'data: {"type":"token","content":"前半"}\n\n',
+    'data: {"type":"token","content":"坏帧}\n\n',
+    'data: {"type":"token","content":"后半"}\n\n',
+    'data: [DONE]\n\n',
+  ])
+
+  const doneReceived = await readStreamEvents(body, (content, event) => messages.push([content, event]))
+
+  assert.equal(doneReceived, true)
+  assert.deepEqual(messages, [
+    ['前半', { type: 'token', content: '前半' }],
+    ['后半', { type: 'token', content: '后半' }],
+  ])
+})
+
+test('readStreamEvents 跨 chunk 边界切开的汉字被完整还原（流式解码状态不能丢）', async () => {
+  const encoder = new TextEncoder()
+  const messages = []
+  const frame = encoder.encode('data: {"type":"token","content":"答案好好"}\n\n')
+  // 切点落在第一个「好」的三个字节中间：解码器必须把半个字符留到下一片再拼。
+  const cut = frame.indexOf(encoder.encode('好')[0]) + 1
+
+  const doneReceived = await readStreamEvents(
+    streamFromBytes([frame.slice(0, cut), frame.slice(cut), encoder.encode('data: [DONE]\n\n')]),
+    (content, event) => messages.push([content, event])
+  )
+
+  assert.equal(doneReceived, true)
+  assert.deepEqual(messages, [['答案好好', { type: 'token', content: '答案好好' }]])
+})
+
+test('readStreamEvents 在流结束时 flush 解码器，末端多字节字符不再被静默吞掉（#134）', async () => {
+  const encoder = new TextEncoder()
+  const messages = []
+  const bytes = encoder.encode('data: 你好')
+  // 末字符「好」共 3 字节，只到达前 2 字节：不 flush 时解码器会把这两个字节留在内部丢掉。
+  const body = streamFromBytes([bytes.slice(0, bytes.length - 1)])
+
+  const doneReceived = await readStreamEvents(body, (content) => messages.push(content))
+
+  assert.equal(doneReceived, false)
+  // 完整字符「你」保留下来，残字节按解码器约定显形为替换字符（可见的丢失信号），而不是无声消失。
+  assert.deepEqual(messages, ['你�'])
+})
+
+test('readStreamEvents 在 CRLF 被分片切开时仍能识别 [DONE] 收尾（#134）', async () => {
+  const encoder = new TextEncoder()
+  const messages = []
+  const body = streamFromBytes([
+    encoder.encode('data: {"type":"token","content":"答案"}\r\n\r\n'),
+    encoder.encode('data: [DONE]\r'),
+    encoder.encode('\n'),
+  ])
+
+  const doneReceived = await readStreamEvents(body, (content, event) => messages.push([content, event]))
+
+  assert.equal(doneReceived, true)
+  assert.deepEqual(messages, [['答案', { type: 'token', content: '答案' }]])
 })
 
 // 协议契约（issue #21）：后备模型接管前，后端下发 {"type":"reset"} 控制事件。

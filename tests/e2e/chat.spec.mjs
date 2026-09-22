@@ -36,6 +36,38 @@ const ANSWER_PREFIX = 'E2E-STUB'
 
 const QUESTION = '员工出差回来多久内必须提交报销？'
 
+// ---------------------------------------------------------------------------
+// 样式护栏（issue #125）
+//
+// 这条用例原先只断言 DOM 与文案，对 CSS 完全不设防：tailwind v4 迁移里最危险的
+// 失败模式是「构建绿、类名还在，但样式整段消失」—— 例如样式入口漏改时 preflight 与
+// 依赖主题变量的工具类会一起丢，而用例照样全绿。下面把两类最易静默丢失的值钉住：
+//
+//   1. 走 `@config` 从 tailwind.config.js 桥接过来的自定义令牌（brand 色阶、panel 阴影）。
+//      桥接一断，类名仍在源码里、DOM 也照常渲染，只是产物里没有对应的规则。
+//   2. v4 改过默认值的裸 `border` 边框色。v4 的 preflight 是 `border: 0 solid`，
+//      简写不含颜色 ⇒ `border-color` 回落到 `currentColor`；v3 默认是 gray-200。
+//      仓库里只有 1 处元素真的落在默认值上（其余都带显式色号），肉眼巡检极难覆盖。
+//   3. v4 一并改掉的 ring 默认色（issue #136）。v4 的 ring 宽度工具类是
+//      `... var(--tw-ring-color, currentcolor)`，preflight 又把该变量置为 initial，
+//      于是「写了环宽、没写环色」的元素回退到自身文字色；v3 的默认是 blue-500 @ 50%。
+//      侧栏选区态 `ring-1 ring-brand-200` 正是这个形态（`brand` 色阶没有 200 键，
+//      该类两版都不生成，颜色只能走默认值），而它只在管理模式勾选会话时才渲染。
+// ---------------------------------------------------------------------------
+
+// brand-600 = #1d4ed8；panel 阴影 = 0 10px 30px rgba(15, 23, 42, 0.08)，两者都来自 tailwind.config.js。
+const BRAND_600_RGB = 'rgb(29, 78, 216)'
+// v3 preflight 的裸边框默认色 gray-200 = #e5e7eb；迁移后必须仍是这个颜色。
+const BORDER_DEFAULT_RGB = 'rgb(229, 231, 235)'
+// 文字色：用来证明裸边框没有退化成 currentColor（那正是这次迁移的静默失败形态）。
+const BODY_TEXT_RGB = 'rgb(31, 41, 55)'
+// v3 preflight 的 ring 默认色 blue-500 @ 50%（`rgb(59 130 246 / .5)`）。断言打在
+// **合成后的 ring 层**上而不是 `--tw-ring-color` 变量：box-shadow 由浏览器归一化成
+// sRGB，与产物里的记法无关（产物压成了 `#3b82f680`，自定义属性则原样保留）。
+const RING_DEFAULT_LAYER = /rgba\(59, 130, 246, 0\.5\) 0px 0px 0px 1px/
+// 侧栏选区态元素自身的文字色 brand-700；ring 若退回 currentcolor 就会画成这个色。
+const BRAND_700_LAYER = /rgb\(30, 64, 175\) 0px 0px 0px 1px/
+
 // 知识库名带上运行标识：重名会被后端拒绝（「知识库名称已存在」），
 // 而 CI 复跑、本地连跑都不该互相干扰。
 const RUN_ID =
@@ -69,6 +101,44 @@ test('登录 → 建库 → 上传 → 提问 → 流式作答 → 引用可溯�
   await test.step('登录', async () => {
     await page.goto('/login')
     await expect(page.getByRole('heading', { name: '企业知识库智能问答系统' })).toBeVisible()
+
+    // 样式护栏：趁还在登录页，把自定义主题令牌钉死。
+    // 这两个值分别覆盖 tailwind.config.js 的 colors.brand 与 boxShadow.panel ——
+    // 走 @config 桥接的配置一旦没被读到，构建依旧成功、DOM 依旧渲染，只有这里会红。
+    const brandMark = page.locator('div.bg-brand-600').first()
+    await expect(brandMark).toBeVisible()
+    await expect(brandMark).toHaveCSS('background-color', BRAND_600_RGB)
+    await expect(brandMark).toHaveCSS('box-shadow', /rgba\(15, 23, 42, 0\.08\) 0px 10px 30px/)
+
+    // 样式护栏：裸 `border` 的默认色必须仍是 v3 的 gray-200，而不是退化成 currentColor。
+    // 页面里没有「无显式色号的边框」元素可断言（仓库仅 1 处，在 Trace 面板内），
+    // 因此这里临时挂一个只带 `border` 的节点，测的是产物样式表本身的行为：
+    // 它若有问题，同一份 CSS 在真实元素上同样会出问题。断言后立即移除，不干扰后续步骤。
+    //
+    // 颜色必须归一化后再比：v3 产物写 `border-color:#e5e7eb`，浏览器回 `rgb(229, 231, 235)`；
+    // v4 产物写 `oklch(92.8% .006 264.531)`，浏览器照样原样回 `oklch(...)`。
+    // 两者是同一个颜色，但字符串不等 —— 直接比字符串会在完全正确的迁移上判红。
+    // 这里把颜色真的画进 canvas 再读像素，得到与记法无关的 sRGB 三元组。
+    const borderColor = await page.evaluate(() => {
+      const probe = document.createElement('div')
+      probe.className = 'border'
+      document.body.appendChild(probe)
+      const computed = getComputedStyle(probe).borderTopColor
+      probe.remove()
+
+      const canvas = document.createElement('canvas')
+      canvas.width = 1
+      canvas.height = 1
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })
+      ctx.fillStyle = '#000'
+      ctx.fillStyle = computed
+      ctx.fillRect(0, 0, 1, 1)
+      const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data
+      return `rgb(${r}, ${g}, ${b})`
+    })
+    expect(borderColor).toBe(BORDER_DEFAULT_RGB)
+    expect(borderColor).not.toBe(BODY_TEXT_RGB)
+
     await page.getByPlaceholder('请输入用户名').fill(LOGIN_USER)
     await page.getByPlaceholder('请输入密码').fill(LOGIN_PASSCODE)
     await page.getByRole('button', { name: '登录' }).click()
@@ -198,5 +268,42 @@ test('登录 → 建库 → 上传 → 提问 → 流式作答 → 引用可溯�
     await expect(drawer.getByText(/rerank\s+[\d.]/).first()).toBeVisible()
     await expect(drawer.getByText(/RRF\s+[\d.]/).first()).toBeVisible()
     await shot(page, testInfo, '7-sources-drawer')
+  })
+
+  await test.step('ring 默认色护栏：产物样式表 + 侧栏选中态', async () => {
+    // 参考资料抽屉还开着，它的遮罩会拦住侧栏点击；先关掉。
+    await page.keyboard.press('Escape')
+    await expect(page.locator('.el-drawer').filter({ hasText: '参考资料' })).toBeHidden()
+
+    // 第一段：产物样式表本身。临时挂一个「只有环宽、没有环色」的节点 —— 这正是默认值
+    // 那条路径，且不依赖任何 UI 状态。v4 未回填时它算出来的是元素文字色（currentcolor），
+    // 与 v3 的 blue-500 @ 50% 肉眼可辨（实测该元素截图逐像素最大通道差 119）。
+    const probeShadow = await page.evaluate(() => {
+      const node = document.createElement('div')
+      node.className = 'ring-1'
+      document.body.appendChild(node)
+      const shadow = getComputedStyle(node).boxShadow
+      node.remove()
+      return shadow
+    })
+    expect(probeShadow).toMatch(RING_DEFAULT_LAYER)
+    // 反向断言：不得是 currentcolor 的回退结果，否则这条护栏在退化的产物上也会绿。
+    expect(probeShadow).not.toContain(`${BODY_TEXT_RGB} 0px 0px 0px 1px`)
+
+    // 第二段：真实元素。侧栏选区态的 `ring-1` 只在管理模式勾选会话时渲染，
+    // 把合成后的 ring 层钉在这个元素上 —— 默认值再漂移一次，这条会直接红。
+    const historyHeader = page
+      .locator('div.flex.items-center.justify-between.px-4.py-3')
+      .filter({ hasText: '历史对话' })
+    await historyHeader.locator('button.el-button').first().click()
+
+    await page.getByRole('button', { name: '全选', exact: true }).click()
+    const selectedRow = page.locator('aside button.ring-1').first()
+    await expect(selectedRow).toBeVisible()
+    await expect(selectedRow).toHaveCSS('box-shadow', RING_DEFAULT_LAYER)
+    // 该元素同时带 `text-brand-700`，按 v4 的 fallback 会画出 brand-700；出现这个颜色
+    // 就说明环色又回到了元素文字色。
+    await expect(selectedRow).not.toHaveCSS('box-shadow', BRAND_700_LAYER)
+    await shot(page, testInfo, '8-ring-selected')
   })
 })

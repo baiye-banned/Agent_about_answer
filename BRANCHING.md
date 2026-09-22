@@ -30,16 +30,16 @@
 
 ### 分支保护（仓库设置，不由代码强制）
 
-约定是 `main` 与 `develop` 都不能直接 push、必须通过 PR 合入，`main` 还要加「合并前 CI 通过」。
+约定是 `main` 与 `develop` 都不能直接 push、必须通过 PR 合入，`main` 还要满足「合并前 CI 通过」。
 
-**现状（2026-09-20 核实）：`main` 与 `develop` 都已开启保护**，且都是 `allow_deletions=false`、`allow_force_pushes=false`（`gh api repos/baiye-banned/Agent_about_answer/branches/main/protection`，`develop` 同理）；还没开的是「Require a pull request」与「Require status checks」。其余相关设置：`allow_merge_commit=true`、`allow_squash_merge=true`、`allow_rebase_merge=true`、`allow_auto_merge=false`、`delete_branch_on_merge=true`。
+**现状（2026-09-21 核实）：`main` 与 `develop` 都已开启保护**，且都是 `allow_deletions=false`、`allow_force_pushes=false`（`gh api repos/baiye-banned/Agent_about_answer/branches/main/protection`，`develop` 同理）。两边都已勾选「Require a pull request before merging」（`required_approving_review_count=0`，即只要求走 PR、不要求 approve）；差别在必需检查：`main` 已设 9 条（`strict=false`，不要求分支先跟上 base），`develop` 未设必需检查。其余相关设置：`allow_merge_commit=true`、`allow_squash_merge=true`、`allow_rebase_merge=true`、`allow_auto_merge=false`、`delete_branch_on_merge=true`。
 
 **这些保护只是兜底，不能当作流程正确性的前提。** 保护规则和仓库设置是两处独立配置，`delete_branch_on_merge` 由平台在合并 PR 时执行，不区分 head 是短分支还是长期分支（详见 §3「回同步工作流」）。2026-09-20 01:36Z 事故发生时两个分支都还没有任何保护（事故当天的清理线现场确认仓库无 ruleset、无 branch protection），`main` 正是这样被自动删掉的；本文这两条保护是事故之后才补上的。把安全寄托在"保护没被改动"上，等于把一个删除 `main` 的开关留在别人手里；正确的做法是让长期分支永远不出现在 PR 的 head 位置。
 
 管理员开启保护时至少需要：
 
-- Require a pull request before merging：`main` 与 `develop` 都勾。
-- Require status checks to pass：至少加在 `main` 上（当前仓库已注册的检查来自 `前端构建` / `前端测试` / `后端测试` / `静态检查` / `Secret Scan` / `PR 标题校验` / `PR 描述校验`）。
+- Require a pull request before merging：`main` 与 `develop` 都勾。**现状：两者都已勾选**，合并审查人数要求为 0（只要求走 PR、不要求 approve）。
+- Require status checks to pass：至少加在 `main` 上。**现状：`main` 已设 9 条必需检查**——`node --test (Node 22)`、`Playwright e2e (chromium)`、`PR 标题规范校验`、`PR 描述必填节校验`、`pytest (Python 3.10)`、`Scan for secrets`、`vite build (Node 22)`、`后端静态检查 (compileall + ruff, Python 3.10)`、`前端静态检查 (node --check + eslint, Node 22)`；`develop` 尚未设置，是本条保留的建议项。
 - **保留 Allow merge commits**：发布 PR 和回同步 PR 都依赖 merge commit，关掉它这两条流程就跑不通。squash 可以同时开着，日常 PR 靠约定选 squash。
 - 不要开 Allow force pushes 和 Allow deletions：本流程明确不改写历史、不删 `main` / `develop`。
 

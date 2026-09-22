@@ -95,7 +95,7 @@
         >
           <div
             :class="[
-              'group relative max-w-[82%] rounded-lg px-4 py-3 shadow-sm',
+              'group relative max-w-[82%] rounded-lg px-4 py-3 shadow-xs',
               message.role === 'user'
                 ? 'bg-brand-600 text-white'
                 : 'border border-slate-200 bg-white text-slate-700',
@@ -174,7 +174,7 @@
 
             <div
               v-if="message.role === 'assistant'"
-              class="pointer-events-none absolute right-2 top-2 flex rounded-md border border-slate-200 bg-white/95 opacity-0 shadow-sm transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100"
+              class="pointer-events-none absolute right-2 top-2 flex rounded-md border border-slate-200 bg-white/95 opacity-0 shadow-xs transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100"
             >
               <el-tooltip content="复制" placement="bottom">
                 <el-button link :icon="CopyDocument" @click="copyMessage(message.content)" />
@@ -187,7 +187,7 @@
         </article>
 
         <article v-if="isCurrentConversationStreaming" class="flex justify-start">
-          <div class="max-w-[82%] rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-sm">
+          <div class="max-w-[82%] rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-xs">
             <div class="mb-2 flex items-center gap-2 text-xs text-slate-500">
               <el-icon><Loading /></el-icon>
               <span>AI 正在生成</span>
@@ -305,11 +305,11 @@
                   RRF {{ Number(source.rrf_score).toFixed(3) }}
                 </span>
                 <span
-                  v-for="route in source.routes || []"
-                  :key="`${source.index}-${route.route}-${route.rank}`"
+                  v-for="sourceRoute in source.routes || []"
+                  :key="`${source.index}-${sourceRoute.route}-${sourceRoute.rank}`"
                   class="rounded bg-slate-100 px-1.5 py-0.5"
                 >
-                  {{ route.route }} #{{ route.rank }}
+                  {{ sourceRoute.route }} #{{ sourceRoute.rank }}
                 </span>
               </div>
               <p v-if="source.rerank_reason" class="mt-1 text-[11px] leading-4 text-slate-400">
@@ -355,15 +355,15 @@
           <el-tab-pane label="检索过程" name="retrieval">
             <el-collapse v-if="retrievalRoutes.length">
               <el-collapse-item
-                v-for="route in retrievalRoutes"
-                :key="route.route"
-                :title="`${route.route} · ${route.count || 0} 条`"
+                v-for="retrievalRoute in retrievalRoutes"
+                :key="retrievalRoute.route"
+                :title="`${retrievalRoute.route} · ${retrievalRoute.count || 0} 条`"
               >
-                <p class="mb-2 whitespace-pre-wrap text-xs text-slate-500">Query：{{ route.query }}</p>
+                <p class="mb-2 whitespace-pre-wrap text-xs text-slate-500">Query：{{ retrievalRoute.query }}</p>
                 <div class="space-y-2">
                   <div
-                    v-for="item in route.items || []"
-                    :key="`${route.route}-${item.file_id}-${item.chunk_id}`"
+                    v-for="item in retrievalRoute.items || []"
+                    :key="`${retrievalRoute.route}-${item.file_id}-${item.chunk_id}`"
                     class="rounded-md border border-slate-200 bg-white p-2 text-xs"
                   >
                     <p class="font-medium text-slate-700">{{ item.file_name || '未命名资料' }} #{{ item.chunk_id }}</p>
@@ -745,7 +745,7 @@ async function openTrace(message) {
       ? await chatAPI.getMessageTrace(message.id)
       : await chatAPI.getTrace(traceId)
     activeTrace.value = normalizeTrace(response)
-  } catch (error) {
+  } catch {
     if (!activeTrace.value?.events?.length) {
       ElMessage.warning('暂无可加载的流程详情')
     }

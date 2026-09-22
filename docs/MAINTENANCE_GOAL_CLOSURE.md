@@ -62,7 +62,7 @@ Commands run from the repository root:
 ## Residual Risks
 
 - Node and Python test discovery have been made explicit in `package.json` and `pytest.ini`; future nested Node tests and Python `test_*.py` files under `tests/` should stay inside the baseline.
-- Milvus migration is the largest backend risk. Existing Chroma data is not automatically migrated, and the upload/query/delete loop still deserves a focused runtime acceptance pass.
+- Milvus migration is the largest backend risk. Existing Chroma data is not automatically migrated. The upload/query/delete loop has since had its runtime acceptance pass: `tests/test_milvus_acceptance.py` ran green on `2026-09-22` (`7 passed` in `13.10s` locally) against a real Milvus Lite database created in a temporary directory, covering upload and re-upload replace, cosine query, delete, knowledge-base isolation, index rebuild, and the `top_k` / missing-collection window; the same module is part of the `507 passed` backend suite on the Python 3.10 CI runner. The boundary of that run is embedded Milvus Lite: a deployed Milvus server is still unverified, and the embedding function is a deterministic stand-in, so the real provider path is not covered here.
 - Several external providers are mocked in tests. DeepSeek, DashScope embedding, DashScope rerank, OSS, and RAGAS runtime behavior still need real-environment smoke checks.
 - Some terminal output showed mojibake for Chinese strings. Prior tests passed, but the final UI text should be checked in a browser or by reading files with confirmed UTF-8 handling.
 - `Knowledge.vue` batch delete/upload feedback and `chat store` RAGAS polling/message merge are now covered by narrow behavior-level Node tests (`tests/knowledgeFeedback.test.js`, `tests/chatStore.test.js`). The view-side logic was extracted into `src/utils/knowledgeFeedback.js` to make it testable in plain Node, so the Vue SFC glue itself (which helper it calls, the toast level, `uploading`/`uploadPercent` reset) is still only verified by reading, not executed by tests.
@@ -75,13 +75,13 @@ Immediate next step:
 
 Next batch:
 
-2. Milvus acceptance goal: verify index rebuild, upload, query, knowledge-base isolation, and deletion cleanup end to end.
+2. Done: the Milvus acceptance goal verified index rebuild, upload, query, knowledge-base isolation, and deletion cleanup end to end on `2026-09-22`; what remains open is the deployed-server and real-embedding-provider boundary (see [Residual Risks](#residual-risks)).
    - Acceptance tests: `tests/test_milvus_acceptance.py` (see [Acceptance Test Index](#acceptance-test-index)).
-3. Retrieval acceptance goal: verify query planning, vector recall, keyword recall, RRF fusion, and rerank with focused behavior tests.
+3. Done: the retrieval acceptance goal verified query planning, vector recall, keyword recall, RRF fusion, and rerank with focused behavior tests on `2026-09-22`; what remains open is the provider boundary - the planner model call, the embedding backend, and the rerank HTTP provider are stubbed in the offline cases (live provider behavior is goal 4).
    - Acceptance tests: `tests/test_retrieval_acceptance.py` (see [Acceptance Test Index](#acceptance-test-index)).
 4. Rerank and provider goal: smoke-test DashScope rerank, LLM fallback, embedding, and DeepSeek connectivity in the target environment.
    - Acceptance tests: `tests/test_provider_smoke.py` plus the offline smoke entry point `scripts/smoke_providers.py` (`--live` for the real endpoints); see [Acceptance Test Index](#acceptance-test-index).
-5. Frontend behavior goal: partially done. Narrow tests for knowledge batch delete/upload feedback and chat RAGAS polling/message merge behavior were added (`tests/knowledgeFeedback.test.js`, `tests/chatStore.test.js`). The three delete entry points in `Knowledge.vue` (delete knowledge base, delete file, batch delete) now share `runConfirmedDelete`, which gives each of them an error branch: cancelling the confirm dialog returns silently instead of raising an unhandled rejection, and a rejected `knowledgeAPI` call emits an error message instead of leaving the view in its old state; `tests/knowledgeFeedback.test.js` covers all three outcomes (cancelled / failed / succeeded). Still open: no test mounts the Vue view, so the untested surface is the call-site glue itself - the `status !== DELETE_SUCCEEDED` short-circuit and the refresh call that follows it.
+5. Frontend behavior goal: partially done. Narrow tests for knowledge batch delete/upload feedback and chat RAGAS polling/message merge behavior were added (`tests/knowledgeFeedback.test.js`, `tests/chatStore.test.js`). The three delete entry points in `Knowledge.vue` (delete knowledge base, delete file, batch delete) now share `runConfirmedDelete`, which gives each of them an error branch: cancelling the confirm dialog returns silently instead of raising an unhandled rejection, and a rejected `knowledgeAPI` call emits an error message instead of leaving the view in its old state; `tests/knowledgeFeedback.test.js` covers all three outcomes (cancelled / failed / succeeded). Since then the view itself is mounted: `tests/knowledgeDeleteCallSiteMount.test.js` mounts `Knowledge.vue` and clicks all three delete entries through a stubbed HTTP boundary, so the call-site glue is now covered - cancelling or failing never gets past the `status !== DELETE_SUCCEEDED` short-circuit into the refresh, while a successful delete does issue one; `tests/traceVariableFlowMount.test.js` mounts `TraceVariableFlow.vue` the same way. Still open on the frontend: the upload path's call-site glue (progress wiring, skip/failure wording), the create/rename dialog and the detail-preview wiring still have behavior tests only at the `src/utils` level; `Chat.vue`, `Layout.vue`, `Login.vue`, `UserProfile.vue` and `MarkdownRenderer.vue` have no mount test at all; and the confirm dialog itself is stubbed at the `utils/confirm.js` seam, because Element Plus's focus trap needs globals the jsdom harness does not install.
 6. Documentation alignment goal: keep startup commands and environment variables consistent across README, docs, and project instructions.
 
 ## Acceptance Test Index
@@ -94,7 +94,7 @@ them run offline and deterministic; no credentials and no network access are req
 Runs against a real Milvus Lite database created in a temporary directory (only the
 embedding function is replaced, with a deterministic offline implementation).
 
-- `test_acceptance_upload_query_delete_round_trip` - upload, query with cosine distance 0, delete, then query again returns nothing.
+- `test_acceptance_upload_query_delete_round_trip` - upload, query with cosine similarity 1, delete, then query again returns nothing.
 - `test_acceptance_knowledge_base_isolation` - a query in knowledge base A never sees knowledge base B chunks, while a query without a knowledge base filter sees both.
 - `test_acceptance_reupload_replaces_previous_chunks` - re-uploading a file replaces its previous chunks instead of appending.
 - `test_acceptance_delete_removes_only_target_file` - deleting one file leaves the other files of the same knowledge base searchable.
@@ -104,11 +104,13 @@ embedding function is replaced, with a deterministic offline implementation).
 
 ### Goal 3 - Retrieval acceptance (`tests/test_retrieval_acceptance.py`)
 
-Drives the full `retrieve_knowledge` chain: multi-route recall, RRF fusion, rerank, and
-final context selection. Only the marginal recall and the rerank HTTP transport are
-replaced; the real fusion, truncation and selection logic runs. Keyword recall reads the
-relational store rather than Milvus, so the last three cases call that implementation
-unpatched against real `KnowledgeFile` rows in a real SQLite database.
+Drives the full `retrieve_knowledge` chain: query planning, multi-route recall, RRF fusion,
+rerank, and final context selection. Only the marginal recall, the rerank HTTP transport and
+the planner's model call are replaced; the real plan normalization, fusion, truncation and
+selection logic runs. Keyword recall reads the relational store rather than Milvus, so the
+last three cases call that implementation unpatched against real `KnowledgeFile` rows in a
+real SQLite database. The vector-recall implementation is covered against a real Milvus Lite
+store by the goal 2 cases, so this file only pins the per-route call contract.
 
 - `test_acceptance_multi_route_rrf_rerank_final_order` - one path from plan to final context: route order and `top_k`, RRF order and scores, rerank request payload, and a final order that follows the rerank scores.
 - `test_acceptance_rerank_failure_falls_back_to_fused_order` - a failed rerank keeps the fused order and reports a failed rerank trace.
@@ -120,6 +122,11 @@ unpatched against real `KnowledgeFile` rows in a real SQLite database.
 - `test_acceptance_single_route_failure_is_not_swallowed` - a failing recall route aborts the retrieval instead of returning partial context.
 - `test_acceptance_route_plan_is_deduplicated_and_capped` - the route plan is deduplicated and capped before recall.
 - `test_acceptance_rerank_candidate_window_is_capped` - the candidate window sent to the reranker and the returned context are capped by the configured limits.
+- `test_acceptance_query_plan_normalizes_and_caps_the_planner_output` - the planner's hypothesis document is stripped, its rewrite list is cleaned and capped at three, and its keywords are merged with the question's own, deduplicated and capped at 24.
+- `test_acceptance_query_plan_failure_still_yields_usable_keywords` - a failed planner still returns deterministic query terms, so the keyword route survives it.
+- `test_acceptance_fallback_keywords_extract_numeric_phrases_and_terms` - numeric policy phrases are matched whole and ahead of the single policy terms.
+- `test_acceptance_fallback_keywords_expand_short_chinese_tokens` - short Chinese tokens also contribute their adjacent bigrams, not just the whole token.
+- `test_acceptance_plan_keywords_reach_the_keyword_route` - the plan's keywords, the question's own deterministic keywords and the plan's required evidence are exactly the terms the keyword route searches for, deduplicated in that order.
 - `test_acceptance_real_keyword_recall_reads_the_relational_store` - the unpatched `keyword_recall` returns only matching rows of the requested knowledge base, with the stored row identity and the real keyword scores in descending order.
 - `test_acceptance_real_keyword_recall_chunks_long_text_and_caps_results` - the unpatched `keyword_recall` splits long stored text at the real character offsets, drops chunks without a keyword hit, and caps the result at `top_k`.
 - `test_acceptance_retrieve_knowledge_uses_the_real_keyword_recall` - the real keyword chunk travels through fusion and rerank into the final context.

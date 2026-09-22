@@ -20,6 +20,7 @@ SSE 用例跑真实的 `TraceRecorder` + 真实的 `sanitize_trace_value` + 真�
 import asyncio
 import json
 import logging
+from types import SimpleNamespace
 
 import docx
 import httpx
@@ -57,6 +58,29 @@ class _StubUploadFile:
 
     async def read(self):
         return self._content
+
+
+class _StubDb:
+    """Session 的最小替身。
+
+    上传链路在写对象**之前**要先落一条待确认行（issue #142），所以直接调 service 函数的
+    用例也得给一个会话；这里只需要记录 add/commit，不落任何真实数据。
+    """
+
+    def __init__(self):
+        self.added = []
+        self.commits = 0
+
+    def add(self, item):
+        self.added.append(item)
+
+    def commit(self):
+        self.commits += 1
+
+
+def _upload_call_kwargs():
+    """`upload_chat_attachment` 的直调参数（绕开 FastAPI 依赖注入）。"""
+    return {"user": SimpleNamespace(id=1), "db": _StubDb()}
 
 
 def _assert_no_leak(text: str, where: str, markers=LEAK_MARKERS) -> None:
@@ -277,7 +301,7 @@ def test_oss_upload_failure_detail_hides_internal_error(monkeypatch, caplog):
 
     with caplog.at_level(logging.WARNING):
         with pytest.raises(HTTPException) as excinfo:
-            asyncio.run(chat_service.upload_chat_attachment(_StubUploadFile(), _user=None))
+            asyncio.run(chat_service.upload_chat_attachment(_StubUploadFile(), **_upload_call_kwargs()))
 
     assert excinfo.value.status_code == 500
     _assert_no_leak(str(excinfo.value.detail), "OSS 上传 500 detail")
@@ -314,7 +338,7 @@ def test_http_detail_error_id_matches_server_log(monkeypatch, caplog):
 
     with caplog.at_level(logging.WARNING):
         with pytest.raises(HTTPException) as excinfo:
-            asyncio.run(chat_service.upload_chat_attachment(_StubUploadFile(), _user=None))
+            asyncio.run(chat_service.upload_chat_attachment(_StubUploadFile(), **_upload_call_kwargs()))
 
     detail = str(excinfo.value.detail)
     error_id = detail.split("错误编号：", 1)[1].rstrip("）")

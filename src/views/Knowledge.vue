@@ -254,7 +254,9 @@ import {
   describeUploadSuccess,
   hasDeletedAnyFile,
   partitionUploadFiles,
+  refreshAfterCreate,
   refreshAfterDelete,
+  refreshAfterUpload,
   runConfirmedDelete,
   uploadFilesInOrder,
 } from '@/utils/knowledgeFeedback'
@@ -281,6 +283,13 @@ const knowledgeBaseInputRef = ref(null)
 const knowledgeBaseForm = reactive({
   name: '',
 })
+
+// 提交代次：对话框每打开一次、每关闭一次（取消 / ESC / 点遮罩 / 提交成功后的自动关闭）都自增。
+// 在飞的提交只有代次仍然匹配时才允许回写对话框状态，否则「取消后重新打开」时，
+// 上一笔提交的迟到响应会把用户刚打开的对话框关掉，并丢掉他已经输入的名称（#156）。
+// 与 utils/detailPreview.js 的 latestToken、utils/fileListRequest.js 的 invalidate 同款：
+// 响应回来时序号已过期就整条丢弃，一个字都不写。
+let knowledgeBaseSubmitToken = 0
 
 // 详情预览的状态放响应式容器，请求时序保护在 createDetailPreview 里：
 // 标题是同步切换的、正文来自异步响应，迟到的旧响应必须被丢弃（#63）。
@@ -413,6 +422,16 @@ function openKnowledgeBaseDialog(mode) {
   const current = knowledgeBases.value.find((item) => item.id === currentKnowledgeBaseId.value)
   if (mode === 'rename' && !current) return
 
+  // 新会话作废上一笔在飞提交：它的响应不得再改这个对话框的任何状态（#156）。
+  knowledgeBaseSubmitToken += 1
+  // 作废的同时必须把提交中状态一并复位：被作废那一笔的 finally 已经不再复位它
+  // （见 submitKnowledgeBaseDialog），而唯一会复位它的 resetKnowledgeBaseDialog 挂在
+  // `@closed` 上——「关闭过渡还没走完就重开」时那次关闭会被抵销、`@closed` 不触发，
+  // 于是新会话带着上一笔的 loading 开始：按钮停在 loading，提交又被上面的
+  // `knowledgeBaseSubmitting` 守卫挡住，对话框看着是开的却用不了。
+  // 新会话此刻还没有自己的在飞提交（同会话的重复提交由该守卫拦住，而对话框开着时
+  // 页面上的「新建知识库」点不到），所以这里复位不会误伤任何本会话的提交。
+  knowledgeBaseSubmitting.value = false
   knowledgeBaseDialogMode.value = mode
   knowledgeBaseForm.name = mode === 'rename' ? current.name : ''
   knowledgeBaseDialogVisible.value = true
@@ -444,26 +463,47 @@ async function submitKnowledgeBaseDialog() {
   }
 
   knowledgeBaseSubmitting.value = true
+  // 本笔提交所属的对话框会话。响应回来时用户可能已经取消并重开了对话框，
+  // 那时这一笔就不再拥有对话框，也不该再改写任何界面状态（#156）。
+  const token = knowledgeBaseSubmitToken
   try {
     if (knowledgeBaseDialogMode.value === 'create') {
       const created = await knowledgeAPI.createBase(name, { silent: true })
+      if (token !== knowledgeBaseSubmitToken) return
       knowledgeStore.upsertKnowledgeBase(created)
       currentKnowledgeBaseId.value = created.id
       selectedFiles.value = []
       page.value = 1
       allFiles.value = []
       ElMessage.success('知识库已创建')
-      await refreshKnowledgeBasesPreserving(created)
-      await fetchFiles()
+      // 关窗上移到刷新之前：创建已经是既成事实，对话框的去留不该由随后那次副作用决定。
+      // 留在原来那个位置时（刷新之后），刷新一抛就跳去下面的 catch，这一行根本走不到 ——
+      // 对话框停在打开态，用户照着重试会撞上 400「知识库已存在」（issue #157）。
+      knowledgeBaseDialogVisible.value = false
+      // 侧栏与文件列表两步都留在同一个出口里，与删除路径的 refreshAfterDelete 同形：
+      // 侧栏那次由 refreshKnowledgeBasesPreserving 自己兜底，真正会抛的是文件列表这次，
+      // 失败只报「知识库已创建，但列表刷新失败」，不再被下面那个 catch 当成创建失败。
+      await refreshAfterCreate({
+        refresh: async () => {
+          await refreshKnowledgeBasesPreserving(created)
+          await fetchFiles()
+        },
+        notifyError: notifyCreateError,
+      })
     } else if (current) {
       const renamed = await knowledgeAPI.renameBase(current.id, name, { silent: true })
+      if (token !== knowledgeBaseSubmitToken) return
       knowledgeStore.upsertKnowledgeBase(renamed)
       ElMessage.success('知识库已重命名')
+      // 同样上移到刷新之前。重命名这条链的刷新只有 refreshKnowledgeBasesPreserving 一次，
+      // 它的取数失败在函数内部就被兜底（catch 里 upsert 回重命名后的对象），不往外抛，
+      // 所以这里没有创建链那种「刷新失败被当成操作失败」的可达路径。
+      knowledgeBaseDialogVisible.value = false
       await refreshKnowledgeBasesPreserving(renamed)
     }
-
-    knowledgeBaseDialogVisible.value = false
   } catch (error) {
+    // 迟到的失败同上：它属于用户已经放弃的那次提交，不该把错误提示落到新会话上。
+    if (token !== knowledgeBaseSubmitToken) return
     const message = getApiErrorMessage(error, '操作失败，请稍后重试')
     if (isDuplicateKnowledgeBaseError(error, message)) {
       try {
@@ -481,7 +521,9 @@ async function submitKnowledgeBaseDialog() {
     }
     ElMessage.error(message)
   } finally {
-    knowledgeBaseSubmitting.value = false
+    // 代次过期时不能复位 loading：那份状态已经属于新的对话框会话，
+    // 复位会把新会话正在跑的那笔提交的 loading 一起抹掉。
+    if (token === knowledgeBaseSubmitToken) knowledgeBaseSubmitting.value = false
   }
 }
 
@@ -503,7 +545,7 @@ async function refreshKnowledgeBasesPreserving(preferredBase) {
     if (preferredBase?.id && !list.some((item) => item.id === preferredBase.id)) {
       knowledgeStore.upsertKnowledgeBase(preferredBase)
     }
-  } catch (error) {
+  } catch {
     if (preferredBase?.id) {
       knowledgeStore.upsertKnowledgeBase(preferredBase)
     }
@@ -513,13 +555,27 @@ async function refreshKnowledgeBasesPreserving(preferredBase) {
 }
 
 function resetKnowledgeBaseDialog() {
+  // 关闭同样作废在飞提交（取消 / ESC / 点遮罩走的都是这条路，#156）。
+  knowledgeBaseSubmitToken += 1
   knowledgeBaseSubmitting.value = false
   knowledgeBaseForm.name = ''
   knowledgeBaseFormRef.value?.resetFields?.()
 }
 
-// 三个删除入口的错误提示统一走这里，与上传路径的 ElMessage.error 保持同一形态。
+// 三个删除入口的错误提示统一走这里，与上传路径的 notifyUploadError 保持同一形态。
 function notifyDeleteError(message) {
+  ElMessage.error(message)
+}
+
+// 创建路径的错误提示出口。刷新失败也走这里，但文案由 describeCreateRefreshFailure 给出，
+// 说的是「知识库已创建，但列表刷新失败」——上面那个 catch 只负责创建/重命名请求本身的失败。
+function notifyCreateError(message) {
+  ElMessage.error(message)
+}
+
+// 上传路径的错误提示出口。刷新失败也走这里，但文案由 describeUploadRefreshFailure 给出，
+// 说的是「上传成功，但列表刷新失败」——上传的 catch 只负责上传本身的失败。
+function notifyUploadError(message) {
   ElMessage.error(message)
 }
 
@@ -601,6 +657,7 @@ async function handleUpload(files) {
 
   let failedIndex = -1
   let attempted = 0
+  let uploadedAll = false
   uploading.value = true
   uploadPercent.value = 0
 
@@ -623,9 +680,7 @@ async function handleUpload(files) {
         uploadPercent.value = percent
       }
     )
-
-    ElMessage.success(describeUploadSuccess(supported.length))
-    await refreshKnowledgeBaseAndFiles()
+    uploadedAll = true
   } catch (error) {
     const reason = getApiErrorMessage(error, '上传失败，请稍后重试')
     if (failedIndex < 0) {
@@ -646,6 +701,19 @@ async function handleUpload(files) {
     uploading.value = false
     uploadPercent.value = 0
   }
+
+  // 文件一个都没传成时上面已经提示过了，不再进成功分支。
+  if (!uploadedAll) return
+
+  ElMessage.success(describeUploadSuccess(supported.length))
+  // 刷新必须留在上面那个 try 之外（issue #154）：留在里面时，刷新自己的拒绝会被上传的
+  // catch 接走，而 failedIndex < 0 在上传成功时恒成立，于是逐字弹「上传失败，请稍后重试」——
+  // 文件其实已经入库，只是列表没跟上；用户据此重传会再入一份（后端对文件名没有唯一约束）。
+  // 走 refreshAfterUpload 后失败只报「上传成功，但列表刷新失败」，上传成功的事实不被改写。
+  await refreshAfterUpload({
+    refresh: refreshKnowledgeBaseAndFiles,
+    notifyError: notifyUploadError,
+  })
 }
 
 function openUploadDialog() {

@@ -14,6 +14,7 @@ jobs:
   issue-validator:
     name: Issue 结构校验
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: 检出默认分支（校验脚本来源）
         uses: actions/checkout@v7

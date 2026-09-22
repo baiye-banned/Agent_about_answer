@@ -46,8 +46,11 @@ def _restore_milvus_uri_env(value: str | None) -> None:
 
 _milvus_uri_env = _hide_lite_uri_from_pymilvus_import()
 
-from pymilvus import DataType, MilvusClient
-from pymilvus.orm.schema import CollectionSchema, FieldSchema
+# pymilvus 在导入期就把 MILVUS_URI 读进 settings.Config（类体赋值，导入即冻结）。
+# 这两行 import 必须停在此处：上移到文件头会让 Lite 的文件路径被当成 server URI，
+# 直接抛 ConnectionConfigException。故按 E402 豁免，而非重排。
+from pymilvus import DataType, MilvusClient  # noqa: E402
+from pymilvus.orm.schema import CollectionSchema, FieldSchema  # noqa: E402
 
 _restore_milvus_uri_env(_milvus_uri_env)
 

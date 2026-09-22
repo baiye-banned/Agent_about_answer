@@ -21,6 +21,7 @@ const ALLOWED_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:'])
 // HTML entities such as `&#9;` are already decoded by the HTML parser before an
 // attribute value reaches this module, so removing the same characters here
 // matches the scheme the browser will actually execute.
+// eslint-disable-next-line no-control-regex -- 控制字符正是本表要剔除的对象，非误写，见上方说明
 const IGNORED_URL_CHARS = /[\x00-\x20\x7f-\x9f]/g
 
 const URL_SCHEME = /^([a-z][a-z0-9+.-]*):/

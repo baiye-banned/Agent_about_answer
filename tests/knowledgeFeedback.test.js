@@ -6,17 +6,23 @@ import assert from 'node:assert/strict'
 // 批量删除反馈与 handleUpload（顺序上传 + 进度 + 成功文案）都走这几个函数，
 // 这里锁的是那几个视图分支的行为。
 import {
+  CREATE_REFRESH_FAILED_HINT,
   DELETE_CANCELLED,
   DELETE_FAILED,
   DELETE_REFRESH_FAILED_HINT,
   DELETE_SUCCEEDED,
+  UPLOAD_REFRESH_FAILED_HINT,
   computeUploadPercent,
   describeBatchDeleteResult,
+  describeCreateRefreshFailure,
   describeDeleteRefreshFailure,
+  describeUploadRefreshFailure,
   describeUploadSuccess,
   hasDeletedAnyFile,
   isConfirmCancellation,
+  refreshAfterCreate,
   refreshAfterDelete,
+  refreshAfterUpload,
   runConfirmedDelete,
   uploadFilesInOrder,
 } from '../src/utils/knowledgeFeedback.js'
@@ -349,5 +355,140 @@ test('describeDeleteRefreshFailure says the delete succeeded and falls back to t
   assert.equal(
     describeDeleteRefreshFailure({}),
     `删除成功，但列表刷新失败：${DELETE_REFRESH_FAILED_HINT}`
+  )
+})
+
+// 上传面（issue #154）。与删除面同一条规则，但失败不得被读成「上传失败」：
+// 文件已经入库，用户据此重传会真的再入一份（后端对文件名没有唯一约束）。
+
+test('describeUploadRefreshFailure says the upload succeeded and falls back to the shared hint', () => {
+  assert.match(describeUploadRefreshFailure(new Error('boom')), /^上传成功，但列表刷新失败：/)
+  assert.ok(describeUploadRefreshFailure({}).endsWith(UPLOAD_REFRESH_FAILED_HINT))
+  assert.equal(
+    describeUploadRefreshFailure({}),
+    `上传成功，但列表刷新失败：${UPLOAD_REFRESH_FAILED_HINT}`
+  )
+  // 承重：这条文案里不能出现「上传失败」。逐字误报正是本项的缺陷形态。
+  assert.ok(
+    !describeUploadRefreshFailure({}).includes('上传失败'),
+    '刷新失败的文案不得含「上传失败」：文件已经入库了'
+  )
+  // 接口给了可显示的原因时用它，而不是笼统的兜底。
+  const error = new Error('Request failed with status code 500')
+  error.response = { status: 500, data: { detail: '服务暂时不可用' } }
+  assert.equal(
+    describeUploadRefreshFailure(error),
+    '上传成功，但列表刷新失败：服务暂时不可用'
+  )
+})
+
+test('refreshAfterUpload returns true and stays silent when the refresh succeeds', async () => {
+  const notifications = []
+  let refreshed = 0
+
+  const result = await refreshAfterUpload({
+    refresh: async () => {
+      refreshed += 1
+    },
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(result, true)
+  assert.equal(refreshed, 1)
+  assert.deepEqual(notifications, [])
+})
+
+test('refreshAfterUpload captures a failed refresh instead of returning a rejected promise', async () => {
+  // 参数是模板事件处理器：返回被拒 Promise 就是一条 unhandledrejection，
+  // 用户什么都看不到。刷新失败必须被捕获并转成一条带归属的提示。
+  const notifications = []
+  const error = new Error('网络连接已断开')
+
+  const result = await refreshAfterUpload({
+    refresh: () => Promise.reject(error),
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(result, false)
+  assert.deepEqual(notifications, ['上传成功，但列表刷新失败：网络连接已断开'])
+})
+
+test('refreshAfterUpload also captures synchronous throws from the refresh closure', async () => {
+  const notifications = []
+
+  const result = await refreshAfterUpload({
+    refresh: () => {
+      throw new Error('同步炸了')
+    },
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(result, false)
+  assert.equal(notifications.length, 1)
+})
+
+// issue #157：创建成功之后的刷新与删除侧同款收口。
+// 修复前这次刷新是裸 await，留在 submitKnowledgeBaseDialog 自己的 try 里，
+// 刷新一失败就被创建自己的 catch 接走，逐字弹刷新的原始错误 —— 文案里看不出
+// 「创建其实成功了」，而对话框还停在打开态，用户照着重试撞上 400「知识库已存在」。
+test('refreshAfterCreate returns true and stays silent when the refresh succeeds', async () => {
+  const notifications = []
+  let refreshed = 0
+
+  const result = await refreshAfterCreate({
+    refresh: async () => {
+      refreshed += 1
+    },
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(result, true)
+  assert.equal(refreshed, 1)
+  assert.deepEqual(notifications, [])
+})
+
+test('refreshAfterCreate captures a failed refresh instead of returning a rejected promise', async () => {
+  const notifications = []
+  const error = new Error('Request failed with status code 500')
+  error.response = { status: 500, data: { detail: '服务暂时不可用' } }
+
+  const result = await refreshAfterCreate({
+    refresh: () => Promise.reject(error),
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(result, false)
+  // 归属必须是「创建成功、刷新没跟上」，不是「操作失败」：后者会让用户重复创建。
+  assert.deepEqual(notifications, ['知识库已创建，但列表刷新失败：服务暂时不可用'])
+})
+
+test('refreshAfterCreate also captures synchronous throws from the refresh closure', async () => {
+  const notifications = []
+
+  const result = await refreshAfterCreate({
+    refresh: () => {
+      throw new Error('同步炸了')
+    },
+    notifyError: (message) => notifications.push(message),
+  })
+
+  assert.equal(result, false)
+  assert.equal(notifications.length, 1)
+})
+
+// 没有出口时不得抛出：模板事件处理器返回被拒 Promise 就是一条 unhandledrejection。
+test('refreshAfterCreate stays non-throwing even without a notifyError exit', async () => {
+  const result = await refreshAfterCreate({ refresh: () => Promise.reject(new Error('boom')) })
+
+  assert.equal(result, false)
+})
+
+test('describeCreateRefreshFailure says the create succeeded and falls back to the shared hint', () => {
+  // 刷新失败不等于创建失败：说成失败会让用户再点一次「创建」，第二次以 400「知识库已存在」收场。
+  assert.match(describeCreateRefreshFailure(new Error('boom')), /^知识库已创建，但列表刷新失败：/)
+  assert.ok(describeCreateRefreshFailure({}).endsWith(CREATE_REFRESH_FAILED_HINT))
+  assert.equal(
+    describeCreateRefreshFailure({}),
+    `知识库已创建，但列表刷新失败：${CREATE_REFRESH_FAILED_HINT}`
   )
 })

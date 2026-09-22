@@ -171,10 +171,10 @@ class TraceRecorder:
 def append_trace_event(trace_id: str | None, stage: str, function: str, **kwargs):
     if not trace_id or not LEARNING_TRACE_ENABLED:
         return
-    snapshot = crud_trace.get_trace_snapshot(trace_id)
-    events = snapshot.get("events", []) if snapshot else []
+    # 这里不能再用 get_trace_snapshot 取「已有事件数」：那条是读取面，带会话存活守卫
+    # （issue #127），会话被删后对被写回的行返回 None，会把序号从 1 重排（issue #141）。
+    # 序号交给 crud 在写事务内按行上已有条数分配。
     event = {
-        "index": len(events) + 1,
         "time": _now_iso(),
         "stage": stage,
         "function": function,
