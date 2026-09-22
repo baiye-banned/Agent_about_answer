@@ -425,6 +425,35 @@ def test_failure_before_the_stream_starts_releases_the_slot(stream_api, monkeypa
     assert follow_up.status_code == 200, "流开始之前失败时并发槽没有归还（外层收尾漏了 release）"
 
 
+def test_early_return_stream_releases_the_slot(stream_api, monkeypatch):
+    """图片识别失败那条早退流也占着并发槽：它是另一条 return，不能只盯着主流的 finally。"""
+
+    async def _scenario():
+        async def failed_vision_question(question, attachments):
+            return question, {"status": "failed", "error": "图片内容识别失败"}
+
+        monkeypatch.setattr(chat_service, "_build_effective_question", failed_vision_question)
+        _normal_upstream(monkeypatch)
+        payload = {"question": "", "attachments": [{"object_key": "rag-chat/probe.png", "name": "probe.png"}]}
+
+        async with _client(stream_api.app) as client:
+            early = await asyncio.wait_for(
+                client.post("/api/chat/stream", json=payload, headers=STREAM_HEADERS), timeout=5
+            )
+            follow_up = await asyncio.wait_for(
+                client.post(
+                    "/api/chat/stream", json={"question": "第二次提问"}, headers=STREAM_HEADERS
+                ),
+                timeout=5,
+            )
+        return early, follow_up
+
+    early, follow_up = asyncio.run(_scenario())
+
+    assert "data: [DONE]" in early.text, f"早退流本身没跑完，本用例没测到它的收尾：{early.text[:200]}"
+    assert follow_up.status_code == 200, "早退流结束后并发槽没有归还，后续请求被一直拒在门外"
+
+
 def test_client_disconnect_releases_the_slot(stream_api, monkeypatch):
     """客户端断开（GeneratorExit/CancelledError）也要归还并发槽，并与路由层行为对上。"""
     _normal_upstream(monkeypatch)
