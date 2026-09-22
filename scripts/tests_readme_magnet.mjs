@@ -12,6 +12,8 @@
 //                                                        # 两侧都折行 -> 逐行并集；任一侧还是旧格式
 //                                                        # 单行 -> 取包含另一侧全文的那一份再折行，
 //                                                        # 互不包含则拒绝（含两侧都还是旧格式）
+//                                                        # 两侧各改同一行的同一处 -> 拒绝（issue #207）
+//                                                        # 只能算「疑似」时 -> 照写但告警
 //
 // 退出码：0 通过；1 违规；2 参数/IO 错误。
 
@@ -210,7 +212,99 @@ const flatten = (text) => text.replace(/\s+/g, ' ').trim();
 // 冲突块的一侧是否还停在旧格式（整段单行）。
 const sideHasLongLine = (side) => side.some((line) => line.length > MAX_LINE);
 
-// 求解一个冲突块。返回 { lines, kept, note }；无法机械求解时返回 null。
+// 两行首尾各共享多少个字符（两段不重叠：后缀从前缀结束处往前数）。
+function sharedEnds(a, b) {
+  let prefix = 0;
+  while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) prefix += 1;
+  let suffix = 0;
+  while (
+    suffix < a.length - prefix &&
+    suffix < b.length - prefix &&
+    a[a.length - 1 - suffix] === b[b.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+  return { prefix, suffix };
+}
+
+// 两侧改写**同一行的同一处**时，冲突块里是这同一行的两个变体：互不相等、也互不包含，
+// 于是逐行并集把两个都追加进同一段 —— 同一句话被写两遍，而零丢失校验照旧报绿（issue #207）。
+//
+// 这个形状在文本上无法与「两侧各追加了一条措辞相近的子句」切开：冲突块里只有分歧区域，
+// git 早把公共行剥掉了，谁也证明不了分歧的那几个词是新写的还是改上去的。仓库外沙盒用
+// **真 git 三方合并**实测（各形状都只产生一个冲突块）：
+//
+//   两侧各追加一行不同子句，首尾共享 21 字符                 -> 并集正确
+//   真实的 tests/README.md：两侧各追加一条子句再跑 format
+//     （README 自己写的登记流程），子句落回同一条末行，
+//     首尾共享 71 字符                                      -> 并集把该行的前缀写了两遍（坏产物）
+//   两侧各追加一条措辞相近的子句，首尾共享 73 字符            -> 并集正确，但与上面一条签名重合
+//
+// 后两条签名重合，说明**按相似度拒绝会连正常并集一起拒**，这条路走不通；所以判据按证据强度
+// 分两档，而不是一刀切：
+//   强证据（两行除一小段分歧外逐字相同）——「各追加了一行」解释不通 → 判为同一行，拒绝；
+//   弱证据（首尾共享一大段连续文本）——两种解释都成立 → 照写，但向 stderr 告警请人工看一眼。
+//
+// 分档线是「分歧 ≤ 较长一行的 8%（至少 2 个字符）」：两个人在同一处独立改写、结果只差
+// 几个字符，比两个人独立追加出几乎逐字相同的两行更常见；反过来，措辞相近的两条追加
+// 分歧远大于此（实测 24-30 字符），不会被误拒。
+const SAME_LINE_MIN_LENGTH = 24;
+const SAME_LINE_DIVERGENCE_RATIO = 0.08;
+// 弱档（只告警）的判据只有一条：两行首尾共享的连续文本**够长**（≥ 24 个字符）。
+// 这里**没有**比值闸门，那正是本单的要害：原判据要求 run 同时 ≥ 32 **且** ≥ 较短行的一半，
+// 而真实形状（两侧各自把子句续写在同一条未满宽末行上）里子句把行撑到八十多个字符、
+// 共享串却主要由那条十来字符的短末行贡献，比值闸门必然把它挡掉 —— 产物照写重复句、
+// stderr 空（issue #207 的「静默」在这一子类里仍在；PR #212 评审条件 C1，实测四处措辞
+// 全部由静默转为告警，见 tests/testsReadmeMagnet.test.js 的那条真实形状用例）。
+// 24 这个数就是「够长」的分界：措辞相近的两条独立追加实测共享 68 个字符（会告警，但那是
+// 该看的一眼），真正不相干的两条各追加一行只共享 20 个上下（安静）。
+//
+// 已知边界（评审条件 C3，写在这里也写在 tests/README.md 里，是**决定**不是遗漏）：
+// 两行都短于 24 个字符时 run 永远够不到 24，短行上的同点改写两档都不接。
+// 仓库外实测（各处 5-7 组样本）表明短行上「同点改写」与「两条各自追加的短语」两个总体在
+// 共享串比值上**交叠**：前者 0.83-0.95，后者 0.50-0.92（间隔 -0.08）—— 任何阈值都会在
+// 交叠区里误伤 `and the export pipeline.` / `and the import pipeline.` 这类正常并集
+//（它 0.92，比五组同点样本里的四组还高）。所以短行这一格选择「明确不覆盖 + 文档写清」，
+// 而不是装一条两边都判不准的判据。
+const VARIANT_RUN_MIN = 24;
+
+// 同一行的两个变体 { ours, theirs }；不是这个形状则返回 null。
+function findSameLineVariants(ours, theirs) {
+  for (const a of ours) {
+    if (a.trim() === '') continue;
+    for (const b of theirs) {
+      if (b.trim() === '' || a === b || a.includes(b) || b.includes(a)) continue;
+      const longest = Math.max(a.length, b.length);
+      if (longest < SAME_LINE_MIN_LENGTH) continue;
+      const { prefix, suffix } = sharedEnds(a, b);
+      const divergence = longest - prefix - suffix;
+      if (divergence <= Math.max(2, Math.floor(longest * SAME_LINE_DIVERGENCE_RATIO))) {
+        return { ours: a, theirs: b };
+      }
+    }
+  }
+  return null;
+}
+
+// 「同源两变体并存」的弱信号 { ours, theirs, run }：两行首尾共享的长连续文本会在并集里
+// 连着出现两遍，产物读起来就是重复句。够不到拒绝线时用它提示人工确认。
+function findVariantRun(ours, theirs) {
+  let best = null;
+  for (const a of ours) {
+    if (a.trim() === '') continue;
+    for (const b of theirs) {
+      if (b.trim() === '' || a === b) continue;
+      const { prefix, suffix } = sharedEnds(a, b);
+      const run = prefix + suffix;
+      if (run < VARIANT_RUN_MIN) continue;
+      if (best === null || run > best.run) best = { ours: a, theirs: b, run };
+    }
+  }
+  return best;
+}
+
+// 求解一个冲突块。返回 { lines, kept, note, warning } 求解成功（warning 非 null 时调用方
+// 要提醒人工确认）；{ refused, detail } 判为同点改写；无法机械求解时返回 null。
 //
 // 判据的门槛是「**任一侧**是否还停在旧格式整段单行」，不是「两侧格式是否不同」：
 // 旧单行本身就包含了折行侧的全部内容，对它逐行求并集必然把同一段文字写两遍。所以只要有一侧
@@ -223,6 +317,8 @@ const sideHasLongLine = (side) => side.some((line) => line.length > MAX_LINE);
 // 两侧都已是折行格式时才逐行求并集：先取 ours，再补上 theirs 里 ours 没有的行。
 // 两次登记落在同一个追加点时，冲突块就是「双方各加了几行」，并集即两边都保留；
 // 相同行只留一份，避免重复登记。
+// 但逐行并集只在「两侧各自追加」这个前提下成立：两侧改写同一行的同一处时，块里是同一行的
+// 两个变体，「两边都保留」就等于把同一句话写两遍。见 findSameLineVariants 的论证。
 function resolveSides(ours, theirs) {
   if (sideHasLongLine(ours) || sideHasLongLine(theirs)) {
     const oursText = flatten(ours.join(' '));
@@ -238,6 +334,8 @@ function resolveSides(ours, theirs) {
     }
     return null;
   }
+  const variants = findSameLineVariants(ours, theirs);
+  if (variants !== null) return { refused: 'same-line-variants', detail: variants };
   const union = [...ours];
   const kept = [];
   for (const line of theirs) {
@@ -245,7 +343,7 @@ function resolveSides(ours, theirs) {
     union.push(line);
     if (line.trim() !== '') kept.push(line);
   }
-  return { lines: union, kept, note: '' };
+  return { lines: union, kept, note: '', warning: findVariantRun(ours, theirs) };
 }
 
 function cmdUnion(file) {
@@ -274,12 +372,24 @@ function cmdUnion(file) {
       );
       return 1;
     }
+    if (resolved.refused === 'same-line-variants') {
+      process.stderr.write(
+        `union: 第 ${block.start + 1} 行的冲突块里，两侧的对应行除一小段分歧外逐字相同：\n` +
+          `    ours:   ${resolved.detail.ours}\n` +
+          `    theirs: ${resolved.detail.theirs}\n` +
+          `  这更像「两侧改写了同一行的同一处」而不是「两侧各追加了一行」——各自追加的行不会只差\n` +
+          `  这几个字符。逐行并集会把这同一句话写两遍（零丢失校验发现不了它：两侧的文字确实都在\n` +
+          `  结果里）。请人工择一或合并；文件未被改动。\n`,
+      );
+      return 1;
+    }
     out.push(...resolved.lines);
     cursor = block.end + 1;
     merged.push({
       line: block.start + 1,
       kept: resolved.kept,
       note: resolved.note,
+      warning: resolved.warning ?? null,
       range: [outStart, out.length],
       sides: [flatten(ours.join(' ')), flatten(theirs.join(' '))],
     });
@@ -343,6 +453,20 @@ function cmdUnion(file) {
     process.stdout.write(`  L${m.line} 补回 ${m.kept.length} 行：\n`);
     for (const line of m.kept) process.stdout.write(`    ${line.slice(0, 100)}\n`);
   }
+  // 够不到拒绝线的形状：并集本身成立，但两侧的对应行共享一大段连续文本，产物里那段会连着
+  // 出现两遍。它也可能是两条措辞相近的追加（同样的签名，实测无法区分），所以不拒绝，只提醒。
+  for (const m of merged) {
+    if (m.warning === null) continue;
+    const { run, ours: a, theirs: b } = m.warning;
+    process.stderr.write(
+      `union: 提醒 - 第 ${m.line} 行的冲突块两侧有一行的首尾共享 ${run} 个连续字符，并集里这段\n` +
+        `  文字会连着出现两遍，读起来像重复句：\n` +
+        `    ours:   ${a.slice(0, 100)}\n` +
+        `    theirs: ${b.slice(0, 100)}\n` +
+        `  它也可能是两侧各追加了一条措辞相近的子句，这个形状在文本上无法机械区分，所以文件已经\n` +
+        `  写出：请人工确认上面那一段里没有重复的句子，有的话请手工删掉重复的那一份。\n`,
+    );
+  }
   return 0;
 }
 
@@ -369,4 +493,13 @@ const isEntryPoint =
   process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isEntryPoint) process.exit(main(process.argv.slice(2)));
 
-export { MAX_LINE, WRAP_WIDTH, findParagraphs, parseConflicts, reflow, unwrap, wrap };
+export {
+  MAX_LINE,
+  VARIANT_RUN_MIN,
+  WRAP_WIDTH,
+  findParagraphs,
+  parseConflicts,
+  reflow,
+  unwrap,
+  wrap,
+};
