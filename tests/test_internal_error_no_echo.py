@@ -379,7 +379,14 @@ OSS_CONFIG = {
     "OSS_BUCKET": "demo",
     "OSS_ENDPOINT": "https://oss-cn-hangzhou.aliyuncs.com",
 }
-IMAGE_ATTACHMENT = {"object_key": "uploads/考勤.png", "file_name": "考勤.png", "content_type": "image/png"}
+# 键必须是铸造形态（照抄上传路径铸出来的样子）：issue #181 之后出网口与写库口、删除口
+# 共用同一条形态判据，非自铸键到不了 `_request_image_description`，本节要验的
+# 「异常原文不进帧」就无从触发。键的形状本身由 tests/test_vision_outbound_guard_181.py 覆盖。
+IMAGE_ATTACHMENT = {
+    "object_key": "rag-chat/2026/09/21/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png",
+    "file_name": "考勤.png",
+    "content_type": "image/png",
+}
 
 
 def _patch_real_vision(monkeypatch):
