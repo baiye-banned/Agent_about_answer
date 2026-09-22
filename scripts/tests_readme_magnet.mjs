@@ -250,8 +250,23 @@ function sharedEnds(a, b) {
 // 分歧远大于此（实测 24-30 字符），不会被误拒。
 const SAME_LINE_MIN_LENGTH = 24;
 const SAME_LINE_DIVERGENCE_RATIO = 0.08;
-const VARIANT_RUN_MIN = 32;
-const VARIANT_RUN_RATIO = 0.5;
+// 弱档（只告警）的判据只有一条：两行首尾共享的连续文本**够长**（≥ 24 个字符）。
+// 这里**没有**比值闸门，那正是本单的要害：原判据要求 run 同时 ≥ 32 **且** ≥ 较短行的一半，
+// 而真实形状（两侧各自把子句续写在同一条未满宽末行上）里子句把行撑到八十多个字符、
+// 共享串却主要由那条十来字符的短末行贡献，比值闸门必然把它挡掉 —— 产物照写重复句、
+// stderr 空（issue #207 的「静默」在这一子类里仍在；PR #212 评审条件 C1，实测四处措辞
+// 全部由静默转为告警，见 tests/testsReadmeMagnet.test.js 的那条真实形状用例）。
+// 24 这个数就是「够长」的分界：措辞相近的两条独立追加实测共享 68 个字符（会告警，但那是
+// 该看的一眼），真正不相干的两条各追加一行只共享 20 个上下（安静）。
+//
+// 已知边界（评审条件 C3，写在这里也写在 tests/README.md 里，是**决定**不是遗漏）：
+// 两行都短于 24 个字符时 run 永远够不到 24，短行上的同点改写两档都不接。
+// 仓库外实测（各处 5-7 组样本）表明短行上「同点改写」与「两条各自追加的短语」两个总体在
+// 共享串比值上**交叠**：前者 0.83-0.95，后者 0.50-0.92（间隔 -0.08）—— 任何阈值都会在
+// 交叠区里误伤 `and the export pipeline.` / `and the import pipeline.` 这类正常并集
+//（它 0.92，比五组同点样本里的四组还高）。所以短行这一格选择「明确不覆盖 + 文档写清」，
+// 而不是装一条两边都判不准的判据。
+const VARIANT_RUN_MIN = 24;
 
 // 同一行的两个变体 { ours, theirs }；不是这个形状则返回 null。
 function findSameLineVariants(ours, theirs) {
@@ -281,7 +296,7 @@ function findVariantRun(ours, theirs) {
       if (b.trim() === '' || a === b) continue;
       const { prefix, suffix } = sharedEnds(a, b);
       const run = prefix + suffix;
-      if (run < VARIANT_RUN_MIN || run < VARIANT_RUN_RATIO * Math.min(a.length, b.length)) continue;
+      if (run < VARIANT_RUN_MIN) continue;
       if (best === null || run > best.run) best = { ours: a, theirs: b, run };
     }
   }
@@ -478,4 +493,13 @@ const isEntryPoint =
   process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isEntryPoint) process.exit(main(process.argv.slice(2)));
 
-export { MAX_LINE, WRAP_WIDTH, findParagraphs, parseConflicts, reflow, unwrap, wrap };
+export {
+  MAX_LINE,
+  VARIANT_RUN_MIN,
+  WRAP_WIDTH,
+  findParagraphs,
+  parseConflicts,
+  reflow,
+  unwrap,
+  wrap,
+};

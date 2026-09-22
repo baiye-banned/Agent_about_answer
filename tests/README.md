@@ -24,7 +24,14 @@ gross regression (a note collapsing back into one line), not the gate. The gate 
 `node scripts/tests_readme_magnet.mjs union <file>` merges both sides in one command; it refuses to
 write - leaving the file untouched - whenever it cannot prove that neither side lost a clause, or
 that both sides did not rewrite the same spot of one line (a union there would print that sentence
-twice). A shape it can only *suspect* is written, but the command says so on stderr.
+twice). A shape it can only *suspect* is written, but the command says so on stderr - and "suspect"
+has a definition: the two sides' conflicting lines share at least 24 characters. Below that the
+union is silent, deliberately, and one case is worth knowing about because it is silent by design
+rather than by oversight: when both conflicting lines are shorter than 24 characters the shared run
+cannot reach the threshold, so a same-spot rewrite there gets neither a refusal nor a warning (the
+text that gets written twice is under 24 characters, and on lines that short the two readings are
+not separable - measured, a same-spot pair and an ordinary pair of appends both land between 0.5
+and 0.95 shared-run ratio, so any threshold would warn on ordinary unions).
 
 ## Node Tests
 
