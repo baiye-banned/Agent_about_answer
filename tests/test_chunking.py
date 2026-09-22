@@ -164,7 +164,11 @@ def test_heading_level_keeps_clause_heading_without_inline_body():
 
 
 def test_chunk_coverage_ratio_reports_share_of_source_text():
-    assert chunk_coverage_ratio("", []) == 1.0
+    # 空源是 0.0 而不是 1.0（issue #166）：原文为空、分块也为空时被索引的文本就是 0，
+    # 覆盖率 0%。这一行原先断言 1.0，正好让「丢得最彻底」的输入绕过 0.5 的阈值守卫。
+    assert chunk_coverage_ratio("", []) == 0.0
+    assert chunk_coverage_ratio("", [{"text": "第一段"}]) == 0.0
+    assert chunk_coverage_ratio(None, []) == 0.0
     assert chunk_coverage_ratio("第一段", []) == 0.0
     assert chunk_coverage_ratio("第一段", [{"text": "第一"}, {"text": "段"}]) == 1.0
     assert chunk_coverage_ratio("第一段落", [{"text": "第一"}]) == 0.5

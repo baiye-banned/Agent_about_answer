@@ -11,6 +11,14 @@ from service.utils_service import KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE, _internal
 
 DOCX_PARSE_FAILED_MESSAGE = "DOCX 解析失败，请确认文件未损坏后重试"
 PDF_PARSE_FAILED_MESSAGE = "PDF 解析失败，请确认文件未损坏后重试"
+# 解析成功但结果为空，与「解析失败」是两回事：文件结构合法，只是没有可索引的文本
+# （扫描件、图片型 PDF、空文本文件）。上传链路据此拒绝，不能让「向量库里 0 条」
+# 以 200 交付——知识链路不落盘原文，那一行永远没有回填入口（issue #166）。
+EMPTY_EXTRACTED_TEXT_MESSAGE = "未从文件中提取到任何文本，可能是扫描件或图片型文件，请上传含可复制文字的版本后重试"
+
+# 内容为空时预览面板给出解释的扩展名。原先只有 .docx 特判，无文本的 PDF/TXT/MD
+# 在预览里是一片空白，用户连「这份文件没抽出内容」都看不到（issue #166）。
+_EMPTY_CONTENT_HINT_EXTENSIONS = (".docx", ".pdf", ".txt", ".md")
 
 
 def serialize_knowledge_file(file_entry: KnowledgeFile) -> dict:
@@ -81,7 +89,7 @@ def get_knowledge_content(db: Session, fid: int, user_id: int) -> dict | None:
     if not entry:
         return None
     content = entry.content or ""
-    if not content and (entry.name or "").lower().endswith(".docx"):
+    if not content and (entry.name or "").lower().endswith(_EMPTY_CONTENT_HINT_EXTENSIONS):
         content = "该文件上传时未抽取内容，请重新上传以生成预览。"
     return {
         "id": entry.id,
@@ -540,10 +548,16 @@ KNOWLEDGE_INDEX_MIN_COVERAGE_RATIO = 0.5
 
 
 def chunk_coverage_ratio(text: str, chunks: list[dict]) -> float:
-    """分块结果相对原文的文本覆盖率，用于暴露「分块吞正文」这类静默丢失。"""
+    """分块结果相对原文的文本覆盖率，用于暴露「分块吞正文」这类静默丢失。
+
+    空源返回 0.0 而不是 1.0：原文为空、分块也为空时，被索引的文本就是 0，
+    覆盖率是 0% 而不是 100%。返回 1.0 会让「丢得最彻底」的输入恰好绕过阈值守卫
+    （1.0 >= 0.5 直接 return），整条链路连一条 warning 都不留（issue #166）。
+    这里必须先判空再相除——走到下面的 len(source) 会除零。
+    """
     source = "" if text is None else str(text)
     if not source:
-        return 1.0
+        return 0.0
     covered = sum(len(chunk.get("text") or "") for chunk in chunks)
     return covered / len(source)
 

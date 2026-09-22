@@ -461,6 +461,17 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
         # 此时既没落库也没写向量，无需清理，直接按超时回 500。
         raise HTTPException(500, INGEST_TIMEOUT_MESSAGE)
 
+    # 抽取成功但结果为空（扫描件、图片型 PDF、空文本文件）不是入库成功：空文本会被
+    # chunk_text 静默转成 []，再由 add_chunks 的 replace_empty 分支正常返回，最后落下一行
+    # 「出现在列表里、向量库 0 条、原文不落盘」的记录——它永远检索不到，也没有任何回填入口。
+    # 放在落库之前：此时既没有元数据行也没有向量，失败无需任何清理（与上面的超时分支同址）。
+    if not (text or "").strip():
+        logger.warning(
+            "Knowledge file upload rejected for empty extracted text: filename=%s",
+            file.filename,
+        )
+        raise HTTPException(400, crud_knowledge_file.EMPTY_EXTRACTED_TEXT_MESSAGE)
+
     try:
         entry = crud_knowledge_file.create_knowledge_file(
             db,
