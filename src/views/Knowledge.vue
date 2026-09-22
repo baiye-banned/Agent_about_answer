@@ -8,19 +8,31 @@
         </div>
 
         <div class="flex flex-wrap items-center gap-2">
-          <el-select
-            v-model="currentKnowledgeBaseId"
-            class="w-48"
-            placeholder="选择知识库"
-            @change="handleKnowledgeBaseChange"
-          >
-            <el-option
-              v-for="base in knowledgeBases"
-              :key="base.id"
-              :label="`${base.name}（${base.file_count || 0}）`"
-              :value="base.id"
-            />
-          </el-select>
+          <div class="flex items-center gap-2">
+            <el-select
+              v-model="currentKnowledgeBaseId"
+              class="w-48"
+              placeholder="选择知识库"
+              @change="handleKnowledgeBaseChange"
+            >
+              <el-option
+                v-for="base in knowledgeBases"
+                :key="base.id"
+                :label="`${base.name}（${base.file_count || 0}）`"
+                :value="base.id"
+              />
+            </el-select>
+            <!-- 知识库列表同样有页大小上限（issue #191）：超出第一页的库按需追加，
+                 不给出入口就等于在下拉框里静默消失。 -->
+            <el-button
+              v-if="knowledgeStore.hasMoreKnowledgeBases"
+              size="small"
+              :loading="knowledgeStore.loadingMore"
+              @click="loadMoreKnowledgeBases"
+            >
+              加载更多知识库
+            </el-button>
+          </div>
           <el-button :icon="Plus" @click="openKnowledgeBaseDialog('create')">新建知识库</el-button>
           <el-button :icon="Edit" :disabled="!currentKnowledgeBaseId" @click="openKnowledgeBaseDialog('rename')">
             重命名
@@ -56,14 +68,20 @@
 
       <section class="rounded-lg border border-slate-200 bg-white p-4">
         <div class="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-          <el-input
-            v-model.trim="keyword"
-            placeholder="搜索文件名"
-            clearable
-            class="md:max-w-sm"
-            :prefix-icon="Search"
-            @input="handleSearch"
-          />
+          <div class="md:max-w-sm">
+            <el-input
+              v-model.trim="keyword"
+              placeholder="搜索文件名"
+              clearable
+              :prefix-icon="Search"
+              @input="handleSearch"
+            />
+            <!-- 筛选与排序都在已加载的这一段上做：列表被上限截断时要说清楚，
+                 否则用户会以为「搜不到」=「没有这个文件」。 -->
+            <p v-if="hasMoreFiles" class="mt-1 text-xs leading-5 text-amber-600">
+              筛选与排序只作用于已加载的 {{ allFiles.length }} 个文件，还有更早的文件未加载。
+            </p>
+          </div>
 
           <div class="flex flex-wrap items-center justify-end gap-2">
             <el-select v-model="sortField" class="w-36" @change="applyFilters">
@@ -131,14 +149,23 @@
         </el-table>
 
         <div v-if="filteredFiles.length" class="mt-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-          <span class="text-sm text-slate-500">共 {{ filteredFiles.length }} 个文件</span>
-          <el-pagination
-            v-model:current-page="page"
-            v-model:page-size="pageSize"
-            :page-sizes="[10, 20, 50]"
-            :total="filteredFiles.length"
-            layout="sizes, prev, pager, next"
-          />
+          <!-- 有上限时不能写「共 N 个文件」：N 只是已加载的那一段，说成总数就是假话。 -->
+          <span v-if="hasMoreFiles" class="text-sm text-slate-500">
+            已加载 {{ allFiles.length }} 个文件，还有更早的文件未加载
+          </span>
+          <span v-else class="text-sm text-slate-500">共 {{ filteredFiles.length }} 个文件</span>
+          <div class="flex items-center gap-3">
+            <el-button v-if="hasMoreFiles" size="small" :loading="loadingMoreFiles" @click="loadMoreFiles">
+              加载更多
+            </el-button>
+            <el-pagination
+              v-model:current-page="page"
+              v-model:page-size="pageSize"
+              :page-sizes="[10, 20, 50]"
+              :total="filteredFiles.length"
+              layout="sizes, prev, pager, next"
+            />
+          </div>
         </div>
       </section>
     </div>
@@ -265,6 +292,10 @@ import { formatDateTime, formatFileSize } from '@/utils'
 const allFiles = ref([])
 const currentKnowledgeBaseId = ref(null)
 const loading = ref(false)
+const loadingMoreFiles = ref(false)
+// 后端文件列表有页大小上限（issue #191）：为真时说明「还有更早的文件没取回来」，
+// 界面必须给出加载入口与可见提示，不能让它们静默消失。
+const hasMoreFiles = ref(false)
 const keyword = ref('')
 const sortField = ref('created_at')
 const sortOrder = ref('descending')
@@ -387,11 +418,21 @@ watch([filteredFiles, pageSize], () => {
 const fileList = createFileListRequest({
   getKnowledgeBaseId: () => currentKnowledgeBaseId.value,
   fetchList: (params) => knowledgeAPI.getList(params),
-  applyFiles: (files) => {
-    allFiles.value = files
+  // append：翻页取回的那一页接在已有列表后面（先按 id 去重，游标翻页正常不会重叠，
+  // 但刷新与翻页交错时重叠会让同一份文件在表格里出现两次）。
+  applyFiles: (files, { append } = {}) => {
+    if (!append) {
+      allFiles.value = files
+      return
+    }
+    const known = new Set(allFiles.value.map((item) => item.id))
+    allFiles.value = [...allFiles.value, ...files.filter((item) => !known.has(item.id))]
   },
   applyLoading: (value) => {
     loading.value = value
+  },
+  applyHasMore: (value) => {
+    hasMoreFiles.value = value
   },
 })
 
@@ -400,6 +441,22 @@ onBeforeUnmount(() => fileList.invalidate())
 
 async function fetchFiles() {
   return fileList.load()
+}
+
+// 向后翻页：把更早的一页接在列表末尾。切库（fetchFiles）会把游标重置到新库的第一页，
+// 两边的在飞请求由 fileList 的时序守卫按同一个世代作废。
+async function loadMoreFiles() {
+  if (loadingMoreFiles.value) return
+  loadingMoreFiles.value = true
+  try {
+    return await fileList.loadMore()
+  } finally {
+    loadingMoreFiles.value = false
+  }
+}
+
+async function loadMoreKnowledgeBases() {
+  return knowledgeStore.loadMoreKnowledgeBases()
 }
 
 async function initializeKnowledgeBases() {

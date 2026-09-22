@@ -1,6 +1,7 @@
 from sqlalchemy import func
 from sqlalchemy.orm import Session, load_only
 
+from crud.pagination import LIST_DEFAULT_LIMIT, clamp_limit
 from model.models import Conversation, KnowledgeBase, KnowledgeFile
 
 
@@ -56,11 +57,30 @@ def resolve_knowledge_base(db: Session, knowledge_base_id: int | None, user_id: 
     return get_default_knowledge_base(db, user_id)
 
 
-def list_knowledge_bases(db: Session, user_id: int) -> list[KnowledgeBase]:
+def list_knowledge_bases(
+    db: Session,
+    user_id: int,
+    *,
+    limit: int = LIST_DEFAULT_LIMIT,
+    after_id: int | None = None,
+) -> list[KnowledgeBase]:
+    """按 user_id 取一页知识库，返回「旧 -> 新」顺序（与旧接口的 created_at 升序一致）。
+
+    翻页语义（issue #191）：**键集游标**，不用 offset——offset 在翻页期间新建知识库时
+    会整体位移，同一行被翻到两次、另一行永远翻不到。
+
+    序键从 `created_at` 换成自增主键 `id`，可见顺序不变（自增主键与插入顺序严格一致，
+    后建的库 created_at 不会更早），换来的是可翻页：`created_at` 是秒级 DATETIME，
+    同一秒建出来的多个库按它排序不稳定，做游标会重复或漏行。游标取 `id > after_id`，
+    即「接着上一页往新的一页翻」，翻页途中新建的库排在游标之后，已经翻过的区间不位移。
+    """
+    limit = clamp_limit(limit)
+    query = db.query(KnowledgeBase).filter_by(user_id=user_id)
+    if after_id is not None:
+        query = query.filter(KnowledgeBase.id > after_id)
     return (
-        db.query(KnowledgeBase)
-        .filter_by(user_id=user_id)
-        .order_by(KnowledgeBase.created_at.asc())
+        query.order_by(KnowledgeBase.id.asc())
+        .limit(limit)
         .all()
     )
 

@@ -5,6 +5,7 @@ from fastapi import HTTPException
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, load_only
 
+from crud.pagination import LIST_DEFAULT_LIMIT, clamp_limit
 from model.models import KnowledgeFile
 from service.utils_service import KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE, _internal_error_detail
 
@@ -31,10 +32,28 @@ def serialize_knowledge_file(file_entry: KnowledgeFile) -> dict:
     }
 
 
-def list_knowledge_files(db: Session, knowledge_base_id: int, user_id: int) -> list[KnowledgeFile]:
-    # 列表只渲染元数据，显式排除 content（LONGTEXT）：否则每列一个文件就把正文整列读进内存。
-    # 调用方若再访问 file_entry.content，SQLAlchemy 会按行补查，本函数的返回值禁止用于正文读取。
-    return (
+def list_knowledge_files(
+    db: Session,
+    knowledge_base_id: int,
+    user_id: int,
+    *,
+    limit: int = LIST_DEFAULT_LIMIT,
+    before_id: int | None = None,
+) -> list[KnowledgeFile]:
+    """按知识库取一页文件，返回「新 -> 旧」顺序（与旧接口的 created_at 降序一致）。
+
+    翻页语义（issue #191）：**键集游标**，与消息接口同族（`list_messages` 的 `before_id`）。
+    排序键由 `created_at` 换成自增主键 `id`：可见顺序不变（同一批上传的文件里，后落的行
+    created_at 不会更早），但同一秒上传的多个文件按 created_at 排序不稳定，做游标会重复或
+    漏行——这正是 `list_messages` 当初弃用 created_at 的同一个理由。游标取 `id < before_id`，
+    即「接着上一页往更早的一页翻」；翻页途中新上传的文件 id 更大、排在游标之前，
+    已经翻过的区间不位移。
+
+    列表只渲染元数据，显式排除 content（LONGTEXT）：否则每列一个文件就把正文整列读进内存。
+    调用方若再访问 file_entry.content，SQLAlchemy 会按行补查，本函数的返回值禁止用于正文读取。
+    """
+    limit = clamp_limit(limit)
+    query = (
         db.query(KnowledgeFile)
         .options(load_only(
             KnowledgeFile.id,
@@ -44,7 +63,12 @@ def list_knowledge_files(db: Session, knowledge_base_id: int, user_id: int) -> l
             KnowledgeFile.created_at,
         ))
         .filter_by(knowledge_base_id=knowledge_base_id, user_id=user_id)
-        .order_by(KnowledgeFile.created_at.desc())
+    )
+    if before_id is not None:
+        query = query.filter(KnowledgeFile.id < before_id)
+    return (
+        query.order_by(KnowledgeFile.id.desc())
+        .limit(limit)
         .all()
     )
 

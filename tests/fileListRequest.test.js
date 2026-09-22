@@ -10,14 +10,16 @@ import { createFileListRequest } from '../src/utils/fileListRequest.js'
 const file = (id, name) => ({ id, name, size: 1024, created_at: '2026-09-01T10:00:00Z' })
 
 // 手动控制的取数桩：每个知识库一条待决队列，用例自己决定谁先返回。
-function setup() {
-  const state = { files: [], loading: false }
+function setup({ pageSize = 50 } = {}) {
+  const state = { files: [], loading: false, hasMore: false }
   const calls = []
+  const paramsLog = []
   const pending = new Map()
   let currentId = null
 
   const fetchList = (params) => {
     calls.push(params.knowledge_base_id)
+    paramsLog.push(params)
     return new Promise((resolve, reject) => {
       const queue = pending.get(params.knowledge_base_id) || []
       queue.push({ resolve, reject })
@@ -28,11 +30,16 @@ function setup() {
   const requests = createFileListRequest({
     getKnowledgeBaseId: () => currentId,
     fetchList,
-    applyFiles: (files) => {
-      state.files = files
+    pageSize,
+    // 与视图同款：append 追加在已有列表后面（这里只断言追加语义本身）。
+    applyFiles: (files, { append } = {}) => {
+      state.files = append ? [...state.files, ...files] : files
     },
     applyLoading: (value) => {
       state.loading = value
+    },
+    applyHasMore: (value) => {
+      state.hasMore = value
     },
   })
 
@@ -48,6 +55,7 @@ function setup() {
     state,
     requests,
     calls,
+    paramsLog,
     select: (id) => {
       currentId = id
     },
@@ -194,4 +202,111 @@ test('陈旧请求的失败不扰动当前列表，也不复位最新请求的 l
   await loadB
   assert.deepEqual(state.files.map((item) => item.id), [2])
   assert.equal(state.loading, false)
+})
+
+// ---------------------------------------------------------------- issue #191：按需翻页
+
+// 造一页数据：后端按「新 -> 旧」返回，多要的那一条在末尾。
+const pageOf = (startId, count) =>
+  Array.from({ length: count }, (_, index) => file(startId - index, `f-${startId - index}.txt`))
+
+test('第一页取满时给出「还有更早的文件」并带上探测用的多一条', async () => {
+  const { state, requests, paramsLog, select, respond } = setup({ pageSize: 3 })
+
+  select('A')
+  const loadA = requests.load()
+  respond('A', pageOf(9, 4)) // 3 + 1：多出来的那条说明还有更多
+
+  await loadA
+
+  assert.deepEqual(paramsLog[0], { knowledge_base_id: 'A', limit: 4 })
+  assert.deepEqual(state.files.map((item) => item.id), [9, 8, 7]) // 收下正好一页，丢掉探测条
+  assert.equal(state.hasMore, true)
+})
+
+test('取不满一页时不再给出加载入口', async () => {
+  const { state, requests, select, respond } = setup({ pageSize: 3 })
+
+  select('A')
+  const loadA = requests.load()
+  respond('A', pageOf(2, 2))
+
+  await loadA
+
+  assert.deepEqual(state.files.map((item) => item.id), [2, 1])
+  assert.equal(state.hasMore, false)
+})
+
+test('loadMore 用末位 id 作游标取更早的一页并追加在后面', async () => {
+  const { state, requests, paramsLog, select, respond } = setup({ pageSize: 3 })
+
+  select('A')
+  const loadA = requests.load()
+  respond('A', pageOf(9, 4))
+  await loadA
+
+  const moreA = requests.loadMore()
+  assert.deepEqual(paramsLog[1], { knowledge_base_id: 'A', limit: 4, before_id: 7 })
+  respond('A', [file(6, 'f-6.txt'), file(5, 'f-5.txt')])
+  await moreA
+
+  assert.deepEqual(state.files.map((item) => item.id), [9, 8, 7, 6, 5])
+  assert.equal(state.hasMore, false) // 这一页没取满：已经到最早一个
+})
+
+test('切换知识库后，迟到的旧库翻页结果不得拼进新库的列表', async () => {
+  const { state, requests, select, respond } = setup({ pageSize: 2 })
+
+  select('A')
+  const loadA = requests.load()
+  respond('A', pageOf(9, 3))
+  await loadA
+  assert.equal(state.hasMore, true)
+
+  const moreA = requests.loadMore()
+  // 翻页还没回来就切到 B，并加载出 B 的第一页。
+  select('B')
+  const loadB = requests.load()
+  respond('B', [file(100, 'B-1.txt')])
+  await loadB
+
+  respond('A', [file(7, 'A-7.txt'), file(6, 'A-6.txt')])
+  await moreA
+
+  assert.deepEqual(state.files.map((item) => item.id), [100])
+  assert.equal(state.hasMore, false)
+})
+
+test('重新加载（切库/刷新）会把游标重置到第一页', async () => {
+  const { requests, paramsLog, select, respond } = setup({ pageSize: 2 })
+
+  select('A')
+  const loadA = requests.load()
+  respond('A', pageOf(9, 3))
+  await loadA
+
+  select('B')
+  const loadB = requests.load()
+  respond('B', pageOf(5, 3))
+  await loadB
+
+  // 新库的第一页请求不带 before_id：游标没有跨库复用。
+  assert.deepEqual(paramsLog[1], { knowledge_base_id: 'B', limit: 3 })
+
+  const moreB = requests.loadMore()
+  assert.deepEqual(paramsLog[2], { knowledge_base_id: 'B', limit: 3, before_id: 4 })
+  respond('B', [])
+  await moreB
+})
+
+test('没有下一页时 loadMore 不发请求', async () => {
+  const { requests, paramsLog, select, respond } = setup({ pageSize: 3 })
+
+  select('A')
+  const loadA = requests.load()
+  respond('A', pageOf(1, 1))
+  await loadA
+
+  assert.equal(await requests.loadMore(), null)
+  assert.equal(paramsLog.length, 1)
 })
