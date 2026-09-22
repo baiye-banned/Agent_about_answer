@@ -22,7 +22,9 @@ hand edit that skips `format` turns CI red even when every line is under the cap
 gross regression (a note collapsing back into one line), not the gate. The gate is the
 `testsReadmeMagnet.test.js` ratchet, which runs under `npm test` in CI. If a merge does conflict,
 `node scripts/tests_readme_magnet.mjs union <file>` merges both sides in one command; it refuses to
-write - leaving the file untouched - whenever it cannot prove that neither side lost a clause.
+write - leaving the file untouched - whenever it cannot prove that neither side lost a clause, or
+that both sides did not rewrite the same spot of one line (a union there would print that sentence
+twice). A shape it can only *suspect* is written, but the command says so on stderr.
 
 ## Node Tests
 

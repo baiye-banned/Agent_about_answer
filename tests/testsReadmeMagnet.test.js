@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -14,6 +14,9 @@ import { MAX_LINE, WRAP_WIDTH, findParagraphs, parseConflicts, reflow, unwrap, w
 // 用「取一侧」解就会静默丢掉另一侧刚登记的条目（本仓一天实测为此解冲突 ≥7 次）。
 // 现在这两段按软换行折成正常宽度的多行（Markdown 段落内的软换行渲染成空格，折行前后渲染一致）。
 // 本文件是防止磁铁长回来的棘轮：门禁 + 折行器的自证 + 冲突求解器的红绿对照。
+// issue #207 补上冲突求解器的第三种形状：两侧都折行、但各自改写了**同一行的同一处** ——
+// 逐行并集会把同一句话写两遍，零丢失校验发现不了（两侧文字确实都在结果里），所以这个形状
+// 必须拒绝；签名只能算「疑似」时退一档，照写但向 stderr 告警。
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const README = path.join(REPO_ROOT, 'tests/README.md')
@@ -26,13 +29,20 @@ function runUnion(body) {
   caseIndex += 1
   const file = path.join(WORK_DIR, `case-${caseIndex}.md`)
   writeFileSync(file, body, 'utf8')
-  let result
-  try {
-    result = { code: 0, output: execFileSync(process.execPath, [SCRIPT, 'union', file], { encoding: 'utf8' }) }
-  } catch (error) {
-    result = { code: error.status ?? -1, output: `${error.stdout || ''}${error.stderr || ''}` }
+  // 必须用 spawnSync 的 stdio:'pipe'：execFileSync 会把子进程 stderr 直接透传给父进程
+  //（拿不到），而 union 的「疑似同点改写」提示只在 stderr 上 —— 用 execFileSync 的话这条
+  // 断言会永远看到空字符串，用例静默空转。
+  const result = spawnSync(process.execPath, [SCRIPT, 'union', file], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  return {
+    code: result.status ?? -1,
+    stdout: result.stdout || '',
+    stderr: result.stderr || '',
+    output: `${result.stdout || ''}${result.stderr || ''}`,
+    after: readFileSync(file, 'utf8'),
   }
-  return { ...result, after: readFileSync(file, 'utf8') }
 }
 
 test('tests/README.md has exactly the two registration notes, both within the width cap', () => {
@@ -106,6 +116,10 @@ test('a conflicting merge of two registrations is resolved by union with zero lo
   const flat = result.after.replace(/\s+/g, ' ')
   assert.equal(flat.split('alpha clause').length - 1, 1)
   assert.equal(flat.split('beta clause').length - 1, 1)
+  // 正常并集这条路径的行为一个字都不许变：不该多出任何提示（issue #207 加的两档判据都只针对
+  // 「两侧的对应行高度重合」，两侧各追加一条不同子句碰不到它们）。这条断言同时是检测器不许
+  // 退化成「见谁都拒/见谁都喊」的哨兵。
+  assert.equal(result.stderr, '', `正常并集不该有 stderr 输出：${result.stderr}`)
 })
 
 test('union resolves a conflict whose other side is still one legacy long line', () => {
@@ -273,6 +287,139 @@ test('union refuses, and writes nothing, when one paragraph holds more than one 
   assert.equal(result.code, 1, '无法机械求并集时应当拒绝')
   assert.equal(result.after, file, '拒绝时不得改动文件（半写出的解冲突比拒绝更糟）')
   assert.match(result.output, /无法机械求并集/)
+})
+
+test('union refuses when both sides rewrote the same spot of one line (issue #207)', () => {
+  // 两侧都已折行、各自改写**同一行的同一处**（例：首行末词改成 conversation-A / conversation-B）。
+  // 冲突块里是这同一行的两个变体：互不相等也互不包含，于是逐行并集把两个都追加进同一段，
+  // 同一句话被写两遍 —— 而零丢失校验（判据是「冲突块两侧的文本成段连续地出现在结果里」）
+  // **必然通过**，因为两侧的文字确实都在结果里，只是一句话写了两遍。下游也拦不住：折行后
+  // 每行都在上限内，check 判通过、format 判「已是目标宽度」，坏产物看上去完全合规。
+  // 这个形状无法机械求并（git 已把公共行剥掉，谁也没法证明那几个字符是新写的还是改上去的），
+  // 拒绝即安全；写出错句子才致命。
+  const ours = 'These tests cover frontend stream parsing, the chat store conversation-A'
+  const theirs = 'These tests cover frontend stream parsing, the chat store conversation-B'
+  const file = [
+    '# Test Baseline',
+    '',
+    'Current files:',
+    '',
+    '- `a.test.js`',
+    '',
+    '<<<<<<< HEAD',
+    ours,
+    '=======',
+    theirs,
+    '>>>>>>> b',
+    'lifecycle, and the knowledge base indexing path used by the chat page.',
+    '',
+    '## Python Tests',
+    '',
+  ].join('\n')
+
+  const result = runUnion(file)
+  assert.equal(result.code, 1, `同点改写应当拒绝：${result.output}`)
+  assert.equal(result.after, file, '拒绝时不得改动文件（写出被写两遍的段落比拒绝更糟）')
+  assert.match(result.output, /同一行的同一处/, '拒绝消息要点明判据')
+  assert.match(result.output, /写两遍/, '拒绝消息要点明原因：逐行并集会把同一句话写两遍')
+  assert.ok(result.output.includes(ours) && result.output.includes(theirs), '拒绝消息要给出两侧原文供人工择一')
+})
+
+test('union refuses the same-spot rewrite on a note’s last line, where no sentence head repeats', () => {
+  // 上一条的兄弟形状：同点改写在段落的**末行**上，产物里重复的是句子片段（`conversation-A
+  // lifecycle used by the chat page. conversation-B lifecycle used by the chat page.`），
+  // 而不是句头 —— issue 里那份「数『These tests cover』出现几次」的独立探针在这个形状下**完全
+  // 看不见**（句头只出现 1 次）。判据必须落在「两侧对应行逐字对比」上，不能退化成句头计数器。
+  const ours = 'conversation-A lifecycle used by the chat page.'
+  const theirs = 'conversation-B lifecycle used by the chat page.'
+  const file = [
+    '# Test Baseline',
+    '',
+    'These tests cover frontend stream parsing, and the chat store',
+    '<<<<<<< HEAD',
+    ours,
+    '=======',
+    theirs,
+    '>>>>>>> b',
+    '',
+    '## Python Tests',
+    '',
+  ].join('\n')
+
+  const result = runUnion(file)
+  assert.equal(result.code, 1, `同点改写（末行）应当拒绝：${result.output}`)
+  assert.equal(result.after, file, '拒绝时不得改动文件')
+  const flat = result.after.replace(/\s+/g, ' ')
+  assert.equal(flat.split('These tests cover ').length - 1, 1, '这条形状里句头本来就只出现一次')
+  assert.match(result.output, /同一行的同一处/)
+})
+
+test('union warns on stderr when a same-spot rewrite can only be suspected', () => {
+  // 现实形状：两侧各自把子句**续写在同一条未满宽的末行**上（段落折在 100 列，末行常常没写满），
+  // 冲突块里是「同一段原文 + 各自追加的子句」。对照的是**真实的** tests/README.md（仓库外沙盒：
+  // 两条分支各按 README 写的流程追加一行子句再跑 format，真 git merge）：冲突块里那一行是
+  // `…from the stale one. It also covers the …`，首尾共享 71 个字符，并集把 `…from the stale one.`
+  // 写了两遍 —— 也就是说这条形状比 issue 里那份「只在段尾新起一行」的对照臂更常见，而它产出的
+  // 同样是重复句。
+  //
+  // 它却**不能**升级成拒绝：冲突块里只有分歧区域，git 早把公共行剥掉了，「同一段原文 + 各自追加的
+  // 子句」与「两侧各追加了一条措辞相近的子句」在文本上签名重合（实测后者首尾共享 73 个字符，比
+  // 本条还长），按相似度拒绝会把正常并集一起拒掉 —— 而正常并集正是这个工具存在的理由。
+  // 所以这一档只照写 + 告警，把人工识别的成本从「通读产物」降到「看一眼 stderr」。
+  const shared = 'the chat page. It also covers the '
+  const ours = `${shared}alpha exporter path (#901).`
+  const theirs = `${shared}beta importer path (#902).`
+  const file = [
+    '# Test Baseline',
+    '',
+    'These tests cover frontend stream parsing, and the chat store lifecycle used by',
+    '<<<<<<< HEAD',
+    ours,
+    '=======',
+    theirs,
+    '>>>>>>> b',
+    '',
+    '## Python Tests',
+    '',
+  ].join('\n')
+
+  const result = runUnion(file)
+  assert.equal(result.code, 0, `只能「疑似」时不该拒绝正常并集：${result.output}`)
+  assert.notEqual(result.stderr, '', '这个形状下 stderr 必须非空（issue #207 的核心诉求是不再静默）')
+  assert.match(result.stderr, /提醒/)
+  assert.match(result.stderr, /两遍/)
+  // 告警不是空转：产物里那段共享文本确实连着出现了两遍，正是要人工确认的东西。
+  const flat = result.after.replace(/\s+/g, ' ')
+  assert.equal(flat.split(shared).length - 1, 2, '告警指向的重复在产物里应当真的存在')
+  assert.ok(!/^<{7}|^={7}$|^>{7}/m.test(result.after), '并集后不该还留着冲突标记')
+  assert.match(result.after, /\n## Python Tests\n$/, 'union 把冲突块之后的正文截掉了')
+})
+
+test('union still merges two similarly worded appends without refusing (issue #207 false-positive arm)', () => {
+  // 上一条的反向对照：两条**各自独立**追加、措辞相近的子句（各自登记一条行为）必须照旧并出来。
+  // 它与上一条共享同样的签名（差别只有几个词），拒绝它就是把正常并集误伤 —— 这条用例把
+  // 「拒绝线不许往这个方向挪」钉住：可以告警，但两侧的登记一条都不能少、rc 必须是 0。
+  const file = [
+    '# Test Baseline',
+    '',
+    'These tests cover frontend stream parsing, and the chat store lifecycle.',
+    '<<<<<<< HEAD',
+    'and the knowledge base indexing path now refreshes the sidebar after a successful removal (issue #901).',
+    '=======',
+    'and the knowledge base indexing path now refreshes the sidebar after a failed removal (issue #902).',
+    '>>>>>>> b',
+    '',
+    '## Python Tests',
+    '',
+  ].join('\n')
+
+  const result = runUnion(file)
+  assert.equal(result.code, 0, `两条独立追加不许被拒：${result.output}`)
+  const flat = result.after.replace(/\s+/g, ' ')
+  assert.match(flat, /after a successful removal \(issue #901\)\./, 'branch A 的登记丢了')
+  assert.match(flat, /after a failed removal \(issue #902\)\./, 'branch B 的登记丢了')
+  assert.match(result.after, /\n## Python Tests\n$/, 'union 把冲突块之后的正文截掉了')
+  assert.ok(!/^<{7}|^={7}$|^>{7}/m.test(result.after), '并集后不该还留着冲突标记')
 })
 
 test('parseConflicts reports unbalanced markers instead of guessing', () => {
