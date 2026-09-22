@@ -44,8 +44,12 @@ class Conversation(Base):
     __tablename__ = "conversations"
 
     id = Column(String(36), primary_key=True, default=_new_id)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    knowledge_base_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=True)
+    # 侧栏会话列表按 user_id 过滤、按 updated_at 排序，删除知识库时按 knowledge_base_id
+    # 反查会话（crud/knowledge_base.py）：两列都没有索引时前者全表扫描 + 临时排序，
+    # 后者同样整表扫一遍（issue #176）。索引名取 SQLAlchemy 默认的 ix_<表>_<列>，
+    # 与启动期补建（database.session._ensure_single_column_index）同名。
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    knowledge_base_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=True, index=True)
     title = Column(String(200), nullable=False)
     memory_summary = Column(Text, default="")
     memory_summary_upto_message_id = Column(Integer, default=0)
@@ -64,7 +68,9 @@ class Message(Base):
     __tablename__ = "messages"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    conversation_id = Column(String(36), ForeignKey("conversations.id"), nullable=False)
+    # 取一页消息按 conversation_id 过滤：没有索引时只能沿主键倒序往回走，
+    # 走多少行由「这页要往回多远」决定，而不是由本会话有多少条消息决定（issue #176）。
+    conversation_id = Column(String(36), ForeignKey("conversations.id"), nullable=False, index=True)
     role = Column(String(10), nullable=False)
     content = Column(LONGTEXT, nullable=False)
     sources = Column(Text, default="")
