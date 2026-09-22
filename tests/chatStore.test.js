@@ -630,7 +630,8 @@ test('评测轮询：后端状态收敛为失败时同样停止轮询', async ()
 })
 
 test('评测轮询：仍为等待中/评测中时按间隔继续轮询，且不重复起表', async () => {
-  const store = await enterPolling('a', [
+  // 只关心起表次数，不读 store：不绑定返回值，免得留一个没人用的变量。
+  await enterPolling('a', [
     backendMessage(1, 'user', '问题'),
     backendMessage(2, 'assistant', '回答', 'pending'),
   ])
@@ -927,7 +928,7 @@ test('整段历史都已加载后，刷新不会重新点亮「加载更早的�
   const open = store.selectConversation('a')
   respond('a', all)
   await open
-  for (const _ of [1, 2, 3]) {
+  for (let i = 0; i < 3; i += 1) {
     const loading = store.loadOlderMessages()
     respond('a', all)
     await loading

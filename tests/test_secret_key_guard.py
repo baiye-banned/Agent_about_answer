@@ -21,7 +21,7 @@ from sqlalchemy.pool import StaticPool
 import config
 from database import session as db_session
 from database.session import Base
-from model.models import User
+from model.models import RevokedToken, User
 from router import user as user_router
 from service import auth_service
 
@@ -46,7 +46,7 @@ def _client_with_admin() -> TestClient:
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
-    Base.metadata.create_all(bind=engine, tables=[User.__table__])
+    Base.metadata.create_all(bind=engine, tables=[User.__table__, RevokedToken.__table__])
     db = sessionmaker(bind=engine, autoflush=False, autocommit=False)()
     db.add(
         User(

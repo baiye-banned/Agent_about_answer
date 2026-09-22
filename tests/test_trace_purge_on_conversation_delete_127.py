@@ -15,6 +15,7 @@
 「仍在飞的流继续落库」交错时，被重新写回的行同样不能读出内容。
 """
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -31,7 +32,7 @@ from crud import trace as crud_trace
 from database import checkpointer
 from database import session as db_session
 from database.session import Base
-from model.models import ChatTraceSession, Conversation, KnowledgeBase, Message, User
+from model.models import ChatTraceSession, Conversation, KnowledgeBase, Message, RevokedToken, User
 from rag.learning_trace import TraceRecorder
 from router import chat as chat_router
 from router import checkpointer as checkpointer_router
@@ -105,7 +106,7 @@ def api(monkeypatch, tmp_path):
     Base.metadata.create_all(
         bind=engine,
         tables=[
-            User.__table__,
+            User.__table__, RevokedToken.__table__,
             KnowledgeBase.__table__,
             Conversation.__table__,
             Message.__table__,
@@ -201,9 +202,14 @@ def test_trace_written_by_real_recorder_is_purged_with_conversation(api):
     trace_id = "trace-recorder-127"
     recorder = TraceRecorder(user_id=api.alice.id)
     recorder.trace_id = trace_id
-    recorder.attach(conversation_id=CONVERSATION_ID)
-    recorder.add("input_normalized", "stream_chat", creates={"effective_question": QUESTION})
-    recorder.finish("done", conversation_id=CONVERSATION_ID, message_id=api.assistant_message_id)
+
+    async def _write_trace():
+        # 与生产同一口径：add/attach/finish 都是协程，写库交给工作线程（issue #201）。
+        await recorder.attach(conversation_id=CONVERSATION_ID)
+        await recorder.add("input_normalized", "stream_chat", creates={"effective_question": QUESTION})
+        await recorder.finish("done", conversation_id=CONVERSATION_ID, message_id=api.assistant_message_id)
+
+    asyncio.run(_write_trace())
 
     assert trace_id in _trace_rows(api.db), "生产写入路径没落库，用例前提不成立"
     assert api.client.get(f"/api/chat/traces/{trace_id}").status_code == 200, (
@@ -311,9 +317,13 @@ def test_trace_written_after_delete_cannot_be_read_back(api):
 
     recorder = TraceRecorder(user_id=api.alice.id)
     recorder.trace_id = TRACE_ID
-    recorder.attach(conversation_id=CONVERSATION_ID)
-    recorder.add("generation_started", "stream_rag_answer", params={"question": QUESTION})
-    recorder.finish("done", conversation_id=CONVERSATION_ID)
+
+    async def _write_trace():
+        await recorder.attach(conversation_id=CONVERSATION_ID)
+        await recorder.add("generation_started", "stream_rag_answer", params={"question": QUESTION})
+        await recorder.finish("done", conversation_id=CONVERSATION_ID)
+
+    asyncio.run(_write_trace())
 
     rows = _trace_rows(api.db)
     # 如实记录：这行会被写回（存储面残留），断言的是读取面。

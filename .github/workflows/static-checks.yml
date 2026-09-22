@@ -4,12 +4,23 @@ name: 静态检查
 # 升级路线（改这里之前先确认不会把存量代码一次性判红）：
 #   1) 后端：ruff 选择集已经放宽到 E4,E7,E9,F。原先卡在这一档的 6 个历史告警
 #      （backend/main.py 2 个 F401、backend/service/chat_service.py 2 个 F401、
-#      backend/rag/milvus_client.py 2 个 E402）已清掉，所以这里可以直接开。
+#      backend/rag/milvus_client.py 2 个 E402）已消解：4 处 F401 直接删除，2 处 E402
+#      就地 noqa 豁免并注明 pymilvus 导入期冻结 MILVUS_URI 的约束（这两行导入不能上移），
+#      所以这里可以直接开。
 #      之后加仓库根 ruff.toml，逐步放开 E/W/F 全量，再逐个评估 I（import 排序）、
 #      B（bugbear）、UP（pyupgrade）、SIM 等规则集。
-#   2) 前端：node --check 保留为不依赖依赖安装的兜底语法门禁（只覆盖 src/**/*.js），
-#      其后追加 eslint（eslint + eslint-plugin-vue，覆盖 src/ 全量含 .vue；规则集见仓库根
-#      eslint.config.js）。后续再考虑 prettier 与 vue-tsc。
+#   2) 前端：node --check 保留为不依赖依赖安装的兜底语法门禁（覆盖仓库根与 src、tests、scripts
+#      下的 .js/.mjs），其后追加 eslint（eslint + eslint-plugin-vue，全仓；规则集与各目录的
+#      globals 见仓库根 eslint.config.js）。后续再考虑 prettier 与 vue-tsc。
+# 范围：issue #203 起，tests/ 与 scripts/ 也进这两道门禁——此前它们不在任何静态检查范围内，
+# 连 scripts/check_*.mjs 这几个门禁实现体自己都没有门禁。纳入前实测 155 处存量
+# （tests/ 117、scripts/ 38，见 eslint.config.js 的注释），已按「只拦确定性错误」的档位清完。
+# 范围：issue #208 起，仓库根的构建配置（eslint/postcss/tailwind/vite.config.js）也进这两道
+# 门禁。它们此前是唯一一类没有任何门禁覆盖的文件，而恰恰是它们在决定「别的文件怎么被检查、
+# 怎么被构建」。这类文件失守时不一定报红：配置语法坏掉会让 eslint 加载失败、两道门禁都会红；
+# 危险的是「能加载但被改松」（摘规则集、加 ignores、放宽规则），前端 lint 静默变弱而 CI 全绿。
+# 纳入前实测 4 个文件本身是干净的，本单要的是「有门禁守着」，不是修存量错。
+# 作用域一律写成「根级通配」而非四个文件的白名单，后续新增的根级配置自动被覆盖，不留尾巴。
 # 这个 workflow 不做"风格即门禁"的事，也不允许用 continue-on-error 把失败掩盖成绿色。
 
 # 触发：PR → develop / main；push → develop（合入后回归）。
@@ -43,15 +54,17 @@ jobs:
           python-version: "3.10"
 
       # 第一档不依赖任何第三方工具，保证即使 pip 装不上也有一道语法门禁。
+      # tests/ 与 scripts/ 下的 .py 一并纳入（issue #203）：CI 本来就在 3.10 上跑 tests/，
+      # 这里只是把「跑得到」升级成「跑之前先拦语法错」。scripts/ 的 .py 此前无人检查。
       - name: 语法级校验 (compileall)
-        run: python -m compileall -q backend
+        run: python -m compileall -q backend tests scripts
 
       # 版本钉死，避免上游默认规则集变化让门禁悄悄变严或变松。
       - name: 安装 ruff
         run: pip install ruff==0.16.8
 
       - name: ruff 基础规则集
-        run: ruff check --select E4,E7,E9,F backend
+        run: ruff check --select E4,E7,E9,F backend tests scripts
 
   frontend-lint:
     name: 前端静态检查 (node --check + eslint, Node 22)
@@ -67,14 +80,20 @@ jobs:
           node-version: "22"
 
       # node --check 只做语法解析，不需要 npm install。
-      # 只覆盖 .js：.vue 单文件组件不是合法 JS，交给 build.yml 的 vite build 兜底。
-      - name: 语法校验 src/**/*.js
+      # 覆盖 .js 与 .mjs：.vue 单文件组件不是合法 JS，交给 build.yml 的 vite build 兜底。
+      # tests/ 与 scripts/ 一并纳入（issue #203），用例与门禁脚本至少有一道语法门禁。
+      # 仓库根也纳入（issue #208）：第二个 find 用 `-maxdepth 1` 只取根级文件，不递归进 backend/
+      # 等无关目录；两道 find 的输出拼成同一个流，所以根级新增的 .js/.mjs 会自动进这道门禁。
+      - name: 语法校验 仓库根与 src|tests|scripts 下的 .js/.mjs
         run: |
           failed=0
           while IFS= read -r -d '' file; do
             echo "checking $file"
             node --check "$file" || failed=1
-          done < <(find src -name '*.js' -print0)
+          done < <(
+            find src tests scripts \( -name '*.js' -o -name '*.mjs' \) -print0
+            find . -maxdepth 1 \( -name '*.js' -o -name '*.mjs' \) -print0
+          )
           exit "$failed"
 
       # eslint 需要依赖，所以放在不依赖安装的 node --check 之后：即使 npm 装不上，
@@ -82,8 +101,10 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
-      # 与本地 `npm run lint`（eslint src）同一个作用域，覆盖 src/ 下全部 .js 与 .vue。
-      # 这里写全命令而不用 npm run lint，是为了避免 package.json 脚本被改（比如加上 --fix）
-      # 时门禁跟着悄悄变松。
-      - name: eslint (src)
-        run: npx eslint src
+      # 与本地 `npm run lint` 同一个作用域：全仓（src/、tests/、scripts/ 与仓库根，issue #203/#208）。
+      # 各目录与根级构建配置的 globals 声明见仓库根 eslint.config.js。
+      # 写 `eslint .` 而不是逐目录列白名单：作用域等价（实测文件数 76 → 80，新增的恰好是
+      # 四个根级配置，无丢失覆盖），但根级后续新增的配置自动被覆盖，不留手工同步的尾巴。
+      # 不用 `npm run lint` 是为了避免 package.json 脚本被改（比如加上 --fix）时门禁跟着悄悄变松。
+      - name: eslint (全仓)
+        run: npx eslint .

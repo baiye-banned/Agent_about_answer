@@ -64,6 +64,10 @@ for (const key of [
   'requestAnimationFrame',
   'cancelAnimationFrame',
   'getComputedStyle',
+  // vue-router 的 finalizeNavigation 直接读裸全局 `history`（jsdom 的 window 上有、
+  // Node 全局没有），缺了它每次导航都以 `ReferenceError: history is not defined` 收场。
+  'history',
+  'location',
   'FormData',
   'File',
   'Blob',
@@ -104,6 +108,14 @@ for (const key of [
     writable: true,
     configurable: true,
   })
+}
+
+// jsdom 不实现 Element.prototype.scrollTo（浏览器里是有的），而 Chat.vue 的
+// scrollToBottom / loadOlderMessages 会调 `chatRef.value?.scrollTo(...)` —— 可选链挡不住
+// 「方法不存在」，于是变成一条 unhandledRejection，而且往往在用例**结束之后**才冒出来，
+// 记在整套输出上（看起来像别人的错）。滚动位置在 jsdom 里没有任何断言面，补个空实现。
+if (typeof dom.window.Element.prototype.scrollTo !== 'function') {
+  dom.window.Element.prototype.scrollTo = () => {}
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +167,7 @@ function registerLoader(modules) {
  *   modules?: Record<string, string>,  // 相对 src 的模块路径 -> 替代源码
  *   pinia?: boolean,
  *   stubs?: Record<string, any>,
+ *   plugins?: any[],  // 额外装的 app 级插件（如 vue-router 实例）；按传入顺序 use
  * }} options
  */
 export async function mountSfc(filePath, options = {}) {
@@ -183,6 +196,10 @@ export async function mountSfc(filePath, options = {}) {
   const app = vue.createApp(Host)
   app.use(ElementPlus)
   for (const [name, impl] of Object.entries(options.stubs || {})) app.component(name, impl)
+  // vue-router 这类要提供 inject 的插件必须在这里装：Chat.vue / Layout.vue / Login.vue
+  // 用 useRoute() / useRouter() 取路由，缺了它拿到的是 undefined 而不是报错，
+  // 症状会漂成「读 route.path 时抛」——看不出是路由没装。
+  for (const plugin of options.plugins || []) app.use(plugin)
 
   let pinia = null
   if (options.pinia !== false) {

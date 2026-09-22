@@ -13,6 +13,12 @@ const MESSAGE_PAGE_SIZE = 50
 // 只取一页时无法区分「正好取满」和「已经取完」，会给出一个点了没反应的按钮。
 const MESSAGE_FETCH_LIMIT = MESSAGE_PAGE_SIZE + 1
 
+// 会话列表分页：与后端 LIST_DEFAULT_LIMIT / LIST_MAX_LIMIT 保持一致（issue #191）。
+// 侧栏原先一次取回全部会话，接口加上限之后必须给出按需加载的入口，
+// 否则超出上限的会话在界面上就是静默消失。
+const CONVERSATION_PAGE_SIZE = 50
+const CONVERSATION_FETCH_LIMIT = CONVERSATION_PAGE_SIZE + 1
+
 // 把「最新 N+1 条」切成「页面」与「还有更早」：后端按旧 -> 新返回，
 // 多出来的那条是最旧的一条，丢掉它，剩下正好一页。
 function splitPage(rows) {
@@ -23,11 +29,30 @@ function splitPage(rows) {
   }
 }
 
+// 会话列表按「最近活动」倒序返回：多出来的那条是最旧的一条（在末尾），丢掉它剩下正好一页。
+function splitConversationPage(rows) {
+  const hasMore = rows.length > CONVERSATION_PAGE_SIZE
+  return {
+    page: hasMore ? rows.slice(0, CONVERSATION_PAGE_SIZE) : rows,
+    hasMore,
+  }
+}
+
+// 翻页游标：后端按 (updated_at, id) 复合键翻页（会话主键是 uuid，排不出先后；
+// updated_at 只到秒，同秒时按主键定序），所以两样都要回带。
+function conversationCursorOf(page) {
+  const last = page[page.length - 1]
+  if (!last?.id || !last?.updated_at) return null
+  return { id: last.id, updated_at: last.updated_at }
+}
+
 export const useChatStore = defineStore('chat', () => {
   const conversations = ref([])
   const currentId = ref(null)
   const messages = ref([])
   const loading = ref(false)
+  const hasMoreConversations = ref(false)
+  const loadingMoreConversations = ref(false)
   const hasMoreMessages = ref(false)
   const loadingOlderMessages = ref(false)
   const historyManageMode = ref(false)
@@ -52,6 +77,8 @@ export const useChatStore = defineStore('chat', () => {
   let streamSeq = 0
   // 消息窗口是否被截断过（replaceMessages 砍掉后半段），见 refreshMessages 的重建分支。
   let windowTruncated = false
+  // 会话列表已加载区间的末位游标（{ id, updated_at }），loadMoreConversations 用它向后翻。
+  let conversationCursor = null
   // 视图世代：用户显式清空会话视图（新建对话 / 删除会话）时递增。在途流据此放弃「认领新建会话」，
   // 否则用户已经开了新对话，旧流收尾还会把他拽回原会话。
   let viewEpoch = 0
@@ -60,14 +87,47 @@ export const useChatStore = defineStore('chat', () => {
     conversations.value.find((conversation) => conversation.id === currentId.value)
   )
 
+  // 取最新一页会话。收尾（handleStreamDone）与侧栏挂载都走这里：只刷新最前面这一页，
+  // 更早的会话由 loadMoreConversations 按需向后翻——整表取回正是 #191 要修的那件事。
   async function fetchConversations() {
     loading.value = true
     try {
-      const response = await chatAPI.getConversations()
-      conversations.value = Array.isArray(response) ? response : []
+      const response = await chatAPI.getConversations({ limit: CONVERSATION_FETCH_LIMIT })
+      const rows = Array.isArray(response) ? response : []
+      const { page, hasMore } = splitConversationPage(rows)
+      conversations.value = page
+      conversationCursor = conversationCursorOf(page)
+      hasMoreConversations.value = hasMore && conversationCursor !== null
       return conversations.value
     } finally {
       loading.value = false
+    }
+  }
+
+  // 向后翻页：以已加载区间的最后一条作游标，把更早的一页接在列表末尾。
+  // 后端按同一游标返回，翻页不会重复也不会漏；取不满一页即说明已经到最早一条。
+  async function loadMoreConversations() {
+    if (!hasMoreConversations.value || loadingMoreConversations.value || !conversationCursor) return
+    loadingMoreConversations.value = true
+    try {
+      const response = await chatAPI.getConversations({
+        limit: CONVERSATION_FETCH_LIMIT,
+        before_updated_at: conversationCursor.updated_at,
+        before_id: conversationCursor.id,
+      })
+      const rows = Array.isArray(response) ? response : []
+      const { page, hasMore } = splitConversationPage(rows)
+      // 逐条去重：流式收尾新插入的会话、以及刷新期间被改动的会话都可能与这一页重叠。
+      const known = new Set(conversations.value.map((item) => item.id))
+      const fresh = page.filter((item) => item?.id && !known.has(item.id))
+      if (fresh.length) {
+        conversations.value = [...conversations.value, ...fresh]
+      }
+      const nextCursor = conversationCursorOf(page)
+      if (nextCursor) conversationCursor = nextCursor
+      hasMoreConversations.value = hasMore && nextCursor !== null
+    } finally {
+      loadingMoreConversations.value = false
     }
   }
 
@@ -598,6 +658,8 @@ export const useChatStore = defineStore('chat', () => {
     currentId,
     messages,
     loading,
+    hasMoreConversations,
+    loadingMoreConversations,
     hasMoreMessages,
     loadingOlderMessages,
     historyManageMode,
@@ -612,6 +674,7 @@ export const useChatStore = defineStore('chat', () => {
     errorMessage,
     currentConversation,
     fetchConversations,
+    loadMoreConversations,
     selectConversation,
     loadOlderMessages,
     addMessage,

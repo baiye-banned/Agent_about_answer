@@ -33,7 +33,7 @@ import rag.llm as llm
 from conftest import FakeKnowledgeBase
 from crud import knowledge_file
 from crud import chat as crud_chat
-from model.models import Message
+from model.models import Message, User
 from rag import milvus_client, vision_service
 from schema.schemas import ChatRequest
 from service import chat_service, oss_service
@@ -127,8 +127,9 @@ def real_trace(monkeypatch):
         original_init(self, *args, **kwargs)
         collector.instances.append(self)
 
-    def spy_add(self, *args, **kwargs):
-        event = original_add(self, *args, **kwargs)
+    async def spy_add(self, *args, **kwargs):
+        # `add` 在 issue #201 之后是协程（写库交给工作线程），间谍必须照样 await 真实现。
+        event = await original_add(self, *args, **kwargs)
         if event:
             collector.events.append(event)
         return event
@@ -140,7 +141,11 @@ def real_trace(monkeypatch):
 
 def _patch_stream_boundaries(monkeypatch, fake_db):
     """只打桩真正的边界（鉴权/会话工厂/知识库解析/检索/模型），其余跑真实实现。"""
-    monkeypatch.setattr(chat_service, "decode_token", lambda authorization: "alice")
+    monkeypatch.setattr(
+        chat_service,
+        "authenticate",
+        lambda db, authorization: db.query(User).filter_by(username="alice").first(),
+    )
     monkeypatch.setattr(chat_service, "SessionLocal", lambda: fake_db)
     monkeypatch.setattr(chat_service, "resolve_knowledge_base", lambda db, kid, user_id: FakeKnowledgeBase())
 
@@ -375,7 +380,14 @@ OSS_CONFIG = {
     "OSS_BUCKET": "demo",
     "OSS_ENDPOINT": "https://oss-cn-hangzhou.aliyuncs.com",
 }
-IMAGE_ATTACHMENT = {"object_key": "uploads/考勤.png", "file_name": "考勤.png", "content_type": "image/png"}
+# 键必须是铸造形态（照抄上传路径铸出来的样子）：issue #181 之后出网口与写库口、删除口
+# 共用同一条形态判据，非自铸键到不了 `_request_image_description`，本节要验的
+# 「异常原文不进帧」就无从触发。键的形状本身由 tests/test_vision_outbound_guard_181.py 覆盖。
+IMAGE_ATTACHMENT = {
+    "object_key": "rag-chat/2026/09/21/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png",
+    "file_name": "考勤.png",
+    "content_type": "image/png",
+}
 
 
 def _patch_real_vision(monkeypatch):

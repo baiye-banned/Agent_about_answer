@@ -153,6 +153,39 @@ def test_documented_values_match_config_defaults():
     assert mismatched == [], "defaults drifted from backend/config.py: " + "; ".join(mismatched)
 
 
+def test_mysql_password_example_is_a_placeholder_not_a_usable_value():
+    """数据库口令与 SECRET_KEY 同强度（issue #185）：模板只给占位说明，不给可用口令。
+
+    模板里留一个能照抄的 `MYSQL_PASSWORD=change-me`，等于让每个复制 `.env.example` 的部署
+    共用同一个可猜口令。实现侧已把它当占位值拒绝启动，这条把文案一侧钉住。
+    """
+    placeholder = _module_constant("DEFAULT_MYSQL_PASSWORD")
+    assert placeholder, "DEFAULT_MYSQL_PASSWORD not found in backend/config.py"
+
+    documented = _parse_env_example()
+    assert "MYSQL_PASSWORD" in documented, "MYSQL_PASSWORD is no longer documented in .env.example"
+    value = documented["MYSQL_PASSWORD"]
+
+    assert value != placeholder, (
+        "MYSQL_PASSWORD must not ship the public placeholder as a copyable default: it is the "
+        "value the startup guard refuses to connect with, so documenting it reintroduces a "
+        "known database credential"
+    )
+    assert value.startswith("<") and value.endswith(">"), (
+        "MYSQL_PASSWORD must stay an explicit placeholder instruction (no usable value, but "
+        f"not an empty one either: empty falls back to the placeholder), got {value!r}"
+    )
+
+    readme_values = [
+        line.strip().partition("=")[2].strip()
+        for line in README.read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith("MYSQL_PASSWORD=")
+    ]
+    assert placeholder not in readme_values, (
+        f"README.md still shows the database placeholder as a value to copy: {readme_values}"
+    )
+
+
 def test_secret_key_example_is_the_public_placeholder_everywhere():
     placeholder = _module_constant("DEFAULT_SECRET_KEY")
     assert placeholder, "DEFAULT_SECRET_KEY not found in backend/config.py"

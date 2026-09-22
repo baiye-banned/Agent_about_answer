@@ -20,9 +20,32 @@ class User(Base):
     username = Column(String(50), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
     avatar = Column(String(500), default="")
+    # 令牌世代（issue #184）：改密时 +1，让改密前签发的全部 token 立即失效。
+    # 存量库由 database/session.py 的补列迁移补上（NOT NULL DEFAULT 0），因此老用户的
+    # 当前世代同样是 0，不需要额外回填脚本。
+    token_version = Column(Integer, nullable=False, default=0, server_default="0")
     created_at = Column(DateTime, server_default=func.now())
 
     conversations = relationship("Conversation", back_populates="user")
+
+
+class RevokedToken(Base):
+    """已登出的 token 登记行，按 jti 一条（issue #184）。
+
+    与 `users.token_version` 分工不同，两者缺一不可：token_version 是「整个用户」的世代，
+    改密时递增，把该用户名下所有已签发 token 一次作废；这张表是「单枚 token」的吊销面，
+    登出时只登记当前这一枚，其他会话的 token 不受影响。若登出也走 token_version，用户
+    在手机上退出登录会把桌面端的会话一起踢掉。
+
+    jti 是 token 自带的随机 id（`uuid4().hex`，32 字符），token 自身带 exp（默认最长 24h）；
+    过期行不会再被任何请求命中，本仓暂不引入清理任务，将来需要回收时按 token 的 exp 删即
+    可（这里不存 exp，是因为在没有回收方之前它只是一列没人读的数据）。
+    """
+
+    __tablename__ = "revoked_tokens"
+
+    jti = Column(String(36), primary_key=True)
+    created_at = Column(DateTime, server_default=func.now())
 
 
 class KnowledgeBase(Base):
@@ -44,8 +67,12 @@ class Conversation(Base):
     __tablename__ = "conversations"
 
     id = Column(String(36), primary_key=True, default=_new_id)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    knowledge_base_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=True)
+    # 侧栏会话列表按 user_id 过滤、按 updated_at 排序，删除知识库时按 knowledge_base_id
+    # 反查会话（crud/knowledge_base.py）：两列都没有索引时前者全表扫描 + 临时排序，
+    # 后者同样整表扫一遍（issue #176）。索引名取 SQLAlchemy 默认的 ix_<表>_<列>，
+    # 与启动期补建（database.session._ensure_single_column_index）同名。
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    knowledge_base_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=True, index=True)
     title = Column(String(200), nullable=False)
     memory_summary = Column(Text, default="")
     memory_summary_upto_message_id = Column(Integer, default=0)
@@ -64,7 +91,9 @@ class Message(Base):
     __tablename__ = "messages"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    conversation_id = Column(String(36), ForeignKey("conversations.id"), nullable=False)
+    # 取一页消息按 conversation_id 过滤：没有索引时只能沿主键倒序往回走，
+    # 走多少行由「这页要往回多远」决定，而不是由本会话有多少条消息决定（issue #176）。
+    conversation_id = Column(String(36), ForeignKey("conversations.id"), nullable=False, index=True)
     role = Column(String(10), nullable=False)
     content = Column(LONGTEXT, nullable=False)
     sources = Column(Text, default="")

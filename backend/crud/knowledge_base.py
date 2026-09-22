@@ -1,6 +1,7 @@
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
+from crud.pagination import LIST_DEFAULT_LIMIT, clamp_limit
 from model.models import Conversation, KnowledgeBase, KnowledgeFile
 
 
@@ -56,11 +57,30 @@ def resolve_knowledge_base(db: Session, knowledge_base_id: int | None, user_id: 
     return get_default_knowledge_base(db, user_id)
 
 
-def list_knowledge_bases(db: Session, user_id: int) -> list[KnowledgeBase]:
+def list_knowledge_bases(
+    db: Session,
+    user_id: int,
+    *,
+    limit: int = LIST_DEFAULT_LIMIT,
+    after_id: int | None = None,
+) -> list[KnowledgeBase]:
+    """按 user_id 取一页知识库，返回「旧 -> 新」顺序（与旧接口的 created_at 升序一致）。
+
+    翻页语义（issue #191）：**键集游标**，不用 offset——offset 在翻页期间新建知识库时
+    会整体位移，同一行被翻到两次、另一行永远翻不到。
+
+    序键从 `created_at` 换成自增主键 `id`，可见顺序不变（自增主键与插入顺序严格一致，
+    后建的库 created_at 不会更早），换来的是可翻页：`created_at` 是秒级 DATETIME，
+    同一秒建出来的多个库按它排序不稳定，做游标会重复或漏行。游标取 `id > after_id`，
+    即「接着上一页往新的一页翻」，翻页途中新建的库排在游标之后，已经翻过的区间不位移。
+    """
+    limit = clamp_limit(limit)
+    query = db.query(KnowledgeBase).filter_by(user_id=user_id)
+    if after_id is not None:
+        query = query.filter(KnowledgeBase.id > after_id)
     return (
-        db.query(KnowledgeBase)
-        .filter_by(user_id=user_id)
-        .order_by(KnowledgeBase.created_at.asc())
+        query.order_by(KnowledgeBase.id.asc())
+        .limit(limit)
         .all()
     )
 
@@ -83,13 +103,29 @@ def get_fallback_knowledge_base(db: Session, deleted_id: int, user_id: int) -> K
 
 
 def list_files_for_knowledge_base(db: Session, kid: int) -> list[KnowledgeFile]:
-    """知识库下的全部文件。
+    """知识库下的全部文件（只取列表元数据，不含正文）。
 
     按知识库 id 取，不再叠加 user_id 过滤：文件既可能带 user_id，也可能是回填前的历史行。
     调用方必须先用 get_knowledge_base(db, kid, user_id) 校验归属；删除知识库时需要清空
     其下所有文件，否则外键会悬挂。
+
+    列集与 list_knowledge_files 一致（id/knowledge_base_id/name/size/created_at），
+    显式排除 content（LONGTEXT）：调用方只要 id 或删行，没有一处需要正文，整行取会把
+    每个文件的正文搬进内存。本函数的返回值禁止用于正文读取——访问 content 会让
+    SQLAlchemy 按行补查，等于把这里省下的正文又读回来。
     """
-    return db.query(KnowledgeFile).filter_by(knowledge_base_id=kid).all()
+    return (
+        db.query(KnowledgeFile)
+        .options(load_only(
+            KnowledgeFile.id,
+            KnowledgeFile.knowledge_base_id,
+            KnowledgeFile.name,
+            KnowledgeFile.size,
+            KnowledgeFile.created_at,
+        ))
+        .filter_by(knowledge_base_id=kid)
+        .all()
+    )
 
 
 def knowledge_base_name_exists(db: Session, name: str, user_id: int, exclude_id: int | None = None) -> bool:

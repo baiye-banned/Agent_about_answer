@@ -28,9 +28,84 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+_logger = logging.getLogger(__name__)
+
+
 # MySQL
+# 下面的字面量是随仓库公开的占位口令，任何人都读得到，因此绝不能成为部署真正拿去连库的口令。
+# 与 SECRET_KEY 同一治理强度：未配置或仍是占位值时，ensure_mysql_password_configured() 会在
+# 启动路径上拒绝启动（见 main.lifespan）。口令的解析必须发生在 DATABASE_URL 拼接之前，所以这组
+# 定义落在 MySQL 段内，而 SECRET_KEY 的对应定义在文件末尾——放置位置不同，治理策略相同。
+DEFAULT_MYSQL_PASSWORD = "change-me"
+ALLOW_INSECURE_DEFAULT_MYSQL_PASSWORD = _env_bool("ALLOW_INSECURE_DEFAULT_MYSQL_PASSWORD", False)
+
+MYSQL_PASSWORD_SOURCE_ENV = "env"  # scan-secrets:allow source label, not a credential
+MYSQL_PASSWORD_SOURCE_INSECURE_DEV = "insecure-dev"  # scan-secrets:allow source label, not a credential
+MYSQL_PASSWORD_SOURCE_UNCONFIGURED = "unconfigured"  # scan-secrets:allow source label, not a credential
+
+MYSQL_PASSWORD_ERROR = (
+    "MYSQL_PASSWORD 未配置，或仍是仓库内置的公开占位值，服务拒绝启动。\n"
+    "请在环境变量或 .env 中设置一个足够长的随机口令，并把同一口令设到 MySQL 对应账号上，例如：\n"
+    "  python -c \"import secrets; print(secrets.token_urlsafe(24))\"\n"
+    "仅本地开发可临时设置 ALLOW_INSECURE_DEFAULT_MYSQL_PASSWORD=true 放行：该开关让进程用默认\n"
+    "占位口令连库，任何拿到本仓库的人都能用同一口令连上你的数据库，禁止用于对外可访问的部署。"
+)
+
+
+class MysqlPasswordError(RuntimeError):
+    """Raised at startup when MYSQL_PASSWORD is missing or still the public placeholder."""
+
+
+def resolve_mysql_password(password, allow_insecure_default):
+    """Resolve the database password into ``(password, source)``.
+
+    The repository placeholder is never returned as a usable password: when the value
+    is missing or still the placeholder, an unguessable random one is generated
+    instead, so a connection made by code that skips the startup check fails outright
+    rather than succeeding with a publicly known credential.
+    """
+    candidate = (password or "").strip()
+    if candidate and candidate != DEFAULT_MYSQL_PASSWORD:
+        return candidate, MYSQL_PASSWORD_SOURCE_ENV
+    if allow_insecure_default:
+        _logger.warning(
+            "MYSQL_PASSWORD is not configured; ALLOW_INSECURE_DEFAULT_MYSQL_PASSWORD=true so "
+            "this process connects with the public repository placeholder. Set a real password "
+            "and never use this for a deployment reachable by others."
+        )
+        return DEFAULT_MYSQL_PASSWORD, MYSQL_PASSWORD_SOURCE_INSECURE_DEV
+    _logger.warning(
+        "MYSQL_PASSWORD is not configured or is still the public repository placeholder. "
+        "The process will refuse to start; set MYSQL_PASSWORD to a random value."
+    )
+    return secrets.token_urlsafe(32), MYSQL_PASSWORD_SOURCE_UNCONFIGURED
+
+
+def mysql_password_is_usable() -> bool:
+    """True when the process has a non-placeholder password to connect with.
+
+    That is either an explicitly configured MYSQL_PASSWORD, or the local-dev escape
+    hatch. Only the unconfigured case is unusable.
+    """
+    return MYSQL_PASSWORD_SOURCE != MYSQL_PASSWORD_SOURCE_UNCONFIGURED
+
+
+def ensure_mysql_password_configured() -> None:
+    """Fail fast when the database would be reached with a publicly known password.
+
+    Called from the application startup path, independently of the SECRET_KEY gate: a
+    deployment that forgot to set MYSQL_PASSWORD must not silently serve traffic on
+    credentials anyone with a copy of this repository can guess.
+    """
+    if not mysql_password_is_usable():
+        raise MysqlPasswordError(MYSQL_PASSWORD_ERROR)
+
+
+MYSQL_PASSWORD, MYSQL_PASSWORD_SOURCE = resolve_mysql_password(
+    os.getenv("MYSQL_PASSWORD"), ALLOW_INSECURE_DEFAULT_MYSQL_PASSWORD
+)
+
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "change-me")
 MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
 MYSQL_PORT = os.getenv("MYSQL_PORT", "3306")
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "rag_system")
@@ -187,6 +262,15 @@ CHAT_ATTACHMENT_SWEEP_BATCH_LIMIT = _env_int("CHAT_ATTACHMENT_SWEEP_BATCH_LIMIT"
 # 迟一点没有正确性代价，而每轮都要串行外呼 OSS。
 CHAT_ATTACHMENT_SWEEP_INTERVAL_SECONDS = _env_int("CHAT_ATTACHMENT_SWEEP_INTERVAL_SECONDS", 6 * 60 * 60)
 
+# 请求限流（issue #183）。计数器在进程内存里（见 service/rate_limit.py），多 worker / 多实例
+# 部署时每个进程各持一份，真实上限 = 配置值 × 进程数。登录侧按「账号 + 来源地址」计数：
+# 阈值内的正确口令不受影响，超阈值后连正确口令一起拒到窗口滑出（否则每次拒绝都要先跑一遍
+# bcrypt，攻击者照样能烧 CPU），窗口滑出即自动恢复，不做永久锁定。
+LOGIN_RATE_LIMIT_MAX_FAILURES = _env_int("LOGIN_RATE_LIMIT_MAX_FAILURES", 5)
+LOGIN_RATE_LIMIT_WINDOW_SECONDS = _env_int("LOGIN_RATE_LIMIT_WINDOW_SECONDS", 300)
+# 同一进程内同时在跑的 SSE 聊天流上限；超出的请求立刻 429，不排队等上游超时。
+CHAT_STREAM_MAX_CONCURRENCY = _env_int("CHAT_STREAM_MAX_CONCURRENCY", 8)
+
 # JWT
 # The literal below is a public placeholder shipped with the repository; anyone can
 # read it, so it must never be used as an actual HS256 signing key.
@@ -204,8 +288,6 @@ SECRET_KEY_ERROR = (
     "仅本地开发可临时设置 ALLOW_INSECURE_DEFAULT_SECRET=true 放行：该开关让进程使用一次性\n"
     "随机密钥启动，每次重启都会使已签发的 token 全部失效，禁止用于任何对外可访问的部署。"
 )
-
-_logger = logging.getLogger(__name__)
 
 
 class SecretKeyError(RuntimeError):

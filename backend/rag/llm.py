@@ -138,7 +138,7 @@ async def stream_answer_events(
     use_rag: bool = True,
 ):
     messages = build_answer_messages(question, context, memory_context, use_rag)
-    _trace_add(
+    await _trace_add(
         trace,
         "langchain_generation_prompt_built",
         "LangChain ChatOpenAI",
@@ -156,7 +156,7 @@ async def stream_answer_events(
         return
     except Exception as exc:
         logger.warning("DeepSeek stream generation failed: %s", exc, exc_info=True)
-        _trace_add(
+        await _trace_add(
             trace,
             "langchain_generation_failed",
             "ChatOpenAI.astream",
@@ -184,7 +184,7 @@ async def stream_answer_events(
         "reason": "text_fallback",
         "message": "DeepSeek 生成中断，已切换到文本后备模型重新生成本轮回答。",
     }
-    _trace_add(
+    await _trace_add(
         trace,
         "langchain_stream_reset",
         "ChatOpenAI.astream",
@@ -194,7 +194,7 @@ async def stream_answer_events(
     yield reset_event
 
     try:
-        _trace_add(
+        await _trace_add(
             trace,
             "langchain_text_fallback_started",
             "ChatOpenAI.astream",
@@ -204,7 +204,7 @@ async def stream_answer_events(
         async for chunk in _stream_model_chunks(get_text_fallback_model(streaming=True, temperature=0.1), messages):
             yield chunk
     except Exception as exc:
-        _trace_add(
+        await _trace_add(
             trace,
             "langchain_text_fallback_failed",
             "ChatOpenAI.astream",
@@ -291,10 +291,15 @@ def _text_value(value) -> str:
     return "" if value is None else str(value)
 
 
-def _trace_add(trace: Any, *args, **kwargs) -> None:
+async def _trace_add(trace: Any, *args, **kwargs) -> None:
+    """记录一条生成侧事件；失败只进 debug 日志，绝不影响本轮回答。
+
+    `TraceRecorder.add` 是协程（写库交给工作线程，issue #201），这里 await 它——调用点都在
+    `stream_answer_events` 这个异步生成器里，也就是事件循环线程上。
+    """
     if not trace:
         return
     try:
-        trace.add(*args, **kwargs)
+        await trace.add(*args, **kwargs)
     except Exception:
         logger.debug("Trace add failed", exc_info=True)

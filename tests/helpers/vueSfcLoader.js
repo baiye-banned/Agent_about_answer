@@ -60,10 +60,22 @@ function stubUrl(source) {
   return `data:text/javascript;base64,${Buffer.from(source).toString('base64')}#.mjs`
 }
 
-function overrideFor(url) {
+// 替换模块自己去 import**「被它替换掉的那个原模块」**时不再替换。
+//
+// 少了这条豁免，观察型替身就写不出来：`tests/helpers/sanitizeHtmlProbe.js` 包了一层
+// 真实实现（记录入参/出参后原样转交），它 import 的原模块与 registry 里登记的键指向同一个
+// 文件，于是同一条替换规则会把**替身自己**再替回来 —— 模块 import 自己。
+// 判据取 parentURL（谁在 import）而不是被 import 的 URL：豁免只对替身内部生效。
+function isReplacementModule(parentURL) {
+  if (!parentURL) return false
+  return Object.values(registry).some((value) => typeof value === 'string' && value === parentURL)
+}
+
+function overrideFor(url, parentURL) {
   // 只有 file: 才有磁盘路径可谈；node: 内置模块直接放行
   // （否则 fileURLToPath('node:module') 会抛 ERR_INVALID_URL_SCHEME）。
   if (!url.startsWith('file:')) return null
+  if (isReplacementModule(parentURL)) return null
 
   // src 内的模块用相对 src 的短键（可读），src 外的（node_modules 里的垫片）
   // 用规范化绝对路径作键。
@@ -91,7 +103,7 @@ function toStubUrl(value) {
 export async function resolve(specifier, context, nextResolve) {
   if (specifier.startsWith('@/')) {
     const url = resolveAlias(specifier)
-    return overrideFor(url) || { url, shortCircuit: true }
+    return overrideFor(url, context.parentURL) || { url, shortCircuit: true }
   }
 
   // 相对 / 绝对路径：先按 Vite 的补全规则试一遍，命中就直接短路，
@@ -99,7 +111,9 @@ export async function resolve(specifier, context, nextResolve) {
   if (specifier.startsWith('.') || specifier.startsWith('/')) {
     try {
       const candidate = withSuffixes(fileURLToPath(new URL(specifier, context.parentURL)))
-      if (candidate) return overrideFor(candidate) || { url: candidate, shortCircuit: true }
+      if (candidate) {
+        return overrideFor(candidate, context.parentURL) || { url: candidate, shortCircuit: true }
+      }
     } catch {
       // fileURLToPath 对带 query/hash 的 URL 会抛，退回默认解析。
     }
@@ -107,7 +121,7 @@ export async function resolve(specifier, context, nextResolve) {
 
   const resolved = await nextResolve(specifier, context)
   // 裸包名（以及上面没命中的情况）走正常解析，再按解析结果决定要不要换掉。
-  return overrideFor(resolved.url) || resolved
+  return overrideFor(resolved.url, context.parentURL) || resolved
 }
 
 // Vite 在构建期把 import.meta.env 静态替换掉，Node 里它是 undefined，
@@ -120,6 +134,12 @@ const ENV_EXPR = 'import.meta.env'
 const ENV_GLOBAL = 'globalThis.__VITE_ENV__'
 
 export async function load(url, context, nextLoad) {
+  // Vite 允许 `import 'x.css'`（构建期抽成样式表再注入 <style>），Node 的 ESM 加载器
+  // 对 .css 直接抛 ERR_UNKNOWN_FILE_EXTENSION。挂载用例的断言面是组件逻辑，样式在 jsdom
+  // 里没有任何可断言的东西，所以统一换成一个空模块 —— 否则任何 import 了样式的组件
+  //（如 MarkdownRenderer.vue 的 highlight.js 主题）连挂载都进不去。
+  if (url.endsWith('.css')) return { format: 'module', source: '', shortCircuit: true }
+
   const isVue = url.endsWith('.vue')
   const isSrcJs = /\.m?js$/.test(url) && url.startsWith(pathToFileURL(srcRoot).href)
 

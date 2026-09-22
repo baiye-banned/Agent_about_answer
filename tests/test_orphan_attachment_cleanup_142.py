@@ -49,7 +49,7 @@ import main
 from crud import chat as crud_chat
 from database import session as db_session
 from database.session import Base
-from model.models import ChatAttachmentUpload, ChatTraceSession, Conversation, Message, User
+from model.models import ChatAttachmentUpload, ChatTraceSession, Conversation, Message, RevokedToken, User
 from router import chat as chat_router
 from schema.schemas import ChatRequest
 from service import auth_service, chat_service, oss_service
@@ -157,7 +157,7 @@ def api(monkeypatch, tmp_path):
     Base.metadata.create_all(
         bind=engine,
         tables=[
-            User.__table__,
+            User.__table__, RevokedToken.__table__,
             Conversation.__table__,
             Message.__table__,
             ChatTraceSession.__table__,
@@ -630,7 +630,10 @@ def test_consuming_the_upload_never_commits_on_its_own(api, oss_requests):
 def test_lifespan_schedules_the_orphan_sweep(monkeypatch):
     """启动期必须挂上清扫任务（issue #142 点名的缺口：lifespan 里没有任何清扫）。"""
     calls = []
+    # 两条启动门禁都置空：本用例测的是清扫是否挂上，不测配置门禁，而它跑在测试环境里
+    # （未配 MYSQL_PASSWORD），否则会死在门禁上而不是断言上。
     monkeypatch.setattr(main, "ensure_secret_key_configured", lambda: None)
+    monkeypatch.setattr(main, "ensure_mysql_password_configured", lambda: None)
     monkeypatch.setattr(main, "init_db", lambda: None)
     monkeypatch.setattr(main, "seed_default_users", lambda: None)
     monkeypatch.setattr(main, "schedule_orphan_attachment_sweep", lambda: calls.append("sweep"))
@@ -807,13 +810,13 @@ class _FakeChatTrace:
         self.user_id = user_id
         self.trace_id = "trace-test"
 
-    def add(self, *_args, **_kwargs):
+    async def add(self, *_args, **_kwargs):
         pass
 
-    def attach(self, **_kwargs):
+    async def attach(self, **_kwargs):
         pass
 
-    def finish(self, *_args, **_kwargs):
+    async def finish(self, *_args, **_kwargs):
         pass
 
     def snapshot(self):
@@ -894,7 +897,11 @@ def _stub_stream_chat_dependencies(api, monkeypatch):
         lambda db, knowledge_base_id, user_id: SimpleNamespace(id=1, name="kb", user_id=user_id),
     )
     monkeypatch.setattr(chat_service, "SessionLocal", lambda: api.db)
-    monkeypatch.setattr(chat_service, "decode_token", lambda authorization: alice_username)
+    monkeypatch.setattr(
+        chat_service,
+        "authenticate",
+        lambda db, authorization: db.query(User).filter_by(username=alice_username).first(),
+    )
     monkeypatch.setattr(chat_service, "TraceRecorder", _FakeChatTrace)
     monkeypatch.setattr(chat_service, "_build_effective_question", fake_build_effective_question)
     monkeypatch.setattr(chat_service, "_build_recent_memory_text", fake_recent_memory_text)
@@ -906,9 +913,12 @@ def _stub_stream_chat_dependencies(api, monkeypatch):
     monkeypatch.setattr(chat_service, "stream_rag_answer", fake_stream_rag_answer)
     monkeypatch.setattr(chat_service, "_trace_sse_payloads", lambda trace: [])
     monkeypatch.setattr(chat_service, "_build_sources", lambda chunks: [])
-    monkeypatch.setattr(chat_service, "_attach_grounding_trace", lambda *args, **kwargs: None)
-    monkeypatch.setattr(chat_service, "_safe_trace_attach", lambda *args, **kwargs: None)
-    monkeypatch.setattr(chat_service, "_safe_trace_finish", lambda *args, **kwargs: None)
+    async def _noop_trace(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(chat_service, "_attach_grounding_trace", _noop_trace)
+    monkeypatch.setattr(chat_service, "_safe_trace_attach", _noop_trace)
+    monkeypatch.setattr(chat_service, "_safe_trace_finish", _noop_trace)
     monkeypatch.setattr(chat_service, "_schedule_memory_summary_update", lambda *args, **kwargs: None)
     monkeypatch.setattr(chat_service, "schedule_ragas_evaluation", lambda *args, **kwargs: None)
 

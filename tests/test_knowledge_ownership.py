@@ -19,7 +19,7 @@ from sqlalchemy.pool import StaticPool
 
 from database import session as db_session
 from database.session import Base
-from model.models import Conversation, KnowledgeBase, KnowledgeFile, Message, User
+from model.models import Conversation, KnowledgeBase, KnowledgeFile, Message, RevokedToken, User
 from router import auth as auth_router
 from router import knowledge as knowledge_router
 from schema.schemas import ChatRequest
@@ -49,7 +49,7 @@ def api(monkeypatch):
     Base.metadata.create_all(
         bind=engine,
         tables=[
-            User.__table__,
+            User.__table__, RevokedToken.__table__,
             KnowledgeBase.__table__,
             KnowledgeFile.__table__,
             Conversation.__table__,
@@ -403,13 +403,13 @@ class _FakeChatTrace:
         self.user_id = user_id
         self.trace_id = "trace-test"
 
-    def add(self, *_args, **_kwargs):
+    async def add(self, *_args, **_kwargs):
         pass
 
-    def attach(self, **_kwargs):
+    async def attach(self, **_kwargs):
         pass
 
-    def finish(self, *_args, **_kwargs):
+    async def finish(self, *_args, **_kwargs):
         pass
 
     def snapshot(self):
@@ -446,7 +446,11 @@ def _run_stream_chat(api, monkeypatch, username, conversation_id):
         yield "回答"
 
     monkeypatch.setattr(chat_service, "SessionLocal", lambda: api.db)
-    monkeypatch.setattr(chat_service, "decode_token", lambda authorization: username)
+    monkeypatch.setattr(
+        chat_service,
+        "authenticate",
+        lambda db, authorization: db.query(User).filter_by(username=username).first(),
+    )
     monkeypatch.setattr(chat_service, "TraceRecorder", _FakeChatTrace)
     monkeypatch.setattr(chat_service, "_build_effective_question", fake_build_effective_question)
     monkeypatch.setattr(chat_service, "_build_recent_memory_text", fake_recent_memory_text)
@@ -459,9 +463,12 @@ def _run_stream_chat(api, monkeypatch, username, conversation_id):
     monkeypatch.setattr(chat_service, "stream_rag_answer", fake_stream_rag_answer)
     monkeypatch.setattr(chat_service, "_trace_sse_payloads", lambda trace: [])
     monkeypatch.setattr(chat_service, "_build_sources", lambda chunks: [])
-    monkeypatch.setattr(chat_service, "_attach_grounding_trace", lambda *args, **kwargs: None)
-    monkeypatch.setattr(chat_service, "_safe_trace_attach", lambda *args, **kwargs: None)
-    monkeypatch.setattr(chat_service, "_safe_trace_finish", lambda *args, **kwargs: None)
+    async def _noop_trace(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(chat_service, "_attach_grounding_trace", _noop_trace)
+    monkeypatch.setattr(chat_service, "_safe_trace_attach", _noop_trace)
+    monkeypatch.setattr(chat_service, "_safe_trace_finish", _noop_trace)
     monkeypatch.setattr(chat_service, "_schedule_memory_summary_update", lambda *args, **kwargs: None)
     monkeypatch.setattr(chat_service, "schedule_ragas_evaluation", lambda *args, **kwargs: None)
 

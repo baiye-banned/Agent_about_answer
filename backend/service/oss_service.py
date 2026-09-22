@@ -32,7 +32,7 @@ SERVICE_MINTED_KEY_PATTERN = re.compile(
 
 
 class ForeignObjectKeyError(ValueError):
-    """对象键不是本服务铸造的：拒绝用它签发任何带服务端凭据的请求。"""
+    """对象键不是本服务铸造的：拒绝用它构造桶内对象的 URL，也拒绝用它签发任何带服务端凭据的请求。"""
 
 
 def is_service_minted_key(object_key: object) -> bool:
@@ -142,5 +142,21 @@ def _sign_oss_url(object_key: str, expires: int = 3600) -> str:
 
 
 def _public_oss_url(object_key: str) -> str:
+    """公开读的对象 URL。
+
+    这里是全仓唯一一处**构造桶内对象 URL** 的地方（上传接口回给前端的 `url` 与 vision
+    出网口都走它），护栏放在这里而不是调用点，与 `_delete_oss_object` 同一个理由：
+    键是客户端能回带的（聊天附件列就是 `/api/chat/stream` 的 body 原样落库的），
+    把这个 URL 交出去等于让拿到它的下游按指定路径取桶里的对象，所以将来多出别的调用方
+    也自动继承这条约束。判据与删除口、写库口是同一条 `is_service_minted_key`。
+
+    先判键、再查配置，与 `_delete_oss_object` 同序：键不合规是调用方的输入问题，不该被
+    「OSS 环境变量未完整配置」这种服务端配置错误顶掉——调用方要能分清「这个键我用不了」
+    和「服务没配好」。
+    """
+    if not is_service_minted_key(object_key):
+        raise ForeignObjectKeyError(
+            f"refuse to build a public URL for an object key this service never minted: {object_key!r}"
+        )
     _ensure_oss_config()
     return f"https://{_oss_host()}{_oss_object_path(object_key)}"

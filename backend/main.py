@@ -4,16 +4,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
 
-from config import REBUILD_KNOWLEDGE_INDEX_ON_STARTUP, ensure_secret_key_configured
+from config import (
+    REBUILD_KNOWLEDGE_INDEX_ON_STARTUP,
+    ensure_mysql_password_configured,
+    ensure_secret_key_configured,
+)
 from database.session import init_db
-from paths import UPLOAD_DIR
 from router.auth import router as auth_router
 from router.chat import router as chat_router
 from router.checkpointer import router as checkpointer_router
 from router.knowledge import router as knowledge_router
+from router.uploads import router as uploads_router
 from router.user import router as user_router
 from service.chat_service import schedule_orphan_attachment_sweep
 from service.knowledge_service import rebuild_existing_knowledge_index, run_ingest_step
@@ -28,6 +31,7 @@ INTEGRITY_CONFLICT_MESSAGE = "数据冲突：本次操作与当前数据状态�
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ensure_secret_key_configured()
+    ensure_mysql_password_configured()
     init_db()
     seed_default_users()
     if REBUILD_KNOWLEDGE_INDEX_ON_STARTUP:
@@ -55,7 +59,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+# `/uploads` 曾经是一整棵目录的匿名静态挂载（issue #186）。目录下只有 `avatars/`，所以这里换成
+# 一条带鉴权的路由：语义上仍然是「按 URL 取头像」，但请求方必须是这条头像的主人。
+# 挂载与路由不能并存——Mount 会先匹配掉整个前缀，后面那条路由永远轮不到，匿名读就又回来了。
+app.include_router(uploads_router)
 
 
 @app.exception_handler(IntegrityError)

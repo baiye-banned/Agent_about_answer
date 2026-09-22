@@ -108,7 +108,7 @@ class _Recorder:
     def __init__(self):
         self.events = []
 
-    def add(self, event, *args, **payload):
+    async def add(self, event, *args, **payload):
         self.events.append({"event": event, "args": args, **payload})
 
 

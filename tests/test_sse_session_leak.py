@@ -31,7 +31,7 @@ from sqlalchemy.pool import QueuePool
 import rag.llm as llm
 from conftest import FakeKnowledgeBase, collect_stream, parse_sse_frames, streamed_content
 from database.session import Base
-from model.models import Conversation, Message, User
+from model.models import Conversation, Message, RevokedToken, User
 from schema.schemas import ChatRequest
 from service import chat_service
 
@@ -47,7 +47,11 @@ def _compile_longtext_as_text(_type, _compiler, **_kwargs):
 
 def _patch_boundaries(monkeypatch, fake_db, trace_cls):
     """只打桩真正的边界（鉴权/会话工厂/trace/知识库解析/检索/模型），其余跑真实实现。"""
-    monkeypatch.setattr(chat_service, "decode_token", lambda authorization: "alice")
+    monkeypatch.setattr(
+        chat_service,
+        "authenticate",
+        lambda db, authorization: db.query(User).filter_by(username="alice").first(),
+    )
     monkeypatch.setattr(chat_service, "SessionLocal", lambda: fake_db)
     monkeypatch.setattr(chat_service, "TraceRecorder", trace_cls)
     monkeypatch.setattr(chat_service, "resolve_knowledge_base", lambda db, kid, user_id: FakeKnowledgeBase())
@@ -189,7 +193,13 @@ def test_starlette_disconnect_cancellation_closes_session(monkeypatch, fake_db, 
 
 
 def test_disconnect_returns_connection_to_pool(monkeypatch, tmp_path, trace_recorder_cls):
-    """断开一次后连接必须归还池：pool_size=1 时后续请求仍然可用。"""
+    """断开一次后连接必须归还池：pool_size=1 时后续请求仍然可用。
+
+    issue #187 之前，流式请求整段握着一个请求级 Session，所以「流进行到一半时池里恰好有
+    1 条连接被占着」是本用例的**前提**。现在每次写库各自「开 session → 用 → 关」，这条
+    连接不会再跨着整段流被占住，前提随之变成 0——它同时仍是泄漏断言：任何一段同步 DB 工作
+    忘了收会话（或又把 Session 跨 await 握在手里），这里立刻非 0，#58 的漏连接形态就回来了。
+    """
     engine = create_engine(
         f"sqlite:///{tmp_path / 'leak.db'}",
         connect_args={"check_same_thread": False},
@@ -200,7 +210,7 @@ def test_disconnect_returns_connection_to_pool(monkeypatch, tmp_path, trace_reco
     )
     Base.metadata.create_all(
         bind=engine,
-        tables=[User.__table__, Conversation.__table__, Message.__table__],
+        tables=[User.__table__, RevokedToken.__table__, Conversation.__table__, Message.__table__],
     )
     with sessionmaker(bind=engine)() as seed:
         seed.add(User(id=7, username="alice", password_hash="x"))
@@ -216,7 +226,7 @@ def test_disconnect_returns_connection_to_pool(monkeypatch, tmp_path, trace_reco
         )
         iterator = first.body_iterator
         await iterator.__anext__()
-        # 前提断言：此刻流式请求确实占着一条池内连接，否则本用例测不出泄漏。
+        # 流式期间不得有连接被占着（issue #187 之后每次写库自带会话、当场归还）。
         checked_out_while_streaming = engine.pool.checkedout()
         await iterator.aclose()
         released_after_disconnect = engine.pool.checkedout()
@@ -229,7 +239,9 @@ def test_disconnect_returns_connection_to_pool(monkeypatch, tmp_path, trace_reco
 
     checked_out_while_streaming, released_after_disconnect, second_body = asyncio.run(_scenario())
 
-    assert checked_out_while_streaming == 1
+    assert checked_out_while_streaming == 0, (
+        "流式期间池里仍有连接被占着：说明有会话跨着整段流被持有，断开路径又会漏连接（issue #58）"
+    )
     assert released_after_disconnect == 0, "断开后连接没有归还池，pool_size 次断连后连接池会被耗尽"
     # 第二次请求跑到了终止帧，说明池没有被上一次断连拖垮（修复前这里会 QueuePool timeout）
     assert "data: [DONE]" in second_body

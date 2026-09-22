@@ -64,6 +64,8 @@ def _ensure_schema_columns():
         _ensure_mysql_text_column("messages", "ragas_scores", "TEXT")
         _ensure_mysql_text_column("messages", "ragas_error", "TEXT")
         _ensure_mysql_text_column("messages", "retrieval_trace", "LONGTEXT")
+        # conversation_id 早于本次改动就已存在，所以不能挂在上面那个「刚加列」的分支里。
+        _ensure_single_column_index("messages", "conversation_id", "ix_messages_conversation_id")
 
     if "conversations" in table_names:
         columns = {column["name"] for column in inspector.get_columns("conversations")}
@@ -82,6 +84,11 @@ def _ensure_schema_columns():
         _ensure_mysql_varchar_column("conversations", "id", 36, nullable=False)
         _ensure_mysql_varchar_column("conversations", "title", 200, nullable=False)
         _ensure_mysql_text_column("conversations", "memory_summary", "TEXT")
+        # 同样是先于本次改动就存在的列：老库只补列、不补索引。
+        _ensure_single_column_index("conversations", "user_id", "ix_conversations_user_id")
+        _ensure_single_column_index(
+            "conversations", "knowledge_base_id", "ix_conversations_knowledge_base_id"
+        )
 
     if "knowledge_files" in table_names:
         columns = {column["name"] for column in inspector.get_columns("knowledge_files")}
@@ -109,6 +116,14 @@ def _ensure_schema_columns():
         _ensure_knowledge_base_owner_unique_index()
 
     if "users" in table_names:
+        columns = {column["name"] for column in inspector.get_columns("users")}
+        # 令牌世代（issue #184）。NOT NULL DEFAULT 0 让存量行直接落在世代 0，与新建用户
+        # 一致，不需要单独的回填脚本。
+        if "token_version" not in columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
+                )
         _ensure_mysql_varchar_column("users", "username", 50, nullable=False)
         _ensure_mysql_varchar_column("users", "password_hash", 255, nullable=False)
         _ensure_mysql_varchar_column("users", "avatar", 500)
@@ -148,6 +163,7 @@ def _ensure_mysql_utf8mb4():
         "knowledge_files",
         "chat_trace_sessions",
         "chat_attachment_uploads",
+        "revoked_tokens",
     ):
         if table_name not in inspector.get_table_names():
             continue

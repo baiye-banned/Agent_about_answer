@@ -5,8 +5,10 @@ import { readStreamEvents } from '@/utils/streamEvents'
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api'
 
 export const chatAPI = {
-  getConversations() {
-    return request.get('/chat/conversations')
+  // params 支持 { limit, before_updated_at, before_id }：不传时后端只返回最新一页，
+  // before_* 是 (updated_at, id) 复合游标，两个要么都给、要么都不给。
+  getConversations(params) {
+    return request.get('/chat/conversations', { params })
   },
   // params 支持 { limit, before_id }：不传时后端只返回最新一页
   getMessages(conversationId, params) {

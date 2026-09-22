@@ -24,24 +24,27 @@ def _trace_sse_payloads(trace: TraceRecorder) -> list[str]:
     ]
 
 
-def _safe_trace_add(trace: TraceRecorder, *args, **kwargs):
+# 三个包装器都是协程：`TraceRecorder` 的 add/attach/finish 把写库交给工作线程，调用方必须
+# await（issue #201）。包装器只吞 Exception——轨迹失败不能影响主回答链路，但
+# CancelledError/GeneratorExit 必须照常上抛，断连路径的收尾语义不受影响。
+async def _safe_trace_add(trace: TraceRecorder, *args, **kwargs):
     try:
-        return trace.add(*args, **kwargs)
+        return await trace.add(*args, **kwargs)
     except Exception as exc:
         logger.warning("Learning trace add failed: %s", exc, exc_info=True)
         return {}
 
 
-def _safe_trace_finish(trace: TraceRecorder, *args, **kwargs):
+async def _safe_trace_finish(trace: TraceRecorder, *args, **kwargs):
     try:
-        trace.finish(*args, **kwargs)
+        await trace.finish(*args, **kwargs)
     except Exception as exc:
         logger.warning("Learning trace finish failed: %s", exc, exc_info=True)
 
 
-def _safe_trace_attach(trace: TraceRecorder, *args, **kwargs):
+async def _safe_trace_attach(trace: TraceRecorder, *args, **kwargs):
     try:
-        trace.attach(*args, **kwargs)
+        await trace.attach(*args, **kwargs)
     except Exception as exc:
         logger.warning("Learning trace attach failed: %s", exc, exc_info=True)
 

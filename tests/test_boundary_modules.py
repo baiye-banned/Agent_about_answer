@@ -32,6 +32,12 @@ OSS_CONFIG = {
 }
 
 
+# 铸造形态的对象键字面量，照抄上传路径实际铸出来的样子。issue #181 之后形态判据也管着
+# URL 构造口（`_public_oss_url`），凡是要真的构造出 OSS URL 的用例都得用这个形状；
+# 非自铸形状的表现由 tests/test_vision_outbound_guard_181.py 覆盖。
+MINTED_KEY = "rag-chat/2026/09/21/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png"
+
+
 def _patch_oss_config(monkeypatch, **overrides):
     for name, value in {**OSS_CONFIG, **overrides}.items():
         monkeypatch.setattr(oss_service, name, value)
@@ -52,18 +58,18 @@ class _RecordingTrace:
             raise self.error
         return list(self.payloads)
 
-    def add(self, *args, **kwargs):
+    async def add(self, *args, **kwargs):
         if self.error is not None:
             raise self.error
         self.calls.append(("add", args, kwargs))
         return {"id": len(self.calls)}
 
-    def finish(self, *args, **kwargs):
+    async def finish(self, *args, **kwargs):
         if self.error is not None:
             raise self.error
         self.calls.append(("finish", args, kwargs))
 
-    def attach(self, *args, **kwargs):
+    async def attach(self, *args, **kwargs):
         if self.error is not None:
             raise self.error
         self.calls.append(("attach", args, kwargs))
@@ -97,9 +103,12 @@ def test_trace_sse_payloads_is_empty_when_nothing_drained():
 def test_safe_trace_wrappers_forward_calls_and_return_values():
     trace = _RecordingTrace()
 
-    assert trace_service._safe_trace_add(trace, "stage", "function", note="n") == {"id": 1}
-    trace_service._safe_trace_attach(trace, conversation_id=5)
-    trace_service._safe_trace_finish(trace, "done", message_id=9)
+    async def run():
+        assert await trace_service._safe_trace_add(trace, "stage", "function", note="n") == {"id": 1}
+        await trace_service._safe_trace_attach(trace, conversation_id=5)
+        await trace_service._safe_trace_finish(trace, "done", message_id=9)
+
+    asyncio.run(run())
 
     assert trace.calls == [
         ("add", ("stage", "function"), {"note": "n"}),
@@ -112,9 +121,12 @@ def test_safe_trace_wrappers_swallow_recorder_failures():
     trace = _RecordingTrace(error=RuntimeError("trace backend down"))
 
     # 轨迹失败不能影响主链路：包装器必须吞掉异常并给出兜底返回值
-    assert trace_service._safe_trace_add(trace, "stage", "function") == {}
-    assert trace_service._safe_trace_attach(trace, conversation_id=1) is None
-    assert trace_service._safe_trace_finish(trace, "done") is None
+    async def run():
+        assert await trace_service._safe_trace_add(trace, "stage", "function") == {}
+        assert await trace_service._safe_trace_attach(trace, conversation_id=1) is None
+        assert await trace_service._safe_trace_finish(trace, "done") is None
+
+    asyncio.run(run())
 
 
 # ---------------------------------------------------------------------------
@@ -196,13 +208,13 @@ def test_oss_object_path_percent_encodes_but_keeps_slashes():
 def test_public_oss_url_requires_complete_config(monkeypatch):
     _patch_oss_config(monkeypatch, OSS_BUCKET="")
     with pytest.raises(HTTPException) as excinfo:
-        oss_service._public_oss_url("uploads/a.png")
+        oss_service._public_oss_url(MINTED_KEY)
     assert (excinfo.value.status_code, excinfo.value.detail) == (500, "OSS 环境变量未完整配置")
 
 
 def test_public_oss_url_builds_host_and_path(monkeypatch):
     _patch_oss_config(monkeypatch)
-    assert oss_service._public_oss_url("uploads/a.png") == "https://demo.oss-cn-hangzhou.aliyuncs.com/uploads/a.png"
+    assert oss_service._public_oss_url(MINTED_KEY) == f"https://demo.oss-cn-hangzhou.aliyuncs.com/{MINTED_KEY}"
 
 
 def test_sign_oss_url_signs_the_documented_string(monkeypatch):
@@ -315,15 +327,17 @@ def test_build_effective_question_trims_and_skips_analysis_without_attachments()
 
 
 def test_build_image_urls_skips_attachments_without_object_key(monkeypatch):
+    # 键用铸造形态：这里断的是「没有键的条目被跳过」，不是「任意键都被接受」。
+    # 百分号编码本身另由 `test_oss_object_path_percent_encodes_but_keeps_slashes` 覆盖。
     _patch_oss_config(monkeypatch)
 
     urls = vision_service._build_image_urls([
-        {"object_key": "uploads/图 1.png"},
+        {"object_key": MINTED_KEY},
         {"object_key": ""},
         {"file_name": "无 key.png"},
     ])
 
-    assert urls == ["https://demo.oss-cn-hangzhou.aliyuncs.com/uploads/%E5%9B%BE%201.png"]
+    assert urls == [f"https://demo.oss-cn-hangzhou.aliyuncs.com/{MINTED_KEY}"]
 
 
 def test_build_effective_question_reports_failure_when_vision_not_configured(monkeypatch):
@@ -331,7 +345,7 @@ def test_build_effective_question_reports_failure_when_vision_not_configured(mon
     monkeypatch.setattr(vision_service, "VISION_API_KEY", "")
 
     question, analysis = asyncio.run(
-        vision_service._build_effective_question("这是什么", [{"object_key": "uploads/a.png"}])
+        vision_service._build_effective_question("这是什么", [{"object_key": MINTED_KEY}])
     )
 
     assert question == "这是什么"
