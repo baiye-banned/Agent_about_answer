@@ -184,20 +184,25 @@ knowledge store directly and closes the store-side half of the same issue: a sec
 short-circuit sits before the loading flag, must not flip `loading` either,
 `force`/`refreshKnowledgeBases` bypass the cache and replace the list wholesale,
 `upsertKnowledgeBase` merges in place on a known id (length and order unchanged) and appends on a
-new one, rows that normalise to null are filtered out of the list instead of being rendered, and the
-knowledge-base paging entry (`loadMoreKnowledgeBases`) takes its cursor from the page it just
-fetched rather than from the end of the array - which is what keeps it advancing instead of spinning
-in place when a whole page turns out to be already loaded - appends only ids it does not already
-hold, drops the `hasMore` flag as soon as a short page says there is nothing left, refuses a second
-request while one is in flight, and offers no "load more" entry at all when the page's last row has
-no id to build a cursor from. `chatStorePaging.test.js` is the sidebar half of issue #191, whose
-review asked for exactly this coverage: the first request asks for one row more than a page so
-`exactly full` and `already exhausted` stay distinguishable, the cursor it hands back is the `{id,
-updated_at}` pair of the page's last row (a conversation id alone cannot order a uuid-keyed list),
-overlapping rows that a refresh or a stream tail inserted are dropped id by id rather than
-duplicated, a page whose last row carries no `updated_at` produces no entry at all instead of a
-button that does nothing, and re-fetching replaces the list with the newest page and resets the
-cursor rather than continuing from the stale one.
+new one, rows that normalise to null are filtered out of the list instead of being rendered - an
+object with no id at all counts as one of those, so a payload that is missing its id neither appends
+a nameless empty row nor flips the empty-state flag - and the knowledge-base paging entry
+(`loadMoreKnowledgeBases`) takes its cursor from the page it just fetched rather than from the end
+of the array - which is what keeps it advancing instead of spinning in place when a whole page turns
+out to be already loaded - appends only ids it does not already hold, drops the `hasMore` flag as
+soon as a short page says there is nothing left, refuses a second request while one is in flight,
+and offers no "load more" entry at all when a page normalises down to no rows and no last id is left
+to build a cursor from - that cursor is read off the normalised page, so a row that is missing its
+id no longer strands the cursor: the append drops it and the cursor still lands on the last real id,
+which is what keeps one malformed row from silently truncating the list, on any page.
+`chatStorePaging.test.js` is the sidebar half of issue #191, whose review asked for exactly this
+coverage: the first request asks for one row more than a page so `exactly full` and `already
+exhausted` stay distinguishable, the cursor it hands back is the `{id, updated_at}` pair of the
+page's last row (a conversation id alone cannot order a uuid-keyed list), overlapping rows that a
+refresh or a stream tail inserted are dropped id by id rather than duplicated, a page whose last row
+carries no `updated_at` produces no entry at all instead of a button that does nothing, and
+re-fetching replaces the list with the newest page and resets the cursor rather than continuing from
+the stale one.
 
 ## Python Tests
 

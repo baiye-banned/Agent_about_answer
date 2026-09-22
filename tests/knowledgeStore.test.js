@@ -165,8 +165,19 @@ test('取数失败：loading 复位、loaded 不置位，下一次仍会打网�
 test('setKnowledgeBases 过滤脏数据，并给缺省字段补齐默认值', async () => {
   const store = createStore()
 
-  // null / undefined / 字符串 / 数字都不是对象，归一化后是 null，必须被丢掉。
-  store.setKnowledgeBases([kb('kb-1'), null, 'kb-2', undefined, 42, { id: 'kb-3' }])
+  // null / undefined / 字符串 / 数字都不是对象；`{}` / `{ id: null }` 是对象但没有 id
+  // （issue #209）—— 两类归一化后都是 null，必须被丢掉。
+  store.setKnowledgeBases([
+    kb('kb-1'),
+    null,
+    'kb-2',
+    undefined,
+    42,
+    {},
+    { name: '有名字但没 id' },
+    { id: null },
+    { id: 'kb-3' },
+  ])
 
   assert.deepEqual(idsOf(store), ['kb-1', 'kb-3'])
   assert.deepEqual(store.knowledgeBases[1], {
@@ -241,8 +252,44 @@ test('upsertKnowledgeBase 脏数据不写状态', async () => {
   store.upsertKnowledgeBase(null)
   store.upsertKnowledgeBase('kb-2')
   store.upsertKnowledgeBase(42)
+  // 是对象但没有 id 的输入属于同一类脏数据（issue #209）：
+  // 归一化守卫只挡 null / 非对象时，这几个形状会穿透成 id: undefined 的空条目。
+  store.upsertKnowledgeBase({})
+  store.upsertKnowledgeBase({ name: '没有 id 的库' })
+  store.upsertKnowledgeBase({ id: null })
 
   assert.deepEqual(idsOf(store), ['kb-1'])
+})
+
+// issue #209 的判别性用例：脏条目一旦被追加，空态判断（hasKnowledgeBases）也跟着失真，
+// 所以除了列表内容，还要钉住 loaded 不被点亮。
+test('upsertKnowledgeBase 缺 id 时不追加、不点亮 loaded、不破坏空态', async () => {
+  const store = createStore()
+  assert.equal(store.loaded, false)
+
+  store.upsertKnowledgeBase({})
+  store.upsertKnowledgeBase({ id: undefined, name: '有键但值是 undefined' })
+
+  assert.deepEqual(store.knowledgeBases, [])
+  assert.equal(
+    store.knowledgeBases.some((item) => item.id == null),
+    false,
+    '列表里不允许出现 id 缺失的条目'
+  )
+  assert.equal(store.hasKnowledgeBases, false)
+  assert.equal(store.loaded, false, '脏数据不该把 loaded 点亮')
+})
+
+// 边界：守卫只认「id 缺失」，不是「id 是假值」。空串与 0 都是调用方给的明确 id，
+// 按现行语义照常入库（`id == null` 才判脏）。变异成 `!base.id` 会让这条红。
+test('id 是空串或 0 时不算缺 id：照常按合法 id 入库', async () => {
+  const store = createStore()
+  store.setKnowledgeBases([kb('kb-1')])
+
+  store.upsertKnowledgeBase({ id: '', name: '空串 id' })
+  store.upsertKnowledgeBase({ id: 0, name: '零 id' })
+
+  assert.deepEqual(idsOf(store), ['kb-1', '', 0])
 })
 
 test('loadMoreKnowledgeBases：没有更多时是纯 no-op，不发请求也不动 loadingMore', async () => {
@@ -325,18 +372,66 @@ test('与已加载内容重叠的返回只追加新的那些，不产生重复�
   assert.equal(ids.at(-1), 'kb-89')
 })
 
-test('末位没有 id 时不给「加载更多」：宁可不给入口，也不给一个点了没反应的按钮', async () => {
+test('整页都归一化不出 id 时不给「加载更多」：宁可不给入口，也不给一个点了没反应的按钮', async () => {
   const store = createStore()
-  const page = rows(1, PAGE_SIZE)
-  page[PAGE_SIZE - 1] = { name: '没有 id 的脏数据' } // 归一化后 id 是 undefined
+  // 51 条全部缺 id（issue #209 之后它们会在归一化时被丢掉）：
+  // 取回的那一页没有末位 id 可做游标，这时才真的算不出下一页 —— 不该给入口。
+  const page = Array.from({ length: PAGE_SIZE + 1 }, (_, index) => ({ name: `缺 id 的脏数据 ${index}` }))
 
-  await fetchWith(store, [...page, kb('kb-51')]) // 51 条 -> 本来「还有更多」
+  await fetchWith(store, page) // >一页 -> 本来「还有更多」
 
+  assert.deepEqual(store.knowledgeBases, [])
   assert.equal(store.hasMoreKnowledgeBases, false)
 
   const calls = getBasesCalls.length
   await store.loadMoreKnowledgeBases()
-  assert.equal(getBasesCalls.length, calls)
+  assert.equal(getBasesCalls.length, calls, '没有游标就不该发请求')
+})
+
+// issue #209 的连带改善：脏行不再「掐断」翻页入口。
+// 修复前：id 缺失的行会被归一化保留成 `id: undefined`，末位取不到游标 -> hasMore 被打成
+// false，这一页之后的知识库从此再也加载不出来（静默截断）。修复后脏行被丢掉，游标回到
+// 真正的末位 id，翻页照常可用。上面那条用例的场景正是被这次修复消解掉的，行为由本用例接管。
+test('页内夹着缺 id 的脏行时，翻页入口不再被静默掐断', async () => {
+  const store = createStore()
+  const page = rows(1, PAGE_SIZE)
+  page[PAGE_SIZE - 1] = { name: '缺 id 的脏行' }
+
+  await fetchWith(store, [...page, kb('kb-51')]) // 51 条 -> 本来「还有更多」
+
+  assert.equal(store.knowledgeBases.length, PAGE_SIZE - 1, '脏行不入列')
+  assert.equal(idsOf(store).at(-1), 'kb-49')
+  assert.equal(store.hasMoreKnowledgeBases, true, '脏行不该把「还有更多」打成 false')
+
+  const request = store.loadMoreKnowledgeBases()
+  assert.deepEqual(getBasesCalls.at(-1), { limit: FETCH_LIMIT, after_id: 'kb-49' })
+  respond([kb('kb-51')])
+  await request
+
+  assert.equal(idsOf(store).at(-1), 'kb-51', '这一页之后的内容仍然拿得到')
+})
+
+// 同一条判据在翻页路径上也要成立：脏行落在**取回那一页的页尾**时，游标同样不能被它掐断。
+// 首屏的游标取自归一化后的结果，翻页的游标曾取自原始末位 —— 一个页尾的脏行就能让游标
+// 算不出来，把「还有更多」打成 false，全页之后的知识库从此再也加载不出来（静默截断）。
+test('脏行落在翻页页尾时，游标回到真正的末位 id 而不是被掐断', async () => {
+  const store = createStore()
+  await fetchWith(store, rows(1, PAGE_SIZE + 1)) // 游标 kb-50，还有更多
+
+  const slice = rows(PAGE_SIZE + 1, 2 * PAGE_SIZE) // kb-51..kb-100
+  slice[PAGE_SIZE - 1] = { name: '缺 id 的页尾脏行' }
+  const request = store.loadMoreKnowledgeBases()
+  respond([...slice, kb(`kb-${2 * PAGE_SIZE + 1}`)]) // 51 条 -> 本来「还有更多」
+  await request
+
+  assert.equal(store.knowledgeBases.length, 2 * PAGE_SIZE - 1, '脏行不入列')
+  assert.equal(idsOf(store).at(-1), 'kb-99', '游标回到脏行之前的那条真 id')
+  assert.equal(store.hasMoreKnowledgeBases, true, '页尾脏行不该把「还有更多」打成 false')
+
+  const next = store.loadMoreKnowledgeBases()
+  assert.deepEqual(getBasesCalls.at(-1), { limit: FETCH_LIMIT, after_id: 'kb-99' })
+  respond([])
+  await next
 })
 
 test('在途时重复触发不叠加请求', async () => {
