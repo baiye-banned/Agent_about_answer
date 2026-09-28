@@ -15,4 +15,4 @@ langchain-openai==1.6.2
 openai>=1.55.0
 pymilvus[milvus_lite]==3.0.2
 milvus-lite==3.2.1
-python-dotenv>=1.2.2
+python-dotenv>=1.2.3
