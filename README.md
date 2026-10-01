@@ -542,4 +542,4 @@ python -m uvicorn main:app --host 127.0.0.1 --port 8002
 
 ## License
 
-当前仓库主要用于个人学习和实习作品集展示。如需作为公开可复用项目，请补充明确的开源许可证。
+本项目采用 MIT 许可证，详见 [LICENSE](LICENSE)。
