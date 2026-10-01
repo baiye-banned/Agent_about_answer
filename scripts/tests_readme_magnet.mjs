@@ -36,8 +36,41 @@ const MAX_LINE = 120;
 // 折行不得造出这种行首。
 const BLOCK_START = /^(?:#{1,6}\s|#{1,6}$|>|\||[-+*]\s|[-+*]$|\d{1,9}[.)]\s|={2,}$|-{3,}$)/;
 
+// 行尾规范化：把每一处 \r\n 折叠成 \n。**单独**的 \n 与**单独**的 \r 都不动 ——
+// 行内 \r（或旧 Mac 行尾）极少见于本仓与 CI 文本，而且要一并治理得先定义「行内 \r 是内容
+// 还是行尾」，本 issue 不回答这个问题。已知代价：文件里真出现行内 \r 时，check 的宽度会把它
+// 多算 1（与修复前的症状同类，但触发面从「每个 Windows 开发者」缩到「文件里真有行内 CR」）。
+function normalizeEol(text) {
+  return text.replace(/\r\n/g, '\n');
+}
+
+// 行尾探测，**必须在 normalizeEol 之前**对原始字节做（规范化会把 CRLF 抹平，之后恒返回 \n，
+// 「保留 CRLF」就静默失效了：不报错，但每次写盘都造一份全量 diff）。
+//   1. crlf = \r\n 出现次数，lf = \n 总数 − crlf（即裸 \n 的个数）。
+//   2. crlf === 0 -> '\n'；lf === 0 -> '\r\n'。
+//   3. 两者都 > 0（混合行尾）-> 以**最先出现**的那种为准，与 detect-newline 的口径一致：
+//      确定性强，不看整文件的分布。混合文件本就是异常输入，一次规范化后即收敛。
+//   4. 全无行尾（单行文件、空文件）-> '\n'，由第 1 条兜住。
+// **分支次序是硬要求**：crlf === 0 必须先于 lf === 0 判断。写反的话，空文件（crlf=0、lf=0）
+// 会命中 lf === 0 返回 '\r\n'，违反第 4 条，并让混合行尾的一次性收敛在空文件上退化。
+function detectEol(raw) {
+  const crlf = (raw.match(/\r\n/g) ?? []).length;
+  const lf = (raw.match(/\n/g) ?? []).length - crlf;
+  if (crlf === 0) return '\n';
+  if (lf === 0) return '\r\n';
+  return raw.indexOf('\r\n') < raw.indexOf('\n') ? '\r\n' : '\n';
+}
+
+// 读入一个文本文件，同时交出三个视图：
+//   raw  —— 原始字节串，供「无改动」比较（比较对象必须是它，见 cmdFormat）；
+//   text —— 规范化后的文本，切行/喂解析器/写盘源都用它；
+//   eol  —— 原文件的行尾，写回时按它拼接。
+// 探测先于规范化，次序不能反。
 function readFile(file) {
-  return readFileSync(file, 'utf8');
+  const raw = readFileSync(file, 'utf8');
+  const eol = detectEol(raw);
+  const text = normalizeEol(raw);
+  return { raw, text, eol };
 }
 
 // 段落 = 以标记开头的连续非空行。返回 [{ start, end }]（0 基，end 不含）。
@@ -132,7 +165,8 @@ function checkLines(lines) {
 }
 
 function cmdCheck(file) {
-  const lines = readFile(file).split('\n');
+  // 切行用规范化后的 text：宽度按**逻辑列宽**计，行尾的 \r 不再进入 length。
+  const lines = readFile(file).text.split('\n');
   const paragraphs = findParagraphs(lines);
   if (paragraphs.length === 0) {
     process.stderr.write(`check: ${file} 里没有以「${PARAGRAPH_MARKER}」开头的登记段落\n`);
@@ -158,31 +192,38 @@ function cmdCheck(file) {
 }
 
 function cmdFormat(file) {
-  const original = readFile(file);
-  const lines = original.split('\n');
+  const { raw, text, eol } = readFile(file);
+  const lines = text.split('\n');
   if (findParagraphs(lines).length === 0) {
     process.stderr.write(`format: ${file} 里没有以「${PARAGRAPH_MARKER}」开头的登记段落\n`);
     return 2;
   }
-  const formatted = replaceSpans(lines, findParagraphs(lines)).join('\n');
-  if (formatted === original) {
+  // 写回按原文件的行尾拼接；结尾换行保持原状（text 以 \n 结尾 -> 尾部有空串 -> join(eol) 复原）。
+  const formatted = replaceSpans(lines, findParagraphs(lines)).join(eol);
+  // 「无改动」与**原始字节**比，不与 text 比：统一 CRLF 的规范文件在规范化后与 raw 恰好相等，
+  // 于是无需写盘；若拿 text 比，任何 CRLF 文件都会被判「有改动」而每次重写一遍。
+  if (formatted === raw) {
     process.stdout.write('format: 已是目标宽度，无改动\n');
     return 0;
   }
   writeFileSync(file, formatted, 'utf8');
   const before = findParagraphs(lines).reduce((n, s) => n + (s.end - s.start), 0);
+  // 这里只派生行数差，行数与 EOL 无关，故仍按 \n 切（中性站点，不参与任何字节比较）。
   const after = findParagraphs(formatted.split('\n')).reduce((n, s) => n + (s.end - s.start), 0);
   process.stdout.write(`format: 登记段落 ${before} 行 -> ${after} 行\n`);
   return 0;
 }
 
 // 冲突块解析：<<<<<<< / ======= / >>>>>>>。返回每个冲突块的行号边界 { start, mid, end }。
+// 三条标记正则都容忍行尾一个可选的 \r：CLI 路径传进来的已是规范化文本（文本里不会有 \r），
+// 但本函数是导出的，直接被喂未规范化的 CRLF 文本时要一样认得出来 —— 否则标记整条失配、
+// 返回 0 个块，调用方会**谎报「没有冲突块」**（比报错更隐蔽）。
 function parseConflicts(text) {
   const lines = text.split('\n');
   const blocks = [];
   let i = 0;
   while (i < lines.length) {
-    if (!/^<{7}(?: .*)?$/.test(lines[i])) {
+    if (!/^<{7}(?: .*)?\r?$/.test(lines[i])) {
       i += 1;
       continue;
     }
@@ -190,8 +231,8 @@ function parseConflicts(text) {
     let mid = -1;
     let end = -1;
     for (let j = i + 1; j < lines.length; j += 1) {
-      if (mid === -1 && /^={7}$/.test(lines[j])) mid = j;
-      else if (/^>{7}(?: .*)?$/.test(lines[j])) {
+      if (mid === -1 && /^={7}\r?$/.test(lines[j])) mid = j;
+      else if (/^>{7}(?: .*)?\r?$/.test(lines[j])) {
         end = j;
         break;
       }
@@ -347,9 +388,11 @@ function resolveSides(ours, theirs) {
 }
 
 function cmdUnion(file) {
-  const original = readFile(file);
-  const lines = original.split('\n');
-  const blocks = parseConflicts(original);
+  // 切行与喂解析器都用规范化后的 text；行尾由 eol 在写回时复原，冲突块行号即逻辑行号
+  //（行数不变，与 Windows 编辑器看到的一致，无需换算）。
+  const { text, eol } = readFile(file);
+  const lines = text.split('\n');
+  const blocks = parseConflicts(text);
   if (blocks.length === 0) {
     process.stderr.write(`union: ${file} 里没有冲突块，无需求解\n`);
     return 2;
@@ -425,6 +468,8 @@ function cmdUnion(file) {
   }
 
   // 兜底断言：两侧文本都要成段留在结果里。上面的前提保证它成立，这里防止将来改坏。
+  // 这里按 \n 拼接是**中性站点**：flat 只用于 flat.includes(side) 自检，而 out 与 side 同为
+  // 规范化文本，两侧一致即成立，与 EOL 无关（不参与任何字节比较）。
   const flat = flatten(out.join('\n'));
   for (const m of merged) {
     if (m.sides.some((side) => side !== '' && !flat.includes(side))) {
@@ -437,7 +482,7 @@ function cmdUnion(file) {
   // 两边拼起来就会出现一条超长行。这里顺手折行，让 union 在两种输入下都一步到位
   //（折行只把空格换成换行，reflow 自带逐字节相等自检，不会再动内容）。
   const resolvedLines = replaceSpans(out, findParagraphs(out));
-  const resolved = resolvedLines.join('\n');
+  const resolved = resolvedLines.join(eol);
   const problems = checkLines(resolvedLines);
   if (problems.length > 0) {
     process.stderr.write(`union: 并集并折行后仍有 ${problems.length} 行超过 ${MAX_LINE} 字符\n`);
@@ -497,7 +542,9 @@ export {
   MAX_LINE,
   VARIANT_RUN_MIN,
   WRAP_WIDTH,
+  detectEol,
   findParagraphs,
+  normalizeEol,
   parseConflicts,
   reflow,
   unwrap,
