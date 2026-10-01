@@ -2,7 +2,165 @@
 
 一个基于 Vue 3 + FastAPI 的企业知识库问答平台。项目支持登录鉴权、知识库管理、文件上传解析、多知识库隔离检索、图片附件问答、SSE 流式回答、多轮会话记忆和 RAGAS 在线评估。
 
-## 1. 架构说明
+定位：面向企业内部资料的检索增强问答。检索、融合、重排、保存、评估由确定性代码编排，LLM 只负责理解与生成。
+
+[![pytest](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/python-tests.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/python-tests.yml)
+[![node --test](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/frontend-tests.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/frontend-tests.yml)
+[![vite build](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/build.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/build.yml)
+[![static checks](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/static-checks.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/static-checks.yml)
+[![e2e](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/e2e.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/e2e.yml)
+
+## 亮点速览
+
+- 支持登录、JWT 鉴权、用户资料、头像上传和路由守卫。
+- 支持知识库创建、重命名、删除、切换、默认知识库兜底和文件管理。
+- 支持文本、DOCX、PDF 上传解析、语义分块、Milvus Lite 向量索引和上传失败回滚。
+- 隔离多知识库数据：以 `knowledge_base_id` 同时约束 MySQL 元数据和 Milvus 向量记录。
+- 提供 `/api/chat/stream` SSE 流式问答，支持历史会话、Markdown 渲染、来源展示和 Trace 回放。
+- 使用 Advanced RAG 检索链路，覆盖 RAG 路由判断、查询规划、HyDE、问题改写、关键词召回、向量召回、RRF 融合、rerank 和兜底检索。
+- 支持图片附件问答，将视觉模型生成的图片描述与用户文本合并为 `effective_question`。
+- 设计多轮会话记忆机制，包含短期滑窗、长期摘要、近期上下文压缩和长期摘要二次压缩。
+- 在 assistant 消息保存后异步执行 RAGAS 在线评估，计算 faithfulness、response relevancy 和 context precision。
+- 补充后端 RAG 检索链路和前端流式解析工具函数的回归测试。
+
+## 目录
+
+- [亮点速览](#亮点速览)
+- [快速开始](#快速开始)
+- [架构说明](#架构说明)
+- [关键 Prompt 与设计思路](#关键-prompt-与设计思路)
+- [AI 调用逻辑](#ai-调用逻辑)
+- [工程与质量](#工程与质量)
+- [部署](#部署)
+- [协作与提交规范](#协作与提交规范)
+- [分支与发布](#分支与发布)
+- [安全说明](#安全说明)
+- [文档](#文档)
+- [License](#license)
+
+## 快速开始
+
+### 环境要求
+
+- Node.js 22.15+（`npm test` 用到该版本起才提供的 `module.registerHooks`，见 [tests/README.md](tests/README.md)）
+- Python 3.10+
+- MySQL 8+
+- Milvus Lite 本地文件或远程 Milvus 服务
+- 可用的 DeepSeek / DashScope API Key
+- 可选：阿里云 OSS，用于图片附件存储
+
+浏览器基线（前端样式依赖）：Safari 16.4+ / Chrome 111+ / Firefox 128+。Tailwind CSS v4 依赖 `@property` 与 `color-mix()` 等较新的 CSS 特性，低于上述基线的浏览器上样式会整体失效（不是降级，是不生效）；旧浏览器需要继续支持时，前端需回退到 Tailwind 3.4.x。
+
+### 安装依赖
+
+```bash
+npm install
+
+cd backend
+pip install -r requirements.txt
+```
+
+### 配置环境变量
+
+复制示例配置：
+
+```bash
+cp .env.example .env
+```
+
+Windows PowerShell：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+至少需要配置：
+
+```env
+MYSQL_USER=your_mysql_user
+MYSQL_PASSWORD=your_mysql_password
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_DATABASE=rag_system
+MYSQL_SSL_MODE=
+MYSQL_SSL_CA=
+
+DEEPSEEK_API_KEY=your_deepseek_api_key
+DASHSCOPE_API_KEY=your_dashscope_api_key
+
+SECRET_KEY=change-this-secret-key-in-production
+```
+
+上面 `SECRET_KEY` 写的是与 `.env.example` 一致的公开占位值，**必须替换**成随机值再启动：保持占位值（或留空）时后端会拒绝启动。生成方式见[安全说明](#安全说明)。
+
+特殊场景按需追加：
+
+- Render 后端 Web Service 建议额外设置 Python 版本，避免平台默认使用过新的 Python 版本：`PYTHON_VERSION=3.10.11`。
+- 使用 Aiven MySQL 这类要求 SSL 的云数据库时，在部署平台（如 Render）的环境变量里加 `MYSQL_SSL_MODE=required`；服务商要求指定 CA 证书时，把证书文件随部署环境挂载后设置 `MYSQL_SSL_CA=/path/to/ca.pem`。
+- 本地 Milvus Lite：`MILVUS_LITE_URI=./milvus.db`。
+- 远程 Milvus：`MILVUS_URI=http://your-milvus-host:19530`，按需补充 `MILVUS_TOKEN`、`MILVUS_USER`、`MILVUS_PASSWORD`、`MILVUS_DB_NAME`。
+
+默认账号播种由 `SEED_DEFAULT_USERS` / `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD` 控制：
+
+- `SEED_DEFAULT_USERS` 默认为 `true`，设为 `false` 后启动过程不会创建任何账号；为 `true` 时仅为尚不存在的 `admin`、`demo` 创建账号，且不会覆盖已有账号的口令。
+- 账号口令只来自 `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD`，仓库中不存在固定口令；未配置对应变量时会生成不可预测的随机口令，随机口令不会写入日志。口令两端的空白字符会被忽略。
+- 因此未显式配置口令的账号无法直接登录，**已存在**的账号可以按下面的方式重置口令（`新口令` 换成自定义值）：
+
+```bash
+cd backend
+python -c "from database.session import SessionLocal; from crud import user as crud_user; from model.models import User; from service.auth_service import pwd_context; db = SessionLocal(); u = db.query(User).filter_by(username='admin').first(); crud_user.update_password_hash(db, u, pwd_context.hash('新口令')); db.close(); print('password updated')"
+```
+
+- 如果该账号还不存在（例如长期设置 `SEED_DEFAULT_USERS=false`，库里没有任何账号），临时把 `SEED_DEFAULT_USERS` 设回 `true` 并配置 `SEED_ADMIN_PASSWORD`，重启服务一次即可创建；播种只补建不存在的账号，不会覆盖已有账号的口令。
+- 对外提供服务前，建议设置 `SEED_DEFAULT_USERS=false`，或至少为启用的账号配置强口令。
+
+### 初始化数据库
+
+创建 MySQL 数据库：
+
+```sql
+CREATE DATABASE IF NOT EXISTS rag_system
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_unicode_ci;
+```
+
+启动 FastAPI 时，`backend/main.py` 会调用 `init_db()` 创建表结构，并调用 `seed_default_users()` 初始化默认账号（播种规则见上一节的 `SEED_DEFAULT_USERS`）。
+
+知识库与知识文件按归属用户隔离，历史数据（`user_id` 为 NULL）对任何用户都不可见，需要一次性回填：
+
+```bash
+python scripts/backfill_knowledge_owner.py --user-id <用户ID>            # 默认只打印回填计划
+python scripts/backfill_knowledge_owner.py --user-id <用户ID> --apply    # 真正写入
+```
+
+### 启动后端
+
+```bash
+cd backend
+python -m uvicorn main:app --host 127.0.0.1 --port 8002
+```
+
+健康检查（注意是根路径 `/health`，不在 `/api/` 前缀下）：
+
+```bash
+curl -i http://127.0.0.1:8002/health
+```
+
+期望返回 `200` 与 `{"status":"ok"}`。
+
+### 启动前端
+
+```bash
+npm run dev
+```
+
+Vite 默认地址：
+
+```text
+http://localhost:5173
+```
+
+## 架构说明
 
 ### 整体架构
 
@@ -71,7 +229,9 @@ src/
   -> 异步 RAGAS 评估
 ```
 
-## 2. 关键 Prompt 与 Vibe 思路
+更完整的模块说明见 [docs/PROJECT_ARCHITECTURE_FULL.md](docs/PROJECT_ARCHITECTURE_FULL.md)。
+
+## 关键 Prompt 与设计思路
 
 ### Prompt 角色划分
 
@@ -86,7 +246,7 @@ src/
 | 视觉理解 Prompt | 将图片附件转成可和文本问题融合的描述 |
 | RAGAS 评估 Prompt | 对回答相关性、忠实度、上下文精度做在线评估 |
 
-### Vibe 思路
+### 设计思路
 
 这个项目的 Prompt 设计目标不是追求复杂 Agent 行为，而是让模型在企业知识库场景下更稳定：
 
@@ -120,7 +280,7 @@ src/
 只输出 JSON，不要输出 Markdown。
 ```
 
-## 3. AI 调用逻辑（流式 / function calling 等）
+## AI 调用逻辑
 
 ### 当前 AI 调用方式
 
@@ -160,366 +320,9 @@ SSE 事件主要包含：
 - DashScope / OpenAI-compatible vision：用于图片附件理解。
 - RAGAS：用于 assistant 消息保存后的异步质量评估。
 
-## 4. 部署步骤说明（含 DNS / HTTPS 说明）
+## 工程与质量
 
-### 4.1 环境准备
-
-建议环境：
-
-- Node.js 22.15+（`npm test` 用到该版本起才提供的 `module.registerHooks`，见 [tests/README.md](tests/README.md)）
-- Python 3.10+
-- MySQL 8+
-- Milvus Lite 本地文件或远程 Milvus 服务
-- 可用的 DeepSeek / DashScope API Key
-- 可选：阿里云 OSS，用于图片附件存储
-
-浏览器基线（前端样式依赖）：
-
-- Safari 16.4+ / Chrome 111+ / Firefox 128+
-
-Tailwind CSS v4 依赖 `@property` 与 `color-mix()` 等较新的 CSS 特性，低于上述基线的浏览器上样式会整体失效（不是降级，是不生效）。旧浏览器需要继续支持时，前端需回退到 Tailwind 3.4.x。
-
-安装前端依赖：
-
-```bash
-npm install
-```
-
-安装后端依赖：
-
-```bash
-cd backend
-pip install -r requirements.txt
-```
-
-### 4.2 配置环境变量
-
-复制示例配置：
-
-```bash
-cp .env.example .env
-```
-
-Windows PowerShell：
-
-```powershell
-Copy-Item .env.example .env
-```
-
-至少需要配置：
-
-```env
-MYSQL_USER=your_mysql_user
-MYSQL_PASSWORD=your_mysql_password
-MYSQL_HOST=localhost
-MYSQL_PORT=3306
-MYSQL_DATABASE=rag_system
-MYSQL_SSL_MODE=
-MYSQL_SSL_CA=
-
-DEEPSEEK_API_KEY=your_deepseek_api_key
-DASHSCOPE_API_KEY=your_dashscope_api_key
-
-SECRET_KEY=change-this-secret-key-in-production
-```
-
-上面 `SECRET_KEY` 写的是与 `.env.example` 一致的公开占位值，**必须替换**成随机值再启动：
-保持占位值（或留空）时后端会拒绝启动。生成方式见文末安全说明。
-
-Render 后端 Web Service 建议额外设置 Python 版本，避免平台默认使用过新的 Python 版本：
-
-```env
-PYTHON_VERSION=3.10.11
-```
-
-如果使用 Aiven MySQL 这类要求 SSL 的云数据库，Render 环境变量里加：
-
-```env
-MYSQL_SSL_MODE=required
-```
-
-如果服务商要求指定 CA 证书，可以把证书文件随部署环境挂载后设置：
-
-```env
-MYSQL_SSL_CA=/path/to/ca.pem
-```
-
-如果使用本地 Milvus Lite：
-
-```env
-MILVUS_LITE_URI=./milvus.db
-```
-
-如果使用远程 Milvus：
-
-```env
-MILVUS_URI=http://your-milvus-host:19530
-MILVUS_TOKEN=
-MILVUS_USER=
-MILVUS_PASSWORD=
-MILVUS_DB_NAME=
-```
-
-默认账号播种由环境变量控制：
-
-```env
-SEED_DEFAULT_USERS=true
-SEED_ADMIN_PASSWORD=
-SEED_DEMO_PASSWORD=
-```
-
-- `SEED_DEFAULT_USERS` 默认为 `true`，设为 `false` 后启动过程不会创建任何账号。
-- 账号口令只来自 `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD`，仓库中不存在固定口令；未配置对应变量时会生成不可预测的随机口令，随机口令不会写入日志。口令两端的空白字符会被忽略。
-- 因此未显式配置口令的账号无法直接登录，**已存在**的账号可以按下面的方式重置口令（`新口令` 换成自定义值）：
-
-```bash
-cd backend
-python -c "from database.session import SessionLocal; from crud import user as crud_user; from model.models import User; from service.auth_service import pwd_context; db = SessionLocal(); u = db.query(User).filter_by(username='admin').first(); crud_user.update_password_hash(db, u, pwd_context.hash('新口令')); db.close(); print('password updated')"
-```
-
-- 如果该账号还不存在（例如长期设置 `SEED_DEFAULT_USERS=false`，库里没有任何账号），临时把 `SEED_DEFAULT_USERS` 设回 `true` 并配置 `SEED_ADMIN_PASSWORD`，重启服务一次即可创建；播种只补建不存在的账号，不会覆盖已有账号的口令。
-- 对外提供服务前，建议设置 `SEED_DEFAULT_USERS=false`，或至少为启用的账号配置强口令。
-
-### 4.3 初始化数据库
-
-创建 MySQL 数据库：
-
-```sql
-CREATE DATABASE IF NOT EXISTS rag_system
-  CHARACTER SET utf8mb4
-  COLLATE utf8mb4_unicode_ci;
-```
-
-启动 FastAPI 时，`backend/main.py` 会调用 `init_db()` 创建表结构，并调用 `seed_default_users()` 初始化默认账号。
-
-`seed_default_users()` 受 `SEED_DEFAULT_USERS` 控制：该开关为 `false` 时不创建任何账号；为 `true` 时仅为尚不存在的 `admin`、`demo` 创建账号，且不会覆盖已有账号的口令。账号口令取自 `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD`，未配置时使用随机生成的口令（不落日志），不再使用任何公开的固定口令。
-
-知识库与知识文件按归属用户隔离，历史数据（`user_id` 为 NULL）对任何用户都不可见，需要一次性回填：
-
-```bash
-python scripts/backfill_knowledge_owner.py --user-id <用户ID>            # 默认只打印回填计划
-python scripts/backfill_knowledge_owner.py --user-id <用户ID> --apply    # 真正写入
-```
-
-### 4.4 本地启动
-
-启动后端：
-
-```bash
-cd backend
-python -m uvicorn main:app --host 127.0.0.1 --port 8002
-```
-
-健康检查（注意是根路径 `/health`，不在 `/api/` 前缀下）：
-
-```bash
-curl -i http://127.0.0.1:8002/health
-```
-
-期望返回 `200` 与 `{"status":"ok"}`。
-
-启动前端：
-
-```bash
-npm run dev
-```
-
-Vite 默认地址：
-
-```text
-http://localhost:5173
-```
-
-### 4.5 生产构建
-
-构建前端：
-
-```bash
-npm run build
-```
-
-构建产物位于：
-
-```text
-dist/
-```
-
-后端可使用 Uvicorn / Gunicorn + Uvicorn Worker 运行。例如：
-
-```bash
-cd backend
-python -m uvicorn main:app --host 127.0.0.1 --port 8002
-```
-
-### 4.6 Nginx 反向代理示例
-
-下面示例假设：
-
-- 域名：`example.com`
-- 前端静态文件目录：`/var/www/rag/dist`
-- 后端地址：`http://127.0.0.1:8002`
-
-```nginx
-server {
-    listen 80;
-    server_name example.com;
-
-    root /var/www/rag/dist;
-    index index.html;
-
-    location = /health {
-        proxy_pass http://127.0.0.1:8002/health;
-    }
-
-    location / {
-        try_files $uri $uri/ /index.html;
-    }
-
-    location /api/ {
-        proxy_pass http://127.0.0.1:8002/api/;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        proxy_buffering off;
-        proxy_read_timeout 300s;
-    }
-
-    location /uploads/ {
-        proxy_pass http://127.0.0.1:8002/uploads/;
-    }
-}
-```
-
-`proxy_buffering off` 对 SSE 很重要，否则流式回答可能被 Nginx 缓冲，导致前端不能实时显示。
-
-健康检查必须单独代理：后端的健康检查路由注册在**根路径 `/health`**，不在 `/api/` 前缀下，所以上面的 `location = /health` 不能省。省略它的话，`/health` 会落进 `location /` 的 `try_files`，返回前端 `index.html`（`200` + `text/html`）而不是健康检查的 JSON，部署自检就会误判。另外**`/api/health` 并不存在**，请求它只会得到 `404`。
-
-关于接口文档：本示例**故意不代理** `/docs`、`/redoc`、`/openapi.json`。这三个是 FastAPI 挂在根路径下的交互文档与 OpenAPI Schema，按上述配置在公网不可达（会被 `location /` 兜到前端页面），可以避免对外暴露完整的接口结构。如果确实需要在受控环境里访问，在 server 块内补充：
-
-```nginx
-    # Swagger UI 页面本身是 /docs，它还会请求 /docs/oauth2-redirect，
-    # 因此精确匹配 /docs 之外还要放行 /docs/ 子路径。
-    # proxy_set_header 在 location 之间互不继承（写在 server 级才会被各 location 继承），
-    # 这里逐块书写，方便单独复制其中一段。
-    location = /docs {
-        proxy_pass http://127.0.0.1:8002/docs;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    location /docs/ {
-        proxy_pass http://127.0.0.1:8002/docs/;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    location = /redoc {
-        proxy_pass http://127.0.0.1:8002/redoc;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    location = /openapi.json {
-        proxy_pass http://127.0.0.1:8002/openapi.json;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-```
-
-这里统一用 `=` 精确匹配，避免 `/docsXYZ` 这类并不存在的路径也被转发到后端。`proxy_set_header Host $host;` 同样是必须的：不写的话 Nginx 默认把 `Host` 设成上游地址（`127.0.0.1:8002`），而 Starlette 对 `/docs/` 会回一个 `307` 跳转到 `/docs`，跳转目标里就会带上 `http://127.0.0.1:8002` 这个只在服务器内部可达的地址，浏览器拿到后会跳不过去。四个块里还一并设置了 `X-Forwarded-Proto`（与上面 `/api/` 块保持一致），这样从 HTTPS 入口访问时 `307` 直接跳到 `https://`；少了它，跳转目标会是 `http://`，还要经 80 端口再 `301` 回 443，白多一次往返。开启前建议配合 IP 白名单（`allow` / `deny`）或额外的鉴权，不要直接暴露在公网。
-
-### 4.7 DNS 配置
-
-如果要绑定域名，需要在域名服务商处添加解析记录：
-
-| 类型 | 主机记录 | 指向 |
-| --- | --- | --- |
-| A | `@` | 服务器公网 IPv4 |
-| A | `www` | 服务器公网 IPv4 |
-| CNAME | `api` | 可选，指向主域名或后端网关域名 |
-
-配置后可用以下命令检查解析：
-
-```bash
-nslookup example.com
-```
-
-或：
-
-```bash
-dig example.com
-```
-
-DNS 生效可能需要几分钟到数小时，取决于 TTL 和域名服务商。
-
-### 4.8 HTTPS 配置
-
-生产环境建议使用 HTTPS。可以通过 Let's Encrypt 申请免费证书：
-
-```bash
-sudo certbot --nginx -d example.com -d www.example.com
-```
-
-证书签发后，确认 Nginx 中存在 443 配置，并将 HTTP 自动跳转到 HTTPS：
-
-```nginx
-server {
-    listen 80;
-    server_name example.com www.example.com;
-    return 301 https://$host$request_uri;
-}
-```
-
-上面是 HTTP → HTTPS 跳转。`certbot --nginx` 是**原地改写**匹配到 `example.com` 的那个 server 块（也就是 4.6 里监听 80 的那一个），所以 4.6 的 `location = /health` 通常会被一并保留；但如果你另行编写了 443 的 server 块，或换用了其它证书签发方式，就必须逐条确认 443 块里也有这条规则，否则 HTTPS 入口的健康检查仍会被 `location /` 兜成前端页面：
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name example.com;
-    # ssl_certificate / ssl_certificate_key 等由 certbot 写入
-
-    location = /health {
-        proxy_pass http://127.0.0.1:8002/health;
-    }
-
-    # 其余 location / 与 location /api/ 的配置同 4.6
-}
-```
-
-HTTPS 部署后需要检查：
-
-- `https://example.com` 可以打开前端页面。
-- `https://example.com/health` 可以正常返回健康检查 JSON。
-- `/api/chat/stream` 流式输出不会被代理缓冲。
-- `VITE_API_BASE_URL` 与 Nginx 代理路径一致。
-- 生产环境 `SECRET_KEY` 已替换为强随机值（未替换时后端会拒绝启动）。
-- CORS、Cookie、安全响应头按真实部署域名收紧。
-
-其中健康检查这一项可以直接用命令验证：
-
-```bash
-curl -i https://example.com/health
-```
-
-期望结果是 `200`、`content-type: application/json`，响应体为 `{"status":"ok"}`。如果拿到的是 `text/html`，说明 `/health` 被 `location /` 兜到了前端页面（缺少 4.6 的 `location = /health`）；如果拿到 `404`，则是请求了并不存在的 `/api/health`。
-
-## 项目亮点
-
-- 支持登录、JWT 鉴权、用户资料、头像上传和路由守卫。
-- 支持知识库创建、重命名、删除、切换、默认知识库兜底和文件管理。
-- 支持文本、DOCX、PDF 上传解析、语义分块、Milvus Lite 向量索引和上传失败回滚。
-- 基于 `knowledge_base_id` 同时隔离 MySQL 元数据和 Milvus 向量记录。
-- 提供 `/api/chat/stream` SSE 流式问答，支持历史会话、Markdown 渲染、来源展示和 Trace 回放。
-- 使用 Advanced RAG 检索链路，覆盖 RAG 路由判断、查询规划、HyDE、问题改写、关键词召回、向量召回、RRF 融合、rerank 和兜底检索。
-- 支持图片附件问答，将视觉模型生成的图片描述与用户文本合并为 `effective_question`。
-- 设计多轮会话记忆机制，包含短期滑窗、长期摘要、近期上下文压缩和长期摘要二次压缩。
-- 在 assistant 消息保存后异步执行 RAGAS 在线评估，计算 faithfulness、response relevancy 和 context precision。
-- 补充后端 RAG 检索链路和前端流式解析工具函数的回归测试。
-
-## 技术栈
+### 技术栈
 
 | 层级 | 技术 |
 | --- | --- |
@@ -531,7 +334,7 @@ curl -i https://example.com/health
 | 评估 | RAGAS |
 | 对象存储 | 阿里云 OSS |
 
-## 目录结构
+### 目录结构
 
 ```text
 .
@@ -549,7 +352,7 @@ curl -i https://example.com/health
 │   ├── router/                  # API 路由挂载
 │   ├── schema/                  # Pydantic schema
 │   └── service/                 # 业务服务
-├── docs/                        # 架构和流程文档
+├── docs/                        # 架构、流程与部署文档
 ├── tests/                       # Node 和 pytest 回归测试
 │   └── e2e/                     # Playwright 浏览器验收（用例 / 夹具 / 模型桩服务）
 ├── package.json
@@ -557,7 +360,7 @@ curl -i https://example.com/health
 └── backend/requirements.txt
 ```
 
-## 测试与构建
+### 测试与构建
 
 Node 测试：
 
@@ -590,7 +393,7 @@ npm run build
 
 ### CI（GitHub Actions）
 
-向 `develop`、`main` 提 PR，以及 push 到 `develop` 时会自动跑下面五个独立检查。同一分支连续 push 时，上一次还在跑的运行会被自动取消（各 workflow 内的 `concurrency`）。
+向 `develop`、`main` 提 PR，以及 push 到 `develop` 时会自动跑下面五个独立检查；PR 上另有 PR 标题校验、PR 描述校验与 Secret Scan 三道门禁。同一分支连续 push 时，上一次还在跑的运行会被自动取消（各 workflow 内的 `concurrency`）。
 
 | Workflow | 检查项 | 内容 |
 | --- | --- | --- |
@@ -665,6 +468,45 @@ python tests/e2e/check_stub_calls.py tests/e2e/artifacts/logs/stub-requests.json
 
 CI 与本地唯一的环境差异是各服务的地址由 `.github/workflows/e2e.yml` 注入；用例本身不感知环境，也不做 `if (CI)` 分支。
 
+## 部署
+
+### 生产构建
+
+构建前端：
+
+```bash
+npm run build
+```
+
+构建产物位于：
+
+```text
+dist/
+```
+
+后端可使用 Uvicorn / Gunicorn + Uvicorn Worker 运行。例如：
+
+```bash
+cd backend
+python -m uvicorn main:app --host 127.0.0.1 --port 8002
+```
+
+### Nginx 反向代理
+
+生产环境用 Nginx 托管前端静态文件，并把 `/api/`、`/uploads/`、`/health` 反代到后端。有三个要点：
+
+- `proxy_buffering off` 对 SSE 很重要，否则流式回答可能被 Nginx 缓冲，导致前端不能实时显示。
+- 健康检查必须单独代理：后端的健康检查路由注册在**根路径 `/health`**，不在 `/api/` 前缀下，所以 `location = /health` 不能省。省略它的话，`/health` 会落进 `location /` 的 `try_files`，返回前端 `index.html`（`200` + `text/html`）而不是健康检查的 JSON，部署自检就会误判。另外**`/api/health` 并不存在**，请求它只会得到 `404`。
+- `/docs`、`/redoc`、`/openapi.json` 默认**故意不代理**：这三个是 FastAPI 挂在根路径下的交互文档与 OpenAPI Schema，按示例配置在公网不可达（会被 `location /` 兜到前端页面），可以避免对外暴露完整的接口结构。确实需要在受控环境里访问时，再补充精确匹配的 location，并配合 IP 白名单（`allow` / `deny`）或额外的鉴权。
+
+完整 Nginx 配置、`/docs` 段的逐块说明与注意事项见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+
+### DNS 与 HTTPS
+
+绑定域名需要在域名服务商处添加解析记录（`@`、`www` 指向服务器公网 IPv4，`api` 可选），并用 `nslookup` / `dig` 检查；DNS 生效可能需要几分钟到数小时，取决于 TTL 和域名服务商。生产环境建议使用 HTTPS，可以通过 Let's Encrypt 申请免费证书（`sudo certbot --nginx -d example.com -d www.example.com`）；`certbot --nginx` 是原地改写监听 80 的 server 块，若另行编写了 443 块，必须逐条确认其中也有 `location = /health`。
+
+解析记录表、443 块示例、HTTPS 部署检查清单（含 `curl -i https://example.com/health` 验证）见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+
 ## 协作与提交规范
 
 - 提交信息与 PR 标题遵循 [Conventional Commits](https://www.conventionalcommits.org/)，type 与 scope 取值、合并方式见 [COMMIT_CONVENTION.md](COMMIT_CONVENTION.md)。
@@ -691,10 +533,12 @@ CI 与本地唯一的环境差异是各服务的地址由 `.github/workflows/e2e
 
 ## 文档
 
-- `docs/PROJECT_ARCHITECTURE_FULL.md`：完整架构和模块说明。
-- `docs/PROJECT_CODE_READING_ROADMAP.md`：代码阅读路线。
-- `docs/PROJECT_FLOW_DIAGRAM.md`：聊天和知识库主流程 Mermaid 图。
-- `docs/MAINTENANCE_GOAL_CLOSURE.md`：维护收束报告和剩余风险。
+- [docs/PROJECT_ARCHITECTURE_FULL.md](docs/PROJECT_ARCHITECTURE_FULL.md)：完整架构和模块说明。
+- [docs/PROJECT_CODE_READING_ROADMAP.md](docs/PROJECT_CODE_READING_ROADMAP.md)：代码阅读路线。
+- [docs/PROJECT_FLOW_DIAGRAM.md](docs/PROJECT_FLOW_DIAGRAM.md)：聊天和知识库主流程 Mermaid 图。
+- [docs/MAINTENANCE_GOAL_CLOSURE.md](docs/MAINTENANCE_GOAL_CLOSURE.md)：维护收束报告和剩余风险。
+- [DEVELOPING.md](DEVELOPING.md)：开发须知、提交前自检、密钥配置与 CI 说明。
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)：Nginx、DNS 与 HTTPS 生产部署细节。
 
 ## License
 

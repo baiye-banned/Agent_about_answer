@@ -24,7 +24,8 @@ import hashlib
 import hmac
 import json
 import logging
-from email.utils import formatdate
+import time
+from email.utils import formatdate, parsedate_to_datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -292,7 +293,12 @@ def test_attachment_delete_request_is_signed_for_oss_delete(api, monkeypatch):
         ).digest()
     ).decode("utf-8")
     assert request.headers["Authorization"] == f"OSS test-id:{expected}"
-    assert date == formatdate(usegmt=True)
+    # Date 头是「签发那一刻」的墙钟读数。这里再取一次 formatdate 做相等断言，就等于要求
+    # 两次互不相关的读数恰好落在同一秒——跨过秒边界必假红。改为校验它是规范的 RFC-2822
+    # GMT 时间（回读再格式化要逐字相同），且与当前时刻的偏差落在容忍窗口内。
+    requested_at = parsedate_to_datetime(date)
+    assert formatdate(requested_at.timestamp(), usegmt=True) == date
+    assert abs(requested_at.timestamp() - time.time()) <= 5
     # 回收不该带上传时那条公开读 ACL 头：对象都要删了，改 ACL 没有意义且会改变签名内容。
     assert "x-oss-object-acl" not in request.headers
     # 也不能带 content-type：签名串的 Content-Type 槽位留空（上面的 string-to-sign 是
