@@ -754,7 +754,7 @@ def test_sweep_never_signs_a_delete_for_a_key_this_service_never_minted(api, oss
 
     assert oss_requests.urls("DELETE") == [f"https://{OSS_HOST}/{UPLOAD_A}"]
     assert report["reclaimed"] == 1
-    # 永远签不出 DELETE 的行不能一直留着：留着就会每轮清扫重复告警、还占着批次名额。
+    # 留着是为了让该键的发送被拒（墓碑）；重复处理由 `reclaimed_at` 过滤挡住。
     assert report["unclaimable"] == 2
     assert _pending_rows(api) == []
     warnings = [record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING]
