@@ -135,6 +135,18 @@ def _ensure_schema_columns():
         if "events" in columns:
             _ensure_mysql_text_column("chat_trace_sessions", "events", "LONGTEXT")
 
+    if "chat_attachment_uploads" in table_names:
+        columns = {column["name"] for column in inspector.get_columns("chat_attachment_uploads")}
+        # 消费时刻（issue #233）。可空、默认 NULL：存量行落成 NULL 恰好等于「还没被消费」
+        # ——也就是旧代码把这行物理删掉时它在清扫任务眼里的状态，语义上严格向后兼容，
+        # 因此不需要单独的回填脚本（归属的推定回填是另一件事，见
+        # scripts/backfill_attachment_owner.py）。上线顺序见该 issue 的回滚方案：只要还有
+        # 实例在跑旧代码，库里就不得存在 consumed_at IS NOT NULL 的行——旧代码的
+        # list_pending_attachment_uploads 没有这列上的过滤，会把已消费的留存行当成孤儿候选。
+        if "consumed_at" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE chat_attachment_uploads ADD COLUMN consumed_at DATETIME"))
+
 
 def _ensure_mysql_utf8mb4():
     if engine.dialect.name != "mysql":
