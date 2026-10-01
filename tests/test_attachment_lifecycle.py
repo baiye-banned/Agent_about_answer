@@ -25,6 +25,7 @@ import hmac
 import json
 import logging
 import time
+from datetime import datetime
 from email.utils import formatdate, parsedate_to_datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -215,6 +216,25 @@ def _add_conversation(api, cid, attachments_columns):
     api.db.commit()
 
 
+def _seed_owned_upload(api, object_key, user_id=None):
+    """补种一条「已被发送消费」的登记行，属主默认是 alice。
+
+    本文件把字面键直接写进 `messages.attachments`（或直接喂给 `stream_chat`），绕开了上传
+    接口那条唯一的铸键路径，库里并没有对应的登记行。issue #233 之后归属判据落在
+    `chat_attachment_uploads` 上，查无此键按 deny-by-default 一律拒签——于是「删掉了」的断言
+    会失败，而失败的原因不是删除链路错了，是这些键本来就没有归属记录。补种就是把这把键
+    「本该在」的归属补回来，断言一字不改。
+
+    `consumed_at` 取非空：这些键都已经被消息引用了，正是「已消费」的形态。
+    """
+    api.db.add(ChatAttachmentUpload(
+        object_key=object_key,
+        user_id=api.alice.id if user_id is None else user_id,
+        consumed_at=datetime.now(),
+    ))
+    api.db.commit()
+
+
 def _upload_avatar(api, payload: bytes, content_type="image/png", filename="avatar.png"):
     return api.client.post(
         "/api/user/avatar",
@@ -231,6 +251,10 @@ def _avatar_file(api, avatar_path: str) -> Path:
 # ---------------------------------------------------------------------------
 
 def test_deleting_conversation_deletes_referenced_attachment_objects(api, oss_requests):
+    # 三个字面键都补种成 alice 的登记行：本用例走的是「自己上传的、已被发送的键」这条
+    # 正常路径（对照②），只是键的形态用字面量写死，好让实现改前缀时用例仍然有效。
+    for key in (KEY_A, KEY_B, KEY_C):
+        _seed_owned_upload(api, key)
     _add_conversation(api, "c-del", [
         _attachments_column(KEY_A),
         _attachments_column(KEY_B, KEY_C),   # 多图消息
@@ -272,6 +296,8 @@ def test_attachment_delete_request_is_signed_for_oss_delete(api, monkeypatch):
         monkeypatch.setattr(oss_service, name, value)
     monkeypatch.setattr(oss_service.httpx, "Client", factory)
 
+    # 补种 KEY_A 的归属：签名断言一字不改，这正是「本人已发送的键照旧回收」的护栏。
+    _seed_owned_upload(api, KEY_A)
     _add_conversation(api, "c-sign", [_attachments_column(KEY_A)])
 
     assert api.client.delete("/api/chat/conversations/c-sign").status_code == 200
@@ -308,6 +334,8 @@ def test_attachment_delete_request_is_signed_for_oss_delete(api, monkeypatch):
 
 def test_failed_object_delete_keeps_the_conversation_delete_working(api, oss_requests, caplog):
     """单个对象删不掉：会话照删，失败落服务端日志，且不回显给用户。"""
+    for key in (KEY_A, KEY_B, KEY_C):
+        _seed_owned_upload(api, key)
     _add_conversation(api, "c-partial", [_attachments_column(KEY_A, KEY_B, KEY_C)])
     oss_requests.status_by_key[KEY_B] = 403
 
@@ -476,7 +504,13 @@ def test_foreign_object_key_is_never_signed_for_delete(api, oss_requests, caplog
     `NEAR_MISS_KEYS` 里的穿越键是这条护栏的重点：键会被 `quote(key, safe="/")` 拼进 URL，
     httpx 会把 `..` 规范化掉，于是 `rag-chat/../../finance-archive/x` 会以 `/finance-archive/x`
     发出去——只查 `rag-chat/` 前缀的实现在这里就会删到桶里别的对象。
+
+    **补种范围是全部 7 把脏键，不止 KEY_A**（issue #233）：归属判据排在形态闸之前，只补
+    KEY_A 的话这 7 把键会先被「查无登记行」挡掉，形态闸在这条路径上一次都不会被执行——
+    用例照样绿，但它测的已经不是它自称在测的东西。
     """
+    for key in (KEY_A, FOREIGN_KEY, *NEAR_MISS_KEYS):
+        _seed_owned_upload(api, key)
     _add_conversation(api, "c-foreign", [
         _attachments_column(FOREIGN_KEY),
         _attachments_column(*NEAR_MISS_KEYS),
@@ -547,6 +581,10 @@ def test_foreign_object_key_is_not_stored_by_the_chat_route(api, monkeypatch, os
     与上一条互补——上一条锁删除侧的收口，这一条锁写入侧的收口，去掉任意一道，
     对应用例变红。
     """
+    # 只补 KEY_A 一条：另两把在写入侧就被 `_service_minted_attachments` 丢掉了（见下面的
+    # `stored == [KEY_A]`），从来进不了库，也就轮不到删除侧。这条路径没有上传，写路径不会
+    # INSERT 登记行，不补种的话 KEY_A 按 deny-by-default 被拒签，用例会红。
+    _seed_owned_upload(api, KEY_A)
     cid = _run_stream_chat(api, monkeypatch, [
         {"object_key": FOREIGN_KEY, "name": "payroll.sql"},
         {"object_key": NEAR_MISS_KEYS[0], "name": "escape.png"},
