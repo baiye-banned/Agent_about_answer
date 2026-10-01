@@ -134,6 +134,12 @@ class ChatAttachmentUpload(Base):
     属主。发送成功不再物理删行，而是盖上 `consumed_at`——行在，归属就在，删会话时才有
     依据判断「这把键是不是该由我回收」；行没了就只能退回「键出现在我的会话里」这种
     伪判据，任何登录用户都能借别人的会话删别人的对象。
+
+    行还记录了清扫侧的状态（issue #238）：`claimed_at` 是租约起点，`reclaimed_at` 是
+    删除意图的墓碑。三者互斥共用一张行状态机——pending（三列皆空）、deleting（claimed_at
+    与 reclaimed_at 皆非空）、reclaimed（只有 reclaimed_at 非空，删除已成）、consumed
+    （consumed_at 非空）。`consumed_at` 与 `reclaimed_at` 不可能同时非空：一条已被消息
+    消费的对象绝不会再被判为孤儿，反之亦然。
     """
 
     __tablename__ = "chat_attachment_uploads"
@@ -149,6 +155,18 @@ class ChatAttachmentUpload(Base):
     # 存量库由 database/session.py 的补列迁移补上（可空、默认 NULL），因此不需要单独的
     # 回填脚本就能让写入侧跑起来；**归属**的推定回填见 scripts/backfill_attachment_owner.py。
     consumed_at = Column(DateTime, nullable=True, default=None)
+    # 租约起点（issue #238）：清扫任务把这一行「领走」的时刻，只用来给一次删除外呼计时。
+    # 它的含义**不是**「发送可以通行」——恰恰相反，同一时刻写下的 reclaimed_at 才是判据。
+    # NULL = 没有人在处理这一行。非 NULL 时必有 reclaimed_at 非 NULL（两者只由
+    # claim_attachment_upload 在同一句 UPDATE 里一起写下），所以「claimed_at 非空」本身就
+    # 蕴含「已被判为待回收」，任何人都不能靠比较它与当前时间来放行一次发送。
+    claimed_at = Column(DateTime, nullable=True, default=None)
+    # 删除意图已提交的时刻（issue #238，墓碑）：清扫赢下这一行之后、**碰对象之前**写下，
+    # 之后才去外呼 OSS DELETE。它与 claimed_at 同一次写入，但两者生命周期不同——删除成功
+    # 只清 claimed_at（行作为既成事实的墓碑留下，让这把键的发送被拒），只有墓碑过了保留期
+    # 才由 GC 连行一起清掉。发送侧的拒签只读这一列，不读 claimed_at（I13）。
+    # 存量库同样由 database/session.py 的补列迁移补上（可空、默认 NULL），不需要回填脚本。
+    reclaimed_at = Column(DateTime, nullable=True, default=None)
 
 
 class ChatTraceSession(Base):

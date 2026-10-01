@@ -146,6 +146,18 @@ def _ensure_schema_columns():
         if "consumed_at" not in columns:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE chat_attachment_uploads ADD COLUMN consumed_at DATETIME"))
+        # 清扫侧的租约起点与删除意图墓碑（issue #238）。同样可空、默认 NULL：存量行落成
+        # 「三列皆空」＝ pending，正是新代码眼里「尚未被处理过的待回收行」，语义向后兼容，
+        # 不需要回填脚本。上线顺序同理——只要还有实例在跑旧代码，库里就不得存在
+        # reclaimed_at IS NOT NULL 的行：旧代码不看这列，会把已经「判过死刑」的键当成普通
+        # 待回收行再签一次 DELETE（对象存储没有回收站，重复删除虽幂等，但更糟的是旧代码没有
+        # 墓碑可拒签，那把键的发送会照着旧逻辑通行，落库的消息引用一个已被删掉的对象）。
+        if "claimed_at" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE chat_attachment_uploads ADD COLUMN claimed_at DATETIME"))
+        if "reclaimed_at" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE chat_attachment_uploads ADD COLUMN reclaimed_at DATETIME"))
 
 
 def _ensure_mysql_utf8mb4():

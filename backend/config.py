@@ -261,6 +261,20 @@ CHAT_ATTACHMENT_SWEEP_BATCH_LIMIT = _env_int("CHAT_ATTACHMENT_SWEEP_BATCH_LIMIT"
 # 孤儿会一直攒着，那正是 issue #142 要消灭的形态。默认 6 小时——回收是尽力而为的维护动作，
 # 迟一点没有正确性代价，而每轮都要串行外呼 OSS。
 CHAT_ATTACHMENT_SWEEP_INTERVAL_SECONDS = _env_int("CHAT_ATTACHMENT_SWEEP_INTERVAL_SECONDS", 6 * 60 * 60)
+# 一次删除外呼的租约时长（issue #238）。清扫领走一行时写下租约起点，这些秒数只用来判断
+# 「上一个清扫进程是不是已经死在半路上」：超过它，这一行可以被下一轮清扫**重新领取**并重试
+# 删除。它**不是**发送侧的放行条——发送能不能通行只看墓碑（reclaimed_at），与租约是否过期
+# 无关；把租约过期当成「清扫放弃了、可以发送了」正是这次修复要消灭的误判。
+# 默认 300 秒：够一次 OSS DELETE 往返（连接超时量级），又远小于清扫间隔（6 小时），
+# 于是一轮清扫里几乎不会出现「刚领的行还没做完就被自己重领」。
+CHAT_ATTACHMENT_LEASE_SECONDS = _env_int("CHAT_ATTACHMENT_LEASE_SECONDS", 300)
+# 墓碑保留期（issue #238）。删除成功后，登记行作为「这把键已被回收」的事实留下，好让这把
+# 键的发送被立刻拒绝（否则消息会落库并永久引用一个已被删掉的对象）。保留期一过，行没有
+# 别的用处了，由清扫末尾的 GC 连行一起清掉——清掉之后这把键退回「表里查无此行」的语义，
+# 发送不再被拒（那正是 #142 之前就存在的老键形态，按 deny-by-default 无处可拒）。
+# 默认 7 天：比 24 小时的待回收窗口长得多，给足「清扫已判死、用户又想把图发出去」的纠错面。
+# **置 0 = 关闭 GC**：墓碑永不清理（用于需要长期保留删除记录的场景），代价是这张表只增不减。
+CHAT_ATTACHMENT_TOMBSTONE_TTL_SECONDS = _env_int("CHAT_ATTACHMENT_TOMBSTONE_TTL_SECONDS", 7 * 24 * 60 * 60)
 
 # 请求限流（issue #183）。计数器在进程内存里（见 service/rate_limit.py），多 worker / 多实例
 # 部署时每个进程各持一份，真实上限 = 配置值 × 进程数。登录侧按「账号 + 来源地址」计数：
