@@ -35,7 +35,6 @@ from database.session import Base
 from model.models import ChatTraceSession, Conversation, KnowledgeBase, Message, RevokedToken, User
 from rag.learning_trace import TraceRecorder
 from router import chat as chat_router
-from router import checkpointer as checkpointer_router
 from service import auth_service
 
 
@@ -152,7 +151,6 @@ def api(monkeypatch, tmp_path):
 
     app = FastAPI()
     app.include_router(chat_router.router)
-    app.include_router(checkpointer_router.router)
     app.dependency_overrides[db_session.get_db] = lambda: db
     app.dependency_overrides[auth_service.get_current_user] = lambda: alice
 
@@ -262,8 +260,9 @@ def test_message_trace_endpoint_does_not_serve_trace_of_deleted_conversation(api
 def test_no_read_endpoint_serves_deleted_conversation_content(api):
     """对抗面穷举：删除会话后把所有相关读取入口扫一遍，任何一处都不能再吐回原文。
 
-    覆盖前端实际调用的两条轨迹入口，加上会话列表、消息历史与 checkpointer 线程列表——
-    「删会话」这条链路要一起清掉的东西都要扫到。最后一条断言是**阳性对照**：另一个会话的
+    覆盖前端实际调用的两条轨迹入口，加上会话列表与消息历史——「删会话」这条链路要一起清掉
+    的东西都要扫到。`/api/checkpointer/threads` 该端点已移除（issue #236），列进 404 一组：
+    它现在既不该 200，也不该吐出任何 thread_id。最后一条断言是**阳性对照**：另一个会话的
     内容必须照常读得到，否则「全都 404」也能让本用例通过。
     """
     _delete_conversation(api)
@@ -272,6 +271,8 @@ def test_no_read_endpoint_serves_deleted_conversation_content(api):
         f"/api/chat/traces/{TRACE_ID}",
         f"/api/chat/messages/{api.assistant_message_id}/trace",
         f"/api/chat/conversations/{CONVERSATION_ID}",
+        # 该端点已移除（issue #236）：路由不存在，因此也是 404。
+        "/api/checkpointer/threads",
     ]
     for path in must_404:
         response = api.client.get(path)
@@ -279,7 +280,7 @@ def test_no_read_endpoint_serves_deleted_conversation_content(api):
         assert QUESTION not in response.text, f"{path} 仍能读出已删会话的提问原文"
 
     # 列表类入口返回 200，这里断言的是「内容不在响应里」。
-    for path in ("/api/chat/conversations", "/api/checkpointer/threads"):
+    for path in ("/api/chat/conversations",):
         response = api.client.get(path)
         assert response.status_code == 200, f"{path} 期望 200，实际 {response.status_code}"
         assert QUESTION not in response.text, f"{path} 仍能读出已删会话的提问原文"

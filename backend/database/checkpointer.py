@@ -60,14 +60,3 @@ def delete_thread_checkpoints(thread_id: str):
         conn.commit()
     finally:
         conn.close()
-
-
-def list_threads() -> list[str]:
-    conn = _get_conn()
-    try:
-        rows = conn.execute(
-            "SELECT DISTINCT thread_id FROM checkpoints ORDER BY created_at DESC"
-        ).fetchall()
-        return [r["thread_id"] for r in rows]
-    finally:
-        conn.close()

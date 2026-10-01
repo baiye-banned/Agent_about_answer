@@ -5,7 +5,6 @@ import logging
 from fastapi import Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from database.checkpointer import list_threads
 from crud import chat as crud_chat
 from database.session import get_db
 from rag.learning_trace import TraceRecorder, get_trace_snapshot, serialize_trace_session as _serialize_trace_session
@@ -76,8 +75,3 @@ def get_message_trace(message_id: int, user: User = Depends(get_current_user),
     if learning_trace:
         return learning_trace
     raise HTTPException(404, "该消息暂无流程 Trace")
-
-
-
-def list_checkpointer_threads(_user: User = Depends(get_current_user)):
-    return {"threads": list_threads()}

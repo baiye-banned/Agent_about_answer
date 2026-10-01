@@ -14,7 +14,6 @@ from config import (
 from database.session import init_db
 from router.auth import router as auth_router
 from router.chat import router as chat_router
-from router.checkpointer import router as checkpointer_router
 from router.knowledge import router as knowledge_router
 from router.uploads import router as uploads_router
 from router.user import router as user_router
@@ -90,7 +89,6 @@ app.include_router(auth_router)
 app.include_router(user_router)
 app.include_router(chat_router)
 app.include_router(knowledge_router)
-app.include_router(checkpointer_router)
 
 
 if __name__ == "__main__":
