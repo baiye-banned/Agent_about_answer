@@ -234,6 +234,7 @@ Current files:
 - `test_chunk_key_namespace.py`
 - `test_chunking.py`
 - `test_config_helpers.py`
+- `test_cors_credentials_235.py`
 - `test_default_users.py`
 - `test_empty_extraction_166.py`
 - `test_env_example_parity.py`

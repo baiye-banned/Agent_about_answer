@@ -52,10 +52,24 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="RAG API", lifespan=lifespan)
+# CORS 收口（issue #235）：`allow_origins=["*"]` 必须与「不允许凭据」绑定，不能搭配
+# `allow_credentials=True`。后者一旦为真，`*` 与 `Access-Control-Allow-Credentials` 在浏览器里
+# 无法共存，Starlette 会改为**回显请求里的任意 Origin** 并附上允许凭据的头——等于给任意站点
+# 发放「可携带凭据跨域读写」的许可。
+#
+# 而本服务今天没有任何凭据可被这样带走：身份是 localStorage 里的 Bearer token，由请求拦截器
+# 手写成 Authorization 头（`src/api/request.js:11-17`），全仓没有 cookie 会话、也没有
+# withCredentials；生产（`docs/DEPLOYMENT.md` 的 nginx 同 host 托管 dist 与 `/api/`）与开发
+# （`vite.config.js` 的 server.proxy）都是同源部署，唯一的跨源消费者是 CI e2e 套件，它同样走
+# Authorization 头——而 Authorization 不受 Allow-Credentials 管辖，靠的是下面的 allow_headers。
+# 所以 `allow_credentials=True` 在这里收益为零，只是凭空多出一条「任意源 + 允许凭据」的配置。
+#
+# 升级触发条件：将来若引入 cookie 会话，**必须同时改为显式来源白名单**，而不是把
+# allow_credentials 改回 True。那时凭据真实存在，`*` 与它共存就从潜伏项变成可利用的漏洞。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
