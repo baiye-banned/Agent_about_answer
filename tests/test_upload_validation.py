@@ -1,3 +1,5 @@
+import mimetypes
+
 import pytest
 from fastapi import HTTPException
 
@@ -58,19 +60,23 @@ def test_octet_stream_falls_back_to_the_filename_extension():
     assert resolve_image_upload_type("application/octet-stream", "photo.jpg", allow_filename_fallback=True) == ("image/jpeg", ".jpg")
 
 
-def test_webp_does_not_fall_back_and_that_is_not_this_change():
-    """.webp` 在 Python 3.10 无法按扩展名回退，按现实锁定，不属 #237。
+def test_webp_fallback_follows_the_platform_mime_table(monkeypatch):
+    """`.webp` 能否按扩展名回退由运行环境的 mime 表决定，不是本模块的判据。
 
-    `mimetypes` 在 Python 3.10 里没有 `.webp` 条目（3.11 才补上），本机注册表也没提供，
-    于是 `guess_type("shot.webp")` 是 `(None, None)`，回退拿不到类型。修复前后完全一样，
-    而且对空类型与 octet-stream 一视同仁——这是回退机制借用的 `mimetypes` 表的盲区，不是
-    本次判据改动引入的开口。声明 `image/webp` 的请求不受影响（`IMAGE_UPLOAD_TYPES` 里有）。
+    解释器版本与系统 mime.types 都会影响这张表：本机 Python 3.10 的表里没有 `.webp`，
+    回退拿不到类型；CI 的 Linux 表里有，回退就得到 `("image/webp", ".webp")`。两种现实
+    都在修复前后一致，不是判据改动引入的开口，所以这里把两种都钉死——两条断言都只走
+    「回退表 ∩ 白名单」。
     """
-    # 这处锁定绑定解释器版本：Python 3.11 起 `mimetypes` 补上了 `.webp` 条目，下面两条
-    # `is None` 会因环境改善而变红（不是回归）。届时随版本更新本锁，或在回退表里显式补
-    # `.webp`。
+    # 表里没有 `.webp`：回退无类型可给（本机 Python 3.10 的常态）。
+    monkeypatch.setattr(mimetypes, "guess_type", lambda name: (None, None))
     assert resolve_image_upload_type("application/octet-stream", "shot.webp", allow_filename_fallback=True) is None
     assert resolve_image_upload_type("", "shot.webp", allow_filename_fallback=True) is None
+
+    # 表里有 `.webp`：回退按扩展名给出类型（CI 的 Linux 表的常态）。
+    monkeypatch.setattr(mimetypes, "guess_type", lambda name: ("image/webp", None))
+    assert resolve_image_upload_type("application/octet-stream", "shot.webp", allow_filename_fallback=True) == ("image/webp", ".webp")
+    assert resolve_image_upload_type("", "shot.webp", allow_filename_fallback=True) == ("image/webp", ".webp")
 
 
 def test_octet_stream_does_not_fall_back_when_the_caller_did_not_ask_for_it():
