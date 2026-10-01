@@ -1,8 +1,9 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import and_, literal, or_
 from sqlalchemy.orm import Session, selectinload
 
+from config import CHAT_ATTACHMENT_LEASE_SECONDS
 from crud import trace as crud_trace
 from crud.pagination import LIST_DEFAULT_LIMIT, clamp_limit, datetime_cursor_value, seconds_text
 from model.models import ChatAttachmentUpload, ChatTraceSession, Conversation, Message
@@ -12,6 +13,50 @@ from service.json_utils import load_json_value
 # 消息历史默认页大小与单页上限：不传分页参数时也必须有上限，否则会话越长单次响应越大。
 CHAT_MESSAGE_DEFAULT_LIMIT = 50
 CHAT_MESSAGE_MAX_LIMIT = 200
+
+
+# 登记行状态的三个判据（issue #238）。**每一条只在这里定义一次**，清扫、领取、消费、
+# 拒签四条链路共用同一段 SQL：判据一旦在多处各写一份，就会各自演化出微妙的差异，
+# 而这次修复的全部要点就是「发送侧与清扫侧看到的是同一个事实」。
+def _pending_upload_clause():
+    """P：尚未结算的行——既没被消息消费，也没被判为待回收。
+
+    清扫候选、领取（claim）、确认消费（confirm）三处都用它。它同时是「消费」与「回收」
+    两条路径互斥的落点：一条行一旦被任一方赢下，就不再是另一方的候选。
+    """
+    return and_(
+        ChatAttachmentUpload.consumed_at.is_(None),
+        ChatAttachmentUpload.reclaimed_at.is_(None),
+    )
+
+
+def _reclaimed_upload_clause():
+    """B：墓碑——删除意图已提交，行还留着。
+
+    发送侧的拒签与清扫的收尾/回退都以它为准，且**只看它**：不加租约条件，也不看
+    claimed_at。租约过期只说明「上一次删除外呼没做完」，不说明「这个对象还在」——
+    把租约过期当成放行条，正是这次修复要消灭的误判。
+
+    判据落在键域上（只按 object_key 认行），因此跨用户也成立：一把别人铸、正在被回收的
+    键，我照样发不出去——对象存储没有回收站，跨用户的差别不构成放行的理由。
+    """
+    return ChatAttachmentUpload.reclaimed_at.is_not(None)
+
+
+def _stale_reclaimed_upload_clause(now: datetime, lease_seconds: int | None = None):
+    """R：租约已过期的墓碑——上一轮清扫死在半路上留下的行，可以重新领取并重试删除。
+
+    只有 claimed_at 非空且停留在租约之外的行才符合：claimed_at 为空的是已经结算完的墓碑
+    （删除成功过，没什么可重试的），租约之内的是此刻可能正在外呼的行（重领会造成两次
+    并发删除同一对象）。用它重新领取时**只刷新 claimed_at，不动 reclaimed_at**——
+    墓碑一旦写下就不回退，否则发送侧会看到拒签凭空消失。
+    """
+    lease = CHAT_ATTACHMENT_LEASE_SECONDS if lease_seconds is None else lease_seconds
+    return and_(
+        _reclaimed_upload_clause(),
+        ChatAttachmentUpload.claimed_at.is_not(None),
+        ChatAttachmentUpload.claimed_at < now - timedelta(seconds=lease),
+    )
 
 
 def serialize_message(message: Message) -> dict:
@@ -203,8 +248,13 @@ def confirm_attachment_uploads(db: Session, object_keys: list[str], user_id: int
 
     消费是**盖 `consumed_at` 而不是删行**（issue #233）：行是归属的唯一凭据，删掉它，删会话
     时就只剩「这个键出现在我的会话里」这种伪判据可用。行留下的副作用只是「已消费的行不再
-    是清扫候选」——由 list_pending_attachment_uploads / claim_attachment_upload 上的
-    `consumed_at IS NULL` 过滤承担（与原先物理删除时的可见行为一致）。
+    是清扫候选」——由判据 P（`consumed_at IS NULL AND reclaimed_at IS NULL`，见
+    `_pending_upload_clause`）承担（与原先物理删除时的可见行为一致）。
+
+    过滤里还要 P（issue #238）：一把已经被判为待回收的键（墓碑）不能被这条消息「复活」。
+    少了 P，清扫已经提交删除意图、随后消息才落库，这条消息就会把一个正在（或已经被）删掉
+    的对象记成正式引用，而对象存储没有回收站——这正是墓碑要挡住的那一臂。加上 P 之后，
+    这条 UPDATE 命中 0 行，调用方据此知道「这把键已经不属于你了」，走拒签分支。
     """
     keys = [key for key in dict.fromkeys(object_keys or []) if isinstance(key, str) and key]
     if not keys:
@@ -214,6 +264,7 @@ def confirm_attachment_uploads(db: Session, object_keys: list[str], user_id: int
         .filter(
             ChatAttachmentUpload.user_id == user_id,
             ChatAttachmentUpload.object_key.in_(keys),
+            _pending_upload_clause(),
         )
         .update(
             {ChatAttachmentUpload.consumed_at: datetime.now()},
@@ -240,10 +291,16 @@ def list_pending_attachment_uploads(
     （对象存储没有回收站）。这也是老代码与新代码不能同时在线的原因，见
     database/session.py 的补列分支与 scripts/backfill_attachment_owner.py 的回滚说明。
 
+    `reclaimed_at IS NULL` 是 #238 加的，与它同属判据 P：已经判过死刑的行（墓碑）不再是
+    候选——删除意图已提交，该做的是把它删完/结算，而不是当成一条新的孤儿再排一轮。
+    候选里**不需要**再带 `claimed_at IS NULL`：claimed_at 只由领取写下，而领取与判据 P
+    的写入同生共死（I12），P 已经把它排除干净了；真有一条租约内的行漏进来，领取那步
+    赢不下来，最坏只是多算一个 skipped，不会碰对象。
+
     按 created_at 升序（同刻按 object_key 兜底定序）：一批超过 limit 时，先被回收的
     是积压更久的那批，且顺序稳定可复现。
     """
-    query = db.query(ChatAttachmentUpload).filter(ChatAttachmentUpload.consumed_at.is_(None))
+    query = db.query(ChatAttachmentUpload).filter(_pending_upload_clause())
     if older_than is not None:
         query = query.filter(ChatAttachmentUpload.created_at < older_than)
     if user_id is not None:
@@ -257,57 +314,240 @@ def list_pending_attachment_uploads(
     return query.all()
 
 
-def claim_attachment_upload(db: Session, object_key: str, older_than) -> dict | None:
-    """原子地把一条「已超期且仍未被消费」的登记行领走；领不到返回 None。
+def list_stale_reclaimed_attachment_uploads(
+    db: Session, *, now, lease_seconds: int | None = None, limit: int | None = None
+) -> list[str]:
+    """租约已过期的墓碑键，返回键本身（issue #238，清扫候选的第二路）。
 
-    领的动作是**条件删除 + 提交**：`WHERE object_key = ? AND created_at < ?`。并发的发送
-    （消费）与另一条清扫（领）竞争的是同一行，数据库的行级原子性保证只有一个能拿到
-    rowcount=1。领不到的一方据此知道「这个对象已经归别人管了」，于是**不去碰对象本身**。
+    与 `list_pending_attachment_uploads` 那张「谁还没被处理过」的名单不同，这条取的是
+    「**上一轮已经开工、但没做完**」的行（判据 R）：清扫领走一行、墓碑已提交，进程在外呼
+    返回之前就没了，这一行会永远停在「正在删」——待回收名单（P）不要它，因为墓碑非空；
+    也没有别的路径回头碰它。不回头的代价是那个对象**永远躲在两个视角之外**：库里说它
+    「已判死」，桶里却好端端躺着——正是 #142 那个形状，而且是这次修复自己造出来的。
 
-    这是「清扫取到候选之后、动手之前，用户正好把这条附件发送成功」那一臂的解药：清扫不再
-    按自己先前那份快照动手，而是每一步都要先赢下这一行；赢不下来就说明这条键已经成了正式
-    引用（或已被另一条清扫处理），对象必须留着。对象存储没有回收站，删错没有第二遍。
+    只取（不领）：领取是下一句条件 UPDATE 的事，中间可能被别人抢走，那时跳过即可。
+    按 claimed_at 升序（同刻按 object_key 兜底）：停得越久的越先重试。
 
-    `consumed_at IS NULL` 必须同时出现在「读」和「删」两处（issue #233）：读的那处少了它，
-    已被消费的行会被当成候选交给调用方去签 DELETE；删的那处少了它，一次领取会把一条已被
-    消费的登记行删掉，归属凭据随之消失。
-
-    返回的行数据交给调用方在删除对象失败时**放回队列**（restore_attachment_upload），所以
-    带上 user_id 与 created_at。
+    判据落在键域上（R 不含 user_id），因此跨用户的行同样会被重试删除——对象存储没有
+    回收站，谁铸的键不影响「它该被删」这个结论。
     """
-    row = (
+    query = db.query(ChatAttachmentUpload.object_key).filter(
+        _stale_reclaimed_upload_clause(now, lease_seconds)
+    )
+    query = query.order_by(
+        ChatAttachmentUpload.claimed_at.asc(),
+        ChatAttachmentUpload.object_key.asc(),
+    )
+    if limit is not None:
+        query = query.limit(max(1, int(limit)))
+    return [object_key for (object_key,) in query.all()]
+
+
+def claim_attachment_upload(db: Session, object_key: str, older_than, *, now=None) -> dict | None:
+    """原子地把一条「已超期且尚未结算」的登记行**判为待回收**；判不下来返回 None。
+
+    判的动作是**条件 UPDATE + 提交**：`WHERE object_key = ? AND created_at < ? AND P`，
+    `SET claimed_at = now, reclaimed_at = now`。这里刻意**不再删行**（#238 之前是条件
+    DELETE）：删行是一个不可回退的既成事实，一旦提交，行没了、归属凭据没了、发送侧也无从
+    知道「这个对象已经被判死」；而写两个时间戳是可判读、可结算、可回退的。
+
+    关键在于**提交发生在碰对象之前**：墓碑一旦落库，这把键的发送就再也发不出去
+    （`_reclaimed_upload_clause` 会命中它），而对象此刻还在桶里。于是顺序只剩两种结果——
+    清扫先提交，则对象必被删、消息必不落库；发送先提交（消费赢了 P），则这条 UPDATE
+    rowcount=0，清扫不碰对象。两者都不会留下「删掉的对象被一条活消息引用」的形态。
+
+    并发的发送与另一条清扫竞争的是同一行，数据库的行级原子性保证只有一个能拿到
+    rowcount=1；**判据只取 rowcount**，不取先前读到的任何快照（M5）。领不到的一方据此
+    知道「这个对象已经归别人管了」，于是不去碰对象本身。
+
+    返回的行数据只是给调用方做日志/计数用的上下文，不再承担「失败时放回队列」的职责
+    ——那件事由 `clear_attachment_claim` 就地把同一行的两个时间戳清回去完成，不需要重建行，
+    因此 created_at 保持原值不变（重建会让这条行排到队尾，且会与既有行撞主键）。
+    """
+    moment = datetime.now() if now is None else now
+    claimed_rows = (
         db.query(ChatAttachmentUpload)
         .filter(
             ChatAttachmentUpload.object_key == object_key,
             ChatAttachmentUpload.created_at < older_than,
+            _pending_upload_clause(),
+        )
+        .update(
+            {
+                ChatAttachmentUpload.claimed_at: moment,
+                ChatAttachmentUpload.reclaimed_at: moment,
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    if not claimed_rows:
+        return None
+    # 领取成功后重新读一次，只是为了把上下文交给调用方：刚提交，读到的就是刚写下的值，且
+    # user_id/created_at 未被本次写入改动。
+    row = db.query(ChatAttachmentUpload).filter_by(object_key=object_key).first()
+    if row is None:
+        # 防御性的、实际不可达：这一行刚被写成「claimed_at 非空」的墓碑，而唯一会删行的 GC
+        # 要求 claimed_at IS NULL，两次读之间没有哪条路径能把它清掉。留着只是让「领取成功」
+        # 这件事永远有一个实打实的行作为前提，读到这行时别当成一条真实的竞态。
+        return None
+    return {"object_key": row.object_key, "user_id": row.user_id, "created_at": row.created_at}
+
+
+def claim_stale_attachment_upload(
+    db: Session, object_key: str, *, now=None, lease_seconds: int | None = None
+) -> bool:
+    """把一条**租约已过期**的墓碑重新领取，返回是否领到（issue #238）。
+
+    这是给「上一轮清扫领了这一行、外呼还没回来进程就没了」准备的重试入口。它只推进
+    claimed_at，**绝不改动 reclaimed_at**：墓碑是既成事实，回退它等于让发送侧凭空放行。
+    判据同样只看 rowcount：行在租约之内（可能正有另一次外呼在飞）或已经结算过，都领不到。
+    """
+    moment = datetime.now() if now is None else now
+    claimed_rows = (
+        db.query(ChatAttachmentUpload)
+        .filter(
+            ChatAttachmentUpload.object_key == object_key,
+            _stale_reclaimed_upload_clause(moment, lease_seconds),
+        )
+        .update({ChatAttachmentUpload.claimed_at: moment}, synchronize_session=False)
+    )
+    db.commit()
+    return bool(claimed_rows)
+
+
+def mark_attachment_reclaimed(db: Session, object_key: str) -> bool:
+    """把一条墓碑标记为**已结算**：清掉租约，行留下（issue #238）。
+
+    行必须留下。它就是「这个对象已经删掉了」在库里的唯一痕迹，发送侧靠它把迟到的那条消息
+    拒掉。清掉的是 claimed_at——删除已经做完，没人还占着这一行；reclaimed_at 原样保留，
+    直到墓碑过保留期由 GC 清走。
+
+    只在墓碑上生效（B），并附 `consumed_at IS NULL`：后者是**防御性的、不可达的**——
+    一条行要么被消费、要么被判为待回收，两者由同一条 P 互斥（见
+    `_pending_upload_clause`），被消费过的行不可能同时带着墓碑。写上它只是让这条 UPDATE
+    在任何情况下都不会去动一条归属已经结算过的行；读到这行时别把它当成一条真实约束。
+    """
+    settled = (
+        db.query(ChatAttachmentUpload)
+        .filter(
+            ChatAttachmentUpload.object_key == object_key,
+            _reclaimed_upload_clause(),
             ChatAttachmentUpload.consumed_at.is_(None),
         )
-        .first()
+        .update({ChatAttachmentUpload.claimed_at: None}, synchronize_session=False)
     )
-    if row is None:
-        return None
-    claimed = {"object_key": row.object_key, "user_id": row.user_id, "created_at": row.created_at}
+    db.commit()
+    return bool(settled)
+
+
+def clear_attachment_claim(db: Session, object_key: str) -> bool:
+    """把一条墓碑**双清**回 pending：删除外呼失败，这一行回到待回收队列（issue #238）。
+
+    清的是两个时间戳：claimed_at（没人再占着这一行）与 reclaimed_at（墓碑撤回，发送侧
+    重新放行——对象确实还在桶里，放行才是对的）。**created_at 不动**：这条行还没被回收，
+    它仍按上传时刻排队，下一轮清扫会立刻再试它，不会因为失败过一次就被排到所有新孤儿后面。
+    这也正是「不再执行 `restore_attachment_upload` 的删行+重插」的原因——重插会换掉
+    created_at，把一条积压已久的孤儿洗成新行（见该函数的移除说明）。
+
+    同样附上防御性的 `consumed_at IS NULL`（不可达，理由见 `mark_attachment_reclaimed`），
+    以及 `claimed_at IS NOT NULL`：只回退**当前确实被领走的**墓碑，不去动一条已经结算的行。
+    """
+    cleared = (
+        db.query(ChatAttachmentUpload)
+        .filter(
+            ChatAttachmentUpload.object_key == object_key,
+            _reclaimed_upload_clause(),
+            ChatAttachmentUpload.claimed_at.is_not(None),
+            ChatAttachmentUpload.consumed_at.is_(None),
+        )
+        .update(
+            {
+                ChatAttachmentUpload.claimed_at: None,
+                ChatAttachmentUpload.reclaimed_at: None,
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return bool(cleared)
+
+
+def list_blocked_attachment_uploads(db: Session, object_keys: list[str]) -> list[str]:
+    """从一批键里挑出**已经是墓碑**的那些，返回键本身（issue #238）。只读，不提交。
+
+    调用方是发送路径：`confirm_attachment_uploads` 命中 0 行之后，用它把「这把键被清扫
+    判死了」从「这颗键本来就没有登记行」里区分出来——前者要拒签，后者是 #142 之前就存在的
+    合法形态（老键没有登记行），照旧发送。这个分类**必须与消费在同一次事务、同一次提交前
+    完成**：分成两次读，中间落进来一条墓碑，拒签就漏了。
+
+    它只是**事后分类器**，不是判据来源：本次发送能不能放行，唯一依据是
+    `confirm_attachment_uploads` 的 rowcount（M5）。先分类再更新就成了「读-再-写」，
+    两次快照之间的变化会让分类结论过期。
+
+    判据落在**键域**上：只问「这把键的登记行是不是墓碑」，不问它属于谁。附件列由客户端
+    回带，一条消息可以引用一把别人铸的键，而对象删了就是删了——跨用户的差别不构成放行的
+    理由（M4/I7）。
+    """
+    keys = [key for key in dict.fromkeys(object_keys or []) if isinstance(key, str) and key]
+    if not keys:
+        return []
+    rows = (
+        db.query(ChatAttachmentUpload.object_key)
+        .filter(
+            ChatAttachmentUpload.object_key.in_(keys),
+            _reclaimed_upload_clause(),
+        )
+        .all()
+    )
+    return [object_key for (object_key,) in rows]
+
+
+def gc_reclaimed_attachment_uploads(
+    db: Session, *, older_than, limit: int | None = None
+) -> int:
+    """清理超过保留期的**已结算**墓碑，返回清掉的条数并提交（issue #238）。
+
+    为什么要有 GC：墓碑是「这个键被删了」的凭据，但它的用处有时效——过了保留期，那条
+    迟到的消息早就不可能来了，行留着只是占表。清掉之后这把键退回「表里查无此行」的语义，
+    发送不再被拒（老键形态）。
+
+    `claimed_at IS NULL` 是**判定条件、不是防御**（A1）：墓碑有两种形态——已结算
+    （claimed_at 为空）与正被处理（claimed_at 非空）。只有前者能清。正在处理的行看上去
+    也可能「很老」：重试路径每轮只刷新 claimed_at、不动 reclaimed_at，一条反复重试失败
+    的行可以让 reclaimed_at 停留在很久以前（默认租约 300 秒对 7 天保留期，最多可重试约
+    2000 次）。少了这个条件，GC 会把一条**此刻正在被外呼删除**的行连根清掉——行没了，
+    发送侧不再拒签，那条迟到的消息就会落库并引用一个刚被删掉的对象，正是墓碑要挡的那一臂
+    （M3 的静默终点状态从墓碑窗口之外被重新打开）。
+    """
+    keys = [
+        object_key
+        for (object_key,) in db.query(ChatAttachmentUpload.object_key)
+        .filter(
+            _reclaimed_upload_clause(),
+            ChatAttachmentUpload.reclaimed_at < older_than,
+            ChatAttachmentUpload.claimed_at.is_(None),
+        )
+        .order_by(ChatAttachmentUpload.reclaimed_at.asc(), ChatAttachmentUpload.object_key.asc())
+        .limit(max(1, int(limit)) if limit is not None else 1000000)
+        .all()
+    ]
+    if not keys:
+        return 0
+    # 同一条 WHERE 再来一遍：上面那次读只是挑批次，删的时候判据必须重新成立一次
+    # （两次之间行可能被别的进程改过），返回的 rowcount 才是真正删掉的条数。
     deleted = (
         db.query(ChatAttachmentUpload)
         .filter(
-            ChatAttachmentUpload.object_key == object_key,
-            ChatAttachmentUpload.created_at < older_than,
-            ChatAttachmentUpload.consumed_at.is_(None),
+            ChatAttachmentUpload.object_key.in_(keys),
+            _reclaimed_upload_clause(),
+            ChatAttachmentUpload.reclaimed_at < older_than,
+            ChatAttachmentUpload.claimed_at.is_(None),
         )
         .delete(synchronize_session=False)
     )
     db.commit()
-    return claimed if deleted else None
-
-
-def restore_attachment_upload(db: Session, *, object_key: str, user_id: int, created_at) -> None:
-    """把「领走了但对象没删成」的登记行按原时间戳放回队列。
-
-    原时间戳（而不是 now）是刻意的：这条行还没被回收，回合后仍按上传时刻排队，下一轮清扫
-    会立刻再试它，不会因为失败过一次就被排到所有新孤儿后面去。
-    """
-    db.add(ChatAttachmentUpload(object_key=object_key, user_id=user_id, created_at=created_at))
-    db.commit()
+    return int(deleted)
 
 
 def delete_attachment_uploads(db: Session, object_keys: list[str], requester_id: int) -> int:
@@ -346,17 +586,6 @@ def delete_attachment_uploads(db: Session, object_keys: list[str], requester_id:
         )
     db.commit()
     return released
-
-
-def drop_attachment_upload(db: Session, object_key: str) -> bool:
-    """丢弃一条登记行并提交（清扫用它处理「永远签不出 DELETE」的行）。幂等：重跑返回 False。"""
-    deleted = (
-        db.query(ChatAttachmentUpload)
-        .filter(ChatAttachmentUpload.object_key == object_key)
-        .delete(synchronize_session=False)
-    )
-    db.commit()
-    return bool(deleted)
 
 
 def delete_conversation(db: Session, cid: str, user_id: int) -> Conversation | None:

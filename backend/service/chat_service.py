@@ -13,9 +13,11 @@ from sqlalchemy.orm import Session
 
 from database.checkpointer import delete_thread_checkpoints
 from config import (
+    CHAT_ATTACHMENT_LEASE_SECONDS,
     CHAT_ATTACHMENT_PENDING_TTL_SECONDS,
     CHAT_ATTACHMENT_SWEEP_BATCH_LIMIT,
     CHAT_ATTACHMENT_SWEEP_INTERVAL_SECONDS,
+    CHAT_ATTACHMENT_TOMBSTONE_TTL_SECONDS,
     MEMORY_WINDOW_TURNS,
 )
 from crud import chat as crud_chat
@@ -64,10 +66,33 @@ ASSISTANT_SAVE_FAILED_MESSAGE = "保存回答失败"
 RAGAS_SCHEDULE_FAILED_MESSAGE = "RAGAS 评估调度失败"
 MEMORY_SUMMARY_SCHEDULE_FAILED_MESSAGE = "长期记忆压缩调度失败"
 OSS_UPLOAD_FAILED_MESSAGE = "图片上传失败，请稍后重试"
+# 这条键已被判为待回收（墓碑）时回给用户的文案（issue #238）。与其它失败分支一样，异常原文
+# （键、时间戳、外呼错误）只进日志，不进 SSE 帧。
+ATTACHMENT_RECLAIMED_MESSAGE = "附件已失效，请重新上传后再发送"
 
 # 保留窗口的下限（不可配置）：一次上传从登记到写对象只需要秒级，把窗口压到它之下就会让
 # 清扫去删一条正在写入的对象。见 reclaim_orphan_chat_attachments 的说明。
 CHAT_ATTACHMENT_MIN_PENDING_TTL_SECONDS = 60
+
+
+class AttachmentReclaimedError(Exception):
+    """这次发送引用了一把**已经被清扫判为待回收**的键，消息不得落库（issue #238）。
+
+    它不是参数错误、也不是「上传失败」，而是一次必须被用户看见的拒绝：清扫已经先一步把
+    这把键判死（删除意图已提交），对象要么已经删掉、要么正在删。此时把消息落库，留下的
+    就是一条引用不存在对象的活消息——「用户看到自己发出去了、点开图片是 404」，而且这条
+    消息此后会被删除路径当成归属凭据，让一把已删除的键继续有资格签发 DELETE。
+
+    刻意做成**独立异常**而不是把 `_save_user_message` 的返回值改成布尔：调用方（`stream_chat`）
+    必须显式处理这条路径，而不能靠「忘了看返回值」蒙混过去——拒签在这里是**非静默**的。
+
+    构造参数只带 object_key：`str(exc)` 会进日志，键本身不含敏感信息，但不带上 user_id
+    与时间戳——它可能被上游当成 detail 回显，没有必要。
+    """
+
+    def __init__(self, object_key: str):
+        self.object_key = object_key
+        super().__init__(f"attachment object_key has been reclaimed: {object_key}")
 
 
 def _serialize_conversation(conv: Conversation, user_id: int) -> dict:
@@ -240,22 +265,38 @@ def reclaim_orphan_chat_attachments(db: Session, *, now: datetime | None = None,
     四条顺序/边界，每条都对应一种不可逆的损失：
 
     ① **逐行「先领行、再删对象」**，而不是按一份先前的快照直接动手。发送侧的消费与清扫侧的
-       领取是同一行的条件删除，数据库保证只有一个能赢；领不到就跳过，不去碰对象——否则
+       领取是同一行的条件 UPDATE，数据库保证只有一个能赢；领不到就跳过，不去碰对象——否则
        「清扫取到候选之后、动手之前用户正好发送成功」会删掉一条已落库消息引用的对象。
        领行把这条判定从「整批一份快照」收窄到「每个对象各判一次」，窗口从分钟级降到一次
        外呼的时间。
-    ② **删对象失败时把领走的行按原时间戳放回**（`restore_attachment_upload`）。不留回队列
-       的话，这个对象就再没有任何线索了——既不在消息里、也不在登记表里，等于回到 #142。
-       代价是这次删除没有生效，下一轮重扫再试，方向是「宁可多留一轮，不可删错」。
+    ② **领行写下的是墓碑（`claimed_at` 与 `reclaimed_at` 同一次写入、且当场提交），删对象
+       失败时把它双清回 pending**（`clear_attachment_claim`）。@238 之前是「领行 = 条件删行 +
+       失败时按原时间戳重插」，那让「清扫赢」与「对象已删」之间没有任何可判读的中间态：
+       行没了，发送侧无从知道这把键已经被判死，一条并发到达的消息会照常落库并引用一个正被
+       删除的对象。现在判死先于外呼落库，失败再把墓碑撤回（对象确实还在桶里，放行才是对的），
+       方向仍是「宁可多留一轮，不可删错」。
+       与 ① 一起，删对象**只在拿到墓碑之后**发生；墓碑留在行上直到删除成功
+       （`mark_attachment_reclaimed` 只清租约、保留墓碑）——**留痕是刻意的**：它就是发送侧
+       拒签这把键的唯一依据。
     ③ **删除前仍然过一遍铸造形态护栏**（`_delete_oss_object` 自己会拒）。登记行是服务端
        写的、理论上只可能是本服务铸的键，但这里是全仓唯一一处用服务端凭据签 DELETE 的
        地方，护栏必须在下手那一刻再判一次：`rag-chat/.../../../finance-archive/x` 这种键会
        被 httpx 规范化成桶里另一个对象的 URL。判不出来的行（`ForeignObjectKeyError`）永远
-       签不出 DELETE，留着只会每轮重复告警、白占批次名额，因此丢弃并留一条可按对象对账的
-       warning。
+       签不出 DELETE，**同样墓碑化**（不再丢弃）：这键这次签不出，不代表它没有被别的路径
+       引用，把行删掉会让一把本该被拒的键悄悄回到「无行 ⇒ 合法」分支；墓碑同样由 GC 按保留期
+       收走，并留一条可按对象对账的 warning。
     ④ **失败只记 warning、不上抛**。单对象删不掉（403/网络）时其余对象照删，失败的那行
-       放回队列留给下一轮。`_ensure_oss_config` 抛的 HTTPException 也走这条：一次没配 OSS
-       的进程不该把登记行清空。
+       双清回 pending 留给下一轮。`_ensure_oss_config` 抛的 HTTPException 也走这条：一次没配
+       OSS 的进程不该把登记行清空。
+    ⑤ **候选有两路**：pending（`created_at` 超期且 `reclaimed_at IS NULL`，即 ①-④ 处理的那批）
+       与**租约超时的墓碑**（`reclaimed_at IS NOT NULL AND claimed_at < now - 租约`）。后者是
+       ①「先领行」的收尾：上一轮领走一行、外呼还没回来进程就没了（崩溃/被杀），这行会永远
+       停在「正在删」而没有任何路径再碰它——对象既不在桶里被重试删、也不在库里被结算，成了
+       「桶里有、库里没有」的隐形孤儿。R 路把它重领一次（只刷新租约、墓碑不动）并重试外呼。
+    ⑥ **末尾按保留期清理已落定的墓碑**（`gc_reclaimed_attachment_uploads`，`claimed_at IS NULL`
+       的才算落定）。墓碑的作用有时效：过了保留期那条迟到消息早就不可能来了，行留着只是占表。
+       `CHAT_ATTACHMENT_TOMBSTONE_TTL_SECONDS <= 0` 时整段跳过（关闭开关）——代价是这张表
+       只增不减，换来「删除记录永不丢失」。
     """
     ttl = CHAT_ATTACHMENT_PENDING_TTL_SECONDS if ttl_seconds is None else ttl_seconds
     # 保留窗口的下限：TTL 配成 0（或负数）时窗口会退化成「比此刻更早的都算超期」，那会把
@@ -263,48 +304,79 @@ def reclaim_orphan_chat_attachments(db: Session, *, now: datetime | None = None,
     # 对象——正是 #142 的形态，而且是这次修复自己造出来的。一分钟远大于一次上传的耗时。
     ttl = max(CHAT_ATTACHMENT_MIN_PENDING_TTL_SECONDS, ttl)
     limit = CHAT_ATTACHMENT_SWEEP_BATCH_LIMIT if batch_limit is None else batch_limit
-    cutoff = (now or datetime.now()) - timedelta(seconds=ttl)
+    moment = now or datetime.now()
+    cutoff = moment - timedelta(seconds=ttl)
 
     # 先把候选键取成普通字符串列表，之后每处理一行都要提交：会话是 expire_on_commit=True 的，
-    # 留着 ORM 行对象会在下一次读属性时触发刷新，而并发的另一条清扫可能已经把那一行删掉了，
+    # 留着 ORM 行对象会在下一次读属性时触发刷新，而并发的另一条清扫可能已经把那一行改掉了，
     # 刷新会抛 ObjectDeletedError 把整批打断——后面的候选一个都处理不到。
-    candidates = [
+    # 两路候选按定义互斥（P 要求 reclaimed_at 为空，R 要求非空），不会重复处理同一行。
+    pending_keys = [
         row.object_key
         for row in crud_chat.list_pending_attachment_uploads(db, older_than=cutoff, limit=limit)
     ]
+    stale_keys = crud_chat.list_stale_reclaimed_attachment_uploads(
+        db, now=moment, lease_seconds=CHAT_ATTACHMENT_LEASE_SECONDS, limit=limit
+    )
+    stale_key_set = set(stale_keys)
+    candidates = pending_keys + stale_keys
+
     reclaimed = 0
     failed = 0
     unclaimable = 0
     skipped = 0
     for object_key in candidates:
-        claimed = crud_chat.claim_attachment_upload(db, object_key, cutoff)
-        if claimed is None:
-            # 已经被发送消费（或另一条清扫领走）：这个对象已经归别人管，绝不能删。
-            skipped += 1
-            continue
+        if object_key in stale_key_set:
+            # R 路：只刷新租约，墓碑不动——外呼成功之后这一行仍是墓碑（留着让发送被拒）。
+            if not crud_chat.claim_stale_attachment_upload(
+                db, object_key, lease_seconds=CHAT_ATTACHMENT_LEASE_SECONDS
+            ):
+                # 已经被另一条清扫重领、或这一行在两次读之间被结算了：不碰对象。
+                skipped += 1
+                continue
+        else:
+            # 返回值只是给日志/计数用的上下文，这一轮不需要，只关心「领到没有」。
+            if crud_chat.claim_attachment_upload(db, object_key, cutoff) is None:
+                # 已经被发送消费（或另一条清扫领走）：这个对象已经归别人管，绝不能删。
+                skipped += 1
+                continue
         try:
             _delete_oss_object(object_key)
         except ForeignObjectKeyError as exc:
             logger.warning(
                 "chat attachment orphan sweep: refusing to delete an object key this service "
-                "never minted, dropping the pending row: object_key=%s error=%s",
+                "never minted, keeping the tombstone so this key stays refused: "
+                "object_key=%s error=%s",
                 object_key,
                 exc,
             )
+            crud_chat.mark_attachment_reclaimed(db, object_key)
             unclaimable += 1
             continue
         except Exception as exc:
             logger.warning(
-                "chat attachment orphan reclaim failed, putting the pending row back for the "
-                "next sweep: object_key=%s error=%s",
+                "chat attachment orphan reclaim failed, clearing the tombstone back to pending "
+                "for the next sweep: object_key=%s error=%s",
                 object_key,
                 exc,
                 exc_info=exc,
             )
-            crud_chat.restore_attachment_upload(db, **claimed)
+            crud_chat.clear_attachment_claim(db, object_key)
             failed += 1
             continue
+        # 删成功：行留下当墓碑（这一把键的发送从此被拒），只把租约清掉——这一次领取已经用完了。
+        crud_chat.mark_attachment_reclaimed(db, object_key)
         reclaimed += 1
+
+    # 墓碑 GC（⑥）。开关置 0 表示关闭：一行都不删。用与本轮同一个时刻算保留窗口——
+    # 一次清扫只认一个时钟，跟候选的 cutoff 同源，测试与排查时才能整体把时间拨到某一刻。
+    tombstone_ttl = CHAT_ATTACHMENT_TOMBSTONE_TTL_SECONDS
+    if tombstone_ttl > 0:
+        crud_chat.gc_reclaimed_attachment_uploads(
+            db,
+            older_than=moment - timedelta(seconds=tombstone_ttl),
+            limit=limit,
+        )
 
     return {"candidates": len(candidates), "reclaimed": reclaimed, "failed": failed,
             "unclaimable": unclaimable, "skipped": skipped}
@@ -565,7 +637,22 @@ def _load_or_create_conversation(
 
 def _save_user_message(cid: str, user_id: int, display_question: str,
                        accepted_attachments: list[dict]) -> int:
-    """写入用户消息并返回它的 id。"""
+    """写入用户消息并返回它的 id；引用了已被清扫判死的键时抛 `AttachmentReclaimedError`。
+
+    拒签的判据是**这次消费的 rowcount**（issue #238，M5）：`confirm_attachment_uploads` 命中
+    的行数少于本次提交的**去重键数**，就说明至少有一把键没能被消费掉。这是唯一从「写入是否
+    真的发生」读出来的信号——先查一遍再写（读-再-写）会在两次快照之间漏掉变化，而这里要
+    挡的恰是「清扫刚刚赢下这一行」这种瞬时窗口。
+
+    少消费了并不直接等于「被拒」：早于 #142 的键本来就没有登记行，消费不到是正常的。
+    因此只在这时补一次**同事务**的分类——`list_blocked_attachment_uploads` 挑出其中带墓碑的
+    那些（键域，跨用户同样成立）。有墓碑 ⇒ 这条键的对象正在（或已经）被删，消息必须不落库；
+    没有 ⇒ 老键形态，照常发送。
+
+    分类必须与消费在同一次提交之前：`confirm` 不提交，读到墓碑后抛异常，`finally` 里的
+    `close()` 把这次事务整个丢弃，消费与消息行一起回滚——落不下「消息已落库、对象被删」
+    的形态。返回的键只用于日志，不随 SSE 帧发给客户端。
+    """
     db = SessionLocal()
     try:
         user_message = Message(
@@ -580,11 +667,17 @@ def _save_user_message(cid: str, user_id: int, display_question: str,
         # 删掉（对象存储没有回收站），反过来则是消息没落库却把对象永久钉在登记表里。
         # 早于本次修复就存在的键没有登记行，消费不到是正常的——它们由消息驱动那条既有的
         # 回收路径负责，与这里无关。
-        crud_chat.confirm_attachment_uploads(
-            db,
-            [item.get("object_key") for item in accepted_attachments],
-            user_id,
-        )
+        requested_keys = [
+            key
+            for key in (item.get("object_key") for item in accepted_attachments)
+            if isinstance(key, str) and key
+        ]
+        confirmed = crud_chat.confirm_attachment_uploads(db, requested_keys, user_id)
+        if confirmed < len(set(requested_keys)):
+            # 同事务、提交前的分类：把「这把键已经判死」从「这颗键本来就没有登记行」里摘出来。
+            blocked = crud_chat.list_blocked_attachment_uploads(db, requested_keys)
+            if blocked:
+                raise AttachmentReclaimedError(blocked[0])
         db.commit()
         db.refresh(user_message)
         return user_message.id
@@ -769,13 +862,46 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
 
         # save user message
         accepted_attachments = _service_minted_attachments(body.attachments, cid)
-        user_message_id = await asyncio.to_thread(
-            _save_user_message,
-            cid,
-            principal.user_id,
-            display_question,
-            accepted_attachments,
-        )
+        try:
+            user_message_id = await asyncio.to_thread(
+                _save_user_message,
+                cid,
+                principal.user_id,
+                display_question,
+                accepted_attachments,
+            )
+        except AttachmentReclaimedError as exc:
+            # 这条消息引用的键已经被清扫任务判为待回收（issue #238）：对象正被删或已删，
+            # 消息绝不能落库。返回一条 SSE 错误帧而不是抛 HTTPException——这是流式端点，
+            # 前端按帧类型分支，与上面「图片识别失败」那条早退流保持同一种收尾形状。
+            # 异常原文（object_key、时间戳）只进日志与 trace，不进给用户的文案。
+            logger.warning(
+                "chat attachment reclaimed, refusing to save the message: %s", exc
+            )
+            await trace.add(
+                "attachment_reclaimed",
+                "_save_user_message",
+                uses={"conversation_id": cid, "attachments_count": len(accepted_attachments)},
+                result={"error": ATTACHMENT_RECLAIMED_MESSAGE},
+                note="附件在发送前已被清扫任务判为待回收，消息被拒，不会写入数据库。",
+            )
+            await trace.finish("failed")
+
+            async def reclaimed_stream():
+                # 与其它早退流一样占着并发槽，收尾必须归还（正常走完/被断开都走 finally）。
+                try:
+                    for payload in _trace_sse_payloads(trace):
+                        yield payload
+                    error_data = json.dumps(
+                        {"type": "error", "message": ATTACHMENT_RECLAIMED_MESSAGE},
+                        ensure_ascii=False,
+                    )
+                    yield f"data: {error_data}\n\n"
+                    yield "data: [DONE]\n\n"
+                finally:
+                    slot.release()
+
+            return StreamingResponse(reclaimed_stream(), media_type="text/event-stream")
         await trace.add(
             "user_message_saved",
             "Message",
