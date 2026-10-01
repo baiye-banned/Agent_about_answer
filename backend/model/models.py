@@ -129,6 +129,11 @@ class ChatAttachmentUpload(Base):
 
     这张表同时是「桶里有、库里没有」的对账入口——issue #142 里完全缺失的那块：上传只把
     对象写进 OSS 就返回键，未发送的对象不在任何消息里，没有任何路径能看见它。
+
+    这张表还是附件归属的唯一凭据（issue #233）：`user_id` 是**铸键人**，也就是这个键的
+    属主。发送成功不再物理删行，而是盖上 `consumed_at`——行在，归属就在，删会话时才有
+    依据判断「这把键是不是该由我回收」；行没了就只能退回「键出现在我的会话里」这种
+    伪判据，任何登录用户都能借别人的会话删别人的对象。
     """
 
     __tablename__ = "chat_attachment_uploads"
@@ -139,6 +144,11 @@ class ChatAttachmentUpload(Base):
     # 时间戳走应用时钟（而不是 server_default=func.now()）：清扫任务按 Python 的
     # datetime.now() 算保留窗口，两边同一个时钟才能让「超过 TTL」这个判据可预期。
     created_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
+    # 被某条消息消费的时刻（issue #233）。NULL = 还没被任何消息引用，是清扫任务的候选；
+    # 非 NULL = 已被引用，不再参与清扫，但行要留着当归属凭据。
+    # 存量库由 database/session.py 的补列迁移补上（可空、默认 NULL），因此不需要单独的
+    # 回填脚本就能让写入侧跑起来；**归属**的推定回填见 scripts/backfill_attachment_owner.py。
+    consumed_at = Column(DateTime, nullable=True, default=None)
 
 
 class ChatTraceSession(Base):
