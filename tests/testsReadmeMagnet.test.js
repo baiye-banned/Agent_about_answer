@@ -10,7 +10,9 @@ import {
   MAX_LINE,
   VARIANT_RUN_MIN,
   WRAP_WIDTH,
+  detectEol,
   findParagraphs,
+  normalizeEol,
   parseConflicts,
   reflow,
   unwrap,
@@ -54,40 +56,89 @@ function runUnion(body) {
   }
 }
 
-test('tests/README.md has exactly the two registration notes, both within the width cap', () => {
-  const lines = readFileSync(README, 'utf8').split('\n')
+// 测试侧的 I/O 规范化：读工作区/临时文件时先按实现同款规则折叠 \r\n 再切行。断言于是只在
+// **逻辑内容**上做，与检出环境（CRLF/LF）无关 —— 一条判据在两种检出下必须给同一个结论，
+// 否则 CI（LF）绿灯只证明 CI 的检出绿，本地（CRLF）是另一套行为。
+const readLogicalLines = (file) => normalizeEol(readFileSync(file, 'utf8')).split('\n')
+
+// 软换行把行首交给 Markdown 解析：`# x` 会变标题、`- x` 变列表、`---` 变分割线。
+const BLOCK_START = /^(?:#{1,6}\s|#{1,6}$|>|\||[-+*]\s|[-+*]$|\d{1,9}[.)]\s|={2,}$|-{3,}$)/
+
+// 登记段落「不放松的判据」总集（工作区用例与 CRLF 检出用例共用）：
+//   ① 恰好两段（Node 一段、Python 一段）；② 每行 ≤ MAX_LINE；③ 每段非单行（磁铁形状没长回来）；
+//   ④ 零丢失：unwrap(reflow(x)) === unwrap(x)；⑤ 停在规范折行形态：reflow(x) === x；
+//   ⑥ 行首不出现块级语法记号。
+// 抽成一个 helper 是刻意的（S3）：CRLF 兄弟用例与工作区用例走**同一份**实现，判据日后只会改一处，
+// 不会出现两条用例各抄一份、只改一条造成的静默漂移。
+function assertRegistrationParagraphs(file) {
+  const lines = readLogicalLines(file)
   const spans = findParagraphs(lines)
   assert.equal(spans.length, 2, '登记段落应恰好两段（Node 一段、Python 一段）')
   for (const span of spans) {
-    const over = lines.slice(span.start, span.end).filter((line) => line.length > MAX_LINE)
+    const physical = lines.slice(span.start, span.end)
+    const over = physical.filter((line) => line.length > MAX_LINE)
     assert.deepEqual(over, [], `第 ${span.start + 1} 行起的那段有超过 ${MAX_LINE} 字符的行`)
-  }
-  // 磁铁的形状判据：一段若又变回单行，行数会塌回 1，这里直接钉住这一点。
-  for (const span of spans) {
     assert.ok(span.end - span.start > 1, `第 ${span.start + 1} 行起的那段又变回单行了`)
+    assert.equal(unwrap(reflow(physical)), unwrap(physical), '折行改变了段落内容')
+    assert.deepEqual(reflow(physical), physical, `第 ${span.start + 1} 行起的段落不在规范折行形态`)
+    for (let i = span.start; i < span.end; i += 1) {
+      assert.ok(
+        !BLOCK_START.test(lines[i]),
+        `第 ${i + 1} 行的行首会被当作块级语法：${lines[i].slice(0, 40)}`,
+      )
+    }
   }
+}
+
+// 跑一次 CLI 子命令并取回写盘后的字节。stdio 同 runUnion：必须 'pipe'，否则拿不到 stderr。
+function runCli(command, file) {
+  const result = spawnSync(process.execPath, [SCRIPT, command, file], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  return {
+    code: result.status ?? -1,
+    stdout: result.stdout || '',
+    stderr: result.stderr || '',
+    output: `${result.stdout || ''}${result.stderr || ''}`,
+    after: readFileSync(file, 'utf8'),
+  }
+}
+
+// 把一段内容写进 tmp 下的 .md 文件并返回路径。writeFileSync 的 utf8 写出不做任何行尾翻译，
+// 所以「造 CRLF」就是让内容字符串本身含 \r\n。
+function writeCase(body) {
+  caseIndex += 1
+  const file = path.join(WORK_DIR, `case-${caseIndex}.md`)
+  writeFileSync(file, body, 'utf8')
+  return file
+}
+
+// 内容里所有登记段落的 unwrap —— 零丢失比较用（只比逻辑文本，不比行尾）。
+function paragraphUnwraps(content) {
+  const lines = normalizeEol(content).split('\n')
+  return findParagraphs(lines).map((span) => unwrap(lines.slice(span.start, span.end)))
+}
+
+// 必须重写的登记段落样例：一条逻辑行远超声宽，format 会按宽度折成多行。
+const LONG_LOGICAL = `These tests cover ${'the widget lifecycle, '.repeat(8)}and the export pipeline.`
+
+test('tests/README.md has exactly the two registration notes, both within the width cap', () => {
+  // 断言体在 assertRegistrationParagraphs 里（S3 共享）：宽度上限只是其中一条，另几条一并钉住。
+  // 顺带修掉「宽度按字节算」的旧口径 —— 读进来先折行尾再切行，`\r` 不再计进 length，
+  // 于是同一条逻辑行在 CRLF 检出与 LF 检出下给出同一个结论。
+  assertRegistrationParagraphs(README)
 })
 
 test('both registration notes are in canonical wrapped form', () => {
-  const lines = readFileSync(README, 'utf8').split('\n')
-  for (const span of findParagraphs(lines)) {
-    const physical = lines.slice(span.start, span.end)
-    // 折行只在原有空格处断行，所以两侧 unwrap 回来必须逐字节相等 —— 这是内容零丢失的判据。
-    assert.equal(unwrap(reflow(physical)), unwrap(physical), '折行改变了段落内容')
-    // 再折一次必须一模一样，否则文件没停在规范形态，说明有人手改后没跑 format。
-    assert.deepEqual(reflow(physical), physical, `第 ${span.start + 1} 行起的段落不在规范折行形态`)
-  }
+  // 同一份断言体：折行只在原有空格处断行，两侧 unwrap 回来必须逐字节相等（零丢失），
+  // 再折一次必须一模一样（停在规范形态，说明有人手改后跑了 format）。
+  assertRegistrationParagraphs(README)
 })
 
 test('wrapping never starts a line with a block-level markdown construct', () => {
-  // 软换行把行首交给 Markdown 解析：`# x` 会变标题、`- x` 变列表、`---` 变分割线。
-  const BLOCK_START = /^(?:#{1,6}\s|#{1,6}$|>|\||[-+*]\s|[-+*]$|\d{1,9}[.)]\s|={2,}$|-{3,}$)/
-  const lines = readFileSync(README, 'utf8').split('\n')
-  for (const span of findParagraphs(lines)) {
-    for (let i = span.start; i < span.end; i += 1) {
-      assert.ok(!BLOCK_START.test(lines[i]), `第 ${i + 1} 行的行首会被当作块级语法：${lines[i].slice(0, 40)}`)
-    }
-  }
+  // 同一份断言体，其中包含「行首不出现块级语法」这条。
+  assertRegistrationParagraphs(README)
   // 反向对照：把 `#` 放在会超宽的位置，折行器必须不把它甩到行首。
   const glued = wrap(`${'word '.repeat(30)}${'and '.repeat(3)}#59: a note`.trim(), WRAP_WIDTH)
   assert.ok(glued.every((line) => !/^#/.test(line)), '#59 被折到了行首，渲染会变成标题')
@@ -584,4 +635,211 @@ test('tests/README.md states the same warn threshold the tool implements (condit
 
 test('parseConflicts reports unbalanced markers instead of guessing', () => {
   assert.throws(() => parseConflicts(['<<<<<<< HEAD', 'ours', '>>>>>>> b'].join('\n')), /没有配对的标记/)
+})
+
+// ---------------------------------------------------------------------------
+// §4.2：行尾（CRLF）行为用例。T1-T3 直接打纯函数与导出解析器；T4-T10 走 CLI，
+// 覆盖写盘路径在两种行尾下的字节行为。所有 fixture 的行尾由测试自己造，
+// 不依赖检出环境 —— CI（LF）上这些用例同样走到 CRLF 分支。
+// ---------------------------------------------------------------------------
+
+test('normalizeEol and detectEol behave as the I/O boundary specifies (T1)', () => {
+  // ① \r\n 折叠成 \n。
+  assert.equal(normalizeEol('a\r\nb\r\n'), 'a\nb\n')
+  // ② 单独的 \n 不动。
+  assert.equal(normalizeEol('a\nb\n'), 'a\nb\n')
+  // ③ 单独的 \r **不动**：行内 \r（或旧 Mac 行尾）不在本 issue 范围，这是显式决定而非遗漏，
+  //    免得日后被顺手「修」成会误伤行内内容的替换。
+  assert.equal(normalizeEol('a\rb\r'), 'a\rb\r')
+  // ④ 纯 CRLF / 纯 LF 各返回对应值。
+  assert.equal(detectEol('a\r\nb\r\n'), '\r\n')
+  assert.equal(detectEol('a\nb\n'), '\n')
+  // ⑤ 混合行尾返回**最先出现**的那种（探测必须在规范化之前看原始字节）。
+  assert.equal(detectEol('a\r\nb\nc'), '\r\n')
+  assert.equal(detectEol('a\nb\r\nc'), '\n')
+  // ⑥ 无行尾（单行 / 空文件）返回 '\n'。这条是「crlf === 0 先于 lf === 0」的回归护栏：
+  //    次序写反时空文件（crlf=0、lf=0）会命中 lf === 0 返回 '\r\n'。
+  assert.equal(detectEol(''), '\n')
+  assert.equal(detectEol('single line'), '\n')
+})
+
+test('the width gate judges the same logical line identically under both line endings (T2)', () => {
+  const line = (length) => `These tests cover ${'x'.repeat(length - 'These tests cover '.length)}`
+  const atCap = line(MAX_LINE)
+  const overCap = line(MAX_LINE + 1)
+  assert.equal(atCap.length, MAX_LINE, '样例必须正好压在上限上')
+  assert.equal(overCap.length, MAX_LINE + 1, '样例必须正好越界一个字符')
+
+  const lfOk = runCli('check', writeCase(`${atCap}\n`))
+  const crlfOk = runCli('check', writeCase(`${atCap}\r\n`))
+  assert.equal(lfOk.code, 0, `LF 恰好 ${MAX_LINE} 字符应当通过：${lfOk.output}`)
+  assert.equal(crlfOk.code, 0, `CRLF 恰好 ${MAX_LINE} 字符应当通过（\\r 不得计入宽度）：${crlfOk.output}`)
+
+  const lfBad = runCli('check', writeCase(`${overCap}\n`))
+  const crlfBad = runCli('check', writeCase(`${overCap}\r\n`))
+  assert.equal(lfBad.code, 1, `LF ${MAX_LINE + 1} 字符应当判违规：${lfBad.output}`)
+  assert.equal(crlfBad.code, 1, `CRLF ${MAX_LINE + 1} 字符应当判违规：${crlfBad.output}`)
+})
+
+test('parseConflicts recognizes CRLF conflict markers when called directly (T3)', () => {
+  // 直接喂**未规范化**的 CRLF 文本：CLI 路径已在上游规范化，但本函数是导出的，
+  // 被直接调用时也必须认得出来 —— 否则标记整条失配、返回 0 个块，调用方会谎报「没有冲突块」。
+  const blocks = parseConflicts(
+    ['<<<<<<< HEAD', 'the alpha clause.', '=======', 'the beta clause.', '>>>>>>> b'].join('\r\n'),
+  )
+  assert.equal(blocks.length, 1, 'CRLF 文本里的冲突块必须被认出来')
+  assert.deepEqual(blocks[0], { start: 0, mid: 2, end: 4 }, '块边界应当是逻辑行号')
+})
+
+test('format rewrites a CRLF file without corrupting it, and is byte-stable on the second run (T4)', () => {
+  // 一段必须重写的登记段落：单条逻辑行远超声宽，format 会按宽度折成多行。
+  const lines = ['# Test Baseline', '', 'Current files:', '', '- `a.test.js`', '', LONG_LOGICAL, '', '## Python Tests', '']
+  const crlfFile = writeCase(lines.join('\r\n'))
+  const lfFile = writeCase(lines.join('\n'))
+
+  const crlf = runCli('format', crlfFile)
+  assert.equal(crlf.code, 0, `CRLF 下 format 应当成功：${crlf.output}`)
+  assert.notEqual(crlf.after, lines.join('\r\n'), '样例应当触发一次重写，否则下面的断言全部空转')
+  // ② 产物中不得有行内 CR（每个 \r 都必须紧跟 \n）。
+  assert.ok(!/\r(?!\n)/.test(crlf.after), '产物里出现了行内 CR')
+  // ③ 行尾全部保持 \r\n（没有裸 \n）。
+  assert.ok(!/(?<!\r)\n/.test(crlf.after), '产物里出现了裸 \\n，行尾没有保持 CRLF')
+  // ④ 同一逻辑内容在两种行尾下必须折到同一组折行点：把产物的行尾折回 \n 后与 LF 版产物逐字节相等。
+  const lf = runCli('format', lfFile)
+  assert.equal(lf.code, 0, `LF 下 format 应当成功：${lf.output}`)
+  assert.equal(crlf.after.replace(/\r\n/g, '\n'), lf.after, '两种行尾下折出的行不一致')
+  // ⑤ 零丢失：段落的 unwrap 与输入逐字节相等。
+  assert.deepEqual(paragraphUnwraps(crlf.after), [LONG_LOGICAL], '折行改变了段落内容（零丢失）')
+  // ⑥ 二次收敛：第二次 format 报「无改动」且字节不变（CRLF 文件不会被反复重写）。
+  const second = runCli('format', crlfFile)
+  assert.equal(second.code, 0, `第二次 format 应当成功：${second.output}`)
+  assert.match(second.stdout, /无改动/, '规范化后的 CRLF 文件第二次不应再被判为「有改动」')
+  assert.equal(second.after, crlf.after, '第二次 format 必须字节不变')
+})
+
+test('format is a no-op on a CRLF copy of tests/README.md (the user-visible regression, T5)', () => {
+  // 真实 tests/README.md 的 CRLF 副本：取自工作区字节并强制统一为 CRLF，于是在 LF 的 CI 上
+  // 也能走到 CRLF 写路径（不依赖检出环境）。修复前这条会把它从 313 行改写成 316 行、
+  // 留下 257 个行内 CR；修复后必须一个字节都不动。
+  const crlfReadme = normalizeEol(readFileSync(README, 'utf8')).split('\n').join('\r\n')
+  const file = writeCase(crlfReadme)
+  const result = runCli('format', file)
+  assert.equal(result.code, 0, `format 应当成功：${result.output}`)
+  assert.match(result.stdout, /无改动/, '规范折行形态的 CRLF 文件不应被判为「有改动」')
+  assert.equal(result.after, crlfReadme, 'format 改动了文件字节（Windows 默认检出下会产生假 diff）')
+})
+
+test('union resolves a CRLF conflict and preserves content and line endings (T6)', () => {
+  const lines = [
+    '# Test Baseline',
+    '',
+    'Current files:',
+    '',
+    '- `a.test.js`',
+    '',
+    'These tests cover the first thing, and the second thing,',
+    '<<<<<<< HEAD',
+    'and the alpha clause that branch A registered.',
+    '=======',
+    'and the beta clause that branch B registered.',
+    '>>>>>>> b',
+    '',
+    '## Python Tests',
+    '',
+  ]
+  const crlf = runCli('union', writeCase(lines.join('\r\n')))
+  assert.equal(crlf.code, 0, `CRLF 下 union 应当解出冲突：${crlf.output}`)
+  assert.match(crlf.after, /alpha clause/)
+  assert.match(crlf.after, /beta clause/)
+  assert.ok(!/^<{7}|^={7}$|^>{7}/m.test(crlf.after), '并集后不该还留着冲突标记')
+  assert.match(crlf.after, /\r\n## Python Tests\r\n$/, 'union 把冲突块之后的正文截掉了')
+  // 两侧子句各出现一次：一侧仍是旧格式整段单行时，按行求并集会把这整段文字写两遍。
+  const flat = crlf.after.replace(/\s+/g, ' ')
+  assert.equal(flat.split('alpha clause').length - 1, 1)
+  assert.equal(flat.split('beta clause').length - 1, 1)
+  // 行尾保持 CRLF：无行内 CR，也没有裸 \n。
+  assert.ok(!/\r(?!\n)/.test(crlf.after), '产物里出现了行内 CR')
+  assert.ok(!/(?<!\r)\n/.test(crlf.after), '产物里出现了裸 \\n，行尾没有保持 CRLF')
+  // 与 LF 版产物逐字节等价（行尾折回 \n 后比较）—— 求解器的行号/切片逻辑与 EOL 无关。
+  const lf = runCli('union', writeCase(lines.join('\n')))
+  assert.equal(lf.code, 0, `LF 下 union 应当解出冲突：${lf.output}`)
+  assert.equal(crlf.after.replace(/\r\n/g, '\n'), lf.after, '两种行尾下的 union 产物必须逐字节等价')
+})
+
+test('union refuses under CRLF and leaves the file byte-identical (T7)', () => {
+  const body = [
+    'These tests cover the alpha wording that only the legacy side has,',
+    '<<<<<<< HEAD',
+    'These tests cover a line that the wrapped side rewrote,',
+    '=======',
+    `These tests cover ${'a completely different clause '.repeat(6)}that the legacy side carries.`,
+    '>>>>>>> b',
+    '',
+    '## Python Tests',
+    '',
+  ].join('\r\n')
+  const file = writeCase(body)
+  const result = runCli('union', file)
+  assert.equal(result.code, 1, '两侧互不包含时应当在任何行尾下都拒绝')
+  assert.match(result.output, /互不包含/)
+  assert.equal(result.after, body, '拒绝时不得改动文件（含行尾）')
+})
+
+test('format/check handle the empty file and the missing trailing newline (T8)', () => {
+  // ① 空文件：没有登记段落，exit 2 且不写盘。
+  const empty = writeCase('')
+  const emptyFormat = runCli('format', empty)
+  assert.equal(emptyFormat.code, 2, '空文件没有登记段落，应当 exit 2')
+  assert.equal(emptyFormat.after, '', '空文件不得被写盘')
+  const emptyCheck = runCli('check', empty)
+  assert.equal(emptyCheck.code, 2, '空文件 check 应当 exit 2')
+
+  // ② 无结尾换行的 CRLF 单段文件：折行后仍不得补出结尾换行，且不得有行内 CR。
+  const body = `${LONG_LOGICAL}\r\nand the trailing clause without a newline.`
+  assert.ok(!body.endsWith('\n'), '样例本身必须无结尾换行')
+  const file = writeCase(body)
+  const result = runCli('format', file)
+  assert.equal(result.code, 0, `format 应当成功：${result.output}`)
+  assert.notEqual(result.after, body, '样例应当触发一次重写，否则下面的断言全部空转')
+  assert.ok(!result.after.endsWith('\n'), '不得补出结尾换行')
+  assert.ok(!/\r(?!\n)/.test(result.after), '产物里出现了行内 CR')
+  assert.ok(!/(?<!\r)\n/.test(result.after), '产物里出现了裸 \\n，行尾没有保持 CRLF')
+})
+
+test('the registration ratchet holds when the checkout is CRLF (T9)', () => {
+  // CI 只有 LF，这是唯一在 CI 里端到端走到 CRLF 读路径的地方：把真实 tests/README.md 的字节
+  // 转成统一 CRLF 写进 tmp，再跑与 T-M1/T-M2/T-M3 **同一份**断言（共用 assertRegistrationParagraphs，
+  // 不是抄一份）。判据不许因为检出是 CRLF 而放宽。
+  const crlfReadme = normalizeEol(readFileSync(README, 'utf8')).split('\n').join('\r\n')
+  assertRegistrationParagraphs(writeCase(crlfReadme))
+})
+
+test('format converges a mixed-line-ending file to a single eol in one pass (T10)', () => {
+  // 内容已规范折行、行尾却混合（第二行裸 \n，其余 \r\n）。按探测规则「最先出现的行尾优先」，
+  // 结果为 \r\n —— 首次 format 把全篇归一为 CRLF，第二次起「无改动」。
+  const canonical = wrap(LONG_LOGICAL, WRAP_WIDTH)
+  assert.ok(canonical.length >= 3, '样例至少要折成三行，才够铺出混合行尾')
+  const fixture = canonical.map((line, i) => `${line}${i === 1 ? '\n' : '\r\n'}`).join('')
+  assert.ok(fixture.includes('\n') && fixture.includes('\r\n'), '样例必须同时含裸 \\n 与 \\r\\n')
+  const file = writeCase(fixture)
+
+  // ① 首次 format 确有重写：stdout 不含「无改动」，字节发生变化。
+  const first = runCli('format', file)
+  assert.equal(first.code, 0, `首次 format 应当成功：${first.output}`)
+  assert.ok(!first.stdout.includes('无改动'), '混合行尾必须被归一，不该报「无改动」')
+  assert.notEqual(first.after, fixture, '首次 format 必须确实改写了文件')
+  // ② 全量归一为单一 \r\n：无行内 CR，也没有裸 \n。
+  assert.ok(!/\r(?!\n)/.test(first.after), '产物里出现了行内 CR')
+  assert.ok(!/(?<!\r)\n/.test(first.after), '产物里还有裸 \\n，没有全量归一为 CRLF')
+  // ③ 只动行尾、不动内容。
+  assert.equal(
+    first.after.replace(/\r\n/g, '\n'),
+    fixture.replace(/\r\n/g, '\n'),
+    '归一只能改行尾，内容必须逐字节不变',
+  )
+  // ④ 二次收敛：再跑一次报「无改动」且字节不变。
+  const second = runCli('format', file)
+  assert.equal(second.code, 0, `第二次 format 应当成功：${second.output}`)
+  assert.match(second.stdout, /无改动/)
+  assert.equal(second.after, first.after, '第二次 format 必须字节不变')
 })
