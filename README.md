@@ -393,7 +393,7 @@ npm run build
 
 ### CI（GitHub Actions）
 
-向 `develop`、`main` 提 PR，以及 push 到 `develop` 时会自动跑下面五个独立检查。同一分支连续 push 时，上一次还在跑的运行会被自动取消（各 workflow 内的 `concurrency`）。
+向 `develop`、`main` 提 PR，以及 push 到 `develop` 时会自动跑下面五个独立检查；PR 上另有 PR 标题校验、PR 描述校验与 Secret Scan 三道门禁。同一分支连续 push 时，上一次还在跑的运行会被自动取消（各 workflow 内的 `concurrency`）。
 
 | Workflow | 检查项 | 内容 |
 | --- | --- | --- |
@@ -493,7 +493,7 @@ python -m uvicorn main:app --host 127.0.0.1 --port 8002
 
 ### Nginx 反向代理
 
-生产环境用 Nginx 托管前端静态文件，并把 `/api/`、`/uploads/`、`/health` 反代到后端。有三个不能省略的点：
+生产环境用 Nginx 托管前端静态文件，并把 `/api/`、`/uploads/`、`/health` 反代到后端。有三个要点：
 
 - `proxy_buffering off` 对 SSE 很重要，否则流式回答可能被 Nginx 缓冲，导致前端不能实时显示。
 - 健康检查必须单独代理：后端的健康检查路由注册在**根路径 `/health`**，不在 `/api/` 前缀下，所以 `location = /health` 不能省。省略它的话，`/health` 会落进 `location /` 的 `try_files`，返回前端 `index.html`（`200` + `text/html`）而不是健康检查的 JSON，部署自检就会误判。另外**`/api/health` 并不存在**，请求它只会得到 `404`。
