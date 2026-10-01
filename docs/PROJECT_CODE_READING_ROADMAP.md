@@ -409,7 +409,7 @@ erDiagram
 | 区域 | 你要看什么 |
 |---|---|
 | `lifespan()` | 启动时做什么 |
-| `app.include_router(...)` | 路由如何汇聚到聊天、知识库、用户、checkpointer |
+| `app.include_router(...)` | 路由如何汇聚到聊天、知识库、用户 |
 | `root()` / `health()` | 基础健康检查 |
 | `create_token()` / `get_current_user()`（`backend/service/auth_service.py`） | 登录鉴权 |
 | `login()` / `logout()`（`backend/service/auth_service.py`） | 登录退出 |

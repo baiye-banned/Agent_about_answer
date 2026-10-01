@@ -157,7 +157,6 @@ flowchart LR
     Chat["聊天<br/>/api/chat/conversations /stream /attachments /traces"]
     KB["知识库<br/>/api/knowledge-bases"]
     Files["知识文件<br/>/api/knowledge /upload /content"]
-    CheckpointerRoute["Checkpointer<br/>/api/checkpointer/threads"]
   end
 
   subgraph Core["业务核心"]
@@ -199,7 +198,6 @@ flowchart LR
   Chat --> Trace
   Chat --> Ragas
   Chat --> DB
-  CheckpointerRoute --> Checkpointer
 
   DB --> MySQL
   Models --> MySQL
@@ -743,7 +741,6 @@ flowchart LR
 | `save_checkpoint()` | 方法 | 保存 checkpoint |
 | `load_checkpoint()` | 方法 | 读取 checkpoint |
 | `delete_thread_checkpoints()` | 方法 | 删除线程相关 checkpoint |
-| `list_threads()` | 方法 | 列出 checkpoint 线程 |
 
 ### `backend/main.py` / `backend/router/*.py`
 
@@ -756,7 +753,7 @@ flowchart LR
 | `lifespan()` | 异步生命周期 | 启动时建库 / 索引初始化 |
 | `root()` | 路由 | `/` |
 | `health()` | 路由 | `/health` |
-| `app.include_router(...)` | 调用 | 把认证、用户、聊天、知识库、checkpointer 路由挂进应用 |
+| `app.include_router(...)` | 调用 | 把认证、用户、聊天、知识库路由挂进应用 |
 | `init_db()` | 调用 | 初始化表结构与轻量迁移 |
 | `seed_default_users()` | 调用 | 初始化默认用户 |
 | `rebuild_existing_knowledge_index()` | 调用 | 在显式开启配置时重建 Milvus 索引 |
@@ -854,7 +851,6 @@ flowchart LR
 |---|---|---|
 | `_build_sources()` | 方法 | 来源列表构造（`backend/service/utils_service.py`） |
 | `load_json_value()` | 方法 | JSON 解析兜底（`backend/service/json_utils.py`） |
-| `list_checkpointer_threads()` | 路由 | `/api/checkpointer/threads`（`backend/service/trace_service.py`） |
 
 ## 9. 怎么把这份文档和源码对照
 

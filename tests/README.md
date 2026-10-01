@@ -231,6 +231,7 @@ Current files:
 - `test_boundary_modules.py`
 - `test_chat_service_retrieval.py`
 - `test_checkpointer.py`
+- `test_checkpointer_threads_removed_236.py`
 - `test_chunk_key_namespace.py`
 - `test_chunking.py`
 - `test_config_helpers.py`
@@ -482,7 +483,17 @@ helper modules split into separate cases so that a single one regressing cannot 
 other's worker-thread sessions; the scan is a second gate over the five modules that reach the trace
 chain, with 2 positive and 5 negative self-checks, and a companion case pins that every `crud_trace`
 call in `learning_trace.py` sits in a synchronous payload while the recorder's write methods are
-coroutines).
+coroutines), and the retired `/api/checkpointer/threads` endpoint (issue #236: it had answered
+`{"threads": []}` since the day it was registered, because the `checkpoints` table has no writer
+anywhere in the request paths and a `thread_id` cannot be attributed to a user at all - so the
+endpoint carried no content and no access control to speak of, and the trade-off taken is removal
+rather than inventing an owner filter over a mapping nothing in the tree confirms; the cases pin the
+path out of `main.app.openapi()["paths"]` rather than out of a walk over `main.app.routes`, since
+`include_router` does not flatten child routers and that walk returns no `/api` path at all, which
+would make the assertion vacuously true; the 404 is taken from a request against the real `main.app`
+with a sibling `/api` route as the positive control that the whole app is still up, and a reverse
+lock keeps `save_checkpoint`/`load_checkpoint`/`delete_thread_checkpoints` callable, so removing the
+endpoint cannot pass by removing the module).
 
 `conftest.py` puts `backend/` on `sys.path` so the tests can import application modules, and holds the test doubles shared by more than one test file: the `FakeQuery`/`FakeDb`/`FakeUser`/`FakeKnowledgeBase`/`FakeTraceRecorder` classes, the pytest fixtures built on them (`fake_user`, `fake_db`, `fake_knowledge_base`, `trace_recorder_cls`), and the SSE helpers (`collect_stream`, `parse_sse_frames`, `frames_of_type`, `streamed_content`). Test doubles used by a single file stay in that file.
 
