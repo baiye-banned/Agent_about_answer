@@ -2,8 +2,9 @@
 //
 // 由来：`git grep Chat.vue tests/` 此前只命中两处，且**都不是挂载** ——
 // `chatStore.test.js` 里是一个桩字符串，`test_internal_error_no_echo.py` 是后端用例。
-// 视图自己的胶水（`sendMessage` 的清空输入、`handleInputEnter` 的 Shift 分支、
-// 流式占位的渲染、知识库选中的接线）全部只有阅读证据。
+// 视图自己的胶水（`sendMessage` 的清空输入、`handleInputEnter` 的 Enter / Shift 分支
+// 与 IME 合成守卫、流式占位的渲染、知识库选中的接线）此前全部只有阅读证据，
+// 键盘那几条现在由文件末尾的 d 组用例接管。
 //
 // 与既有用例的分工：
 //   tests/chatStore.test.js  用 registerHooks 换掉 `@/api/chat`，测 **store** 的状态机
@@ -158,6 +159,30 @@ async function sendQuestion(view, text) {
   return mark
 }
 
+// 在输入框上按一次 Enter。cancelable: true 是必须的：断言面是「守卫有没有走到
+// preventDefault」，不可取消的事件恒为 defaultPrevented === false，会让对照组假绿。
+async function pressEnter(view, init = {}) {
+  const textarea = view.query('textarea')
+  assert.ok(textarea, '页面上应当有提问用的输入框')
+  const event = new KeyboardEvent('keydown', {
+    key: 'Enter', code: 'Enter', bubbles: true, cancelable: true, ...init,
+  })
+  textarea.dispatchEvent(event)
+  await view.flush(3)
+  return event
+}
+
+// 进入合成态并打入一段「尚未上屏」的文本：先 compositionstart 置 isComposing，
+// 再把 DOM 值改掉并以 isComposing 的 input 通知（el-input 此时会早退，v-model 不动）。
+async function typeDuringComposition(view, text) {
+  const textarea = view.query('textarea')
+  textarea.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }))
+  textarea.value = text
+  textarea.dispatchEvent(new InputEvent('input', { bubbles: true, isComposing: true, data: text }))
+  await view.flush(3)
+  return textarea
+}
+
 async function close(view) {
   view.elementPlusUnpatch()
   await view.unmount()
@@ -251,6 +276,155 @@ test('挂载后当前知识库与列表第一个同步（syncSelectedKnowledgeBa
     assert.match(view.text(), /KB1/, '当前知识库应当显示为列表第一个')
     const selected = view.queryAll('.el-select').length
     assert.ok(selected > 0, '页面上应当渲染出知识库选择器')
+  } finally {
+    await close(view)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// d. 键盘接线：Enter / Shift+Enter / IME 合成态（issue #240）
+//
+// 这一组把 `handleInputEnter` 的三条出口都钉住：非合成态的 Enter 照常发送、
+// Shift+Enter 留给换行、合成态（isComposing 或旧引擎的 keyCode 229）一律放行给输入法。
+// 判据是**事件本身**：组字中的 Enter 若被 preventDefault，输入法就没法用它选字
+//（这正是 #240 里「候选框被打掉」的机制），所以那两条直接断言 defaultPrevented。
+// ---------------------------------------------------------------------------
+
+test('Enter：非合成态按下应当发送并阻止默认行为', async () => {
+  const { view, streamCalls } = await mountChat()
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    const textarea = view.query('textarea')
+    assert.ok(textarea, '页面上应当有提问用的输入框')
+    textarea.value = 'q-plain'
+    textarea.dispatchEvent(new Event('input', { bubbles: true }))
+    await view.flush(3)
+    assert.equal(view.buttonByText('发送').disabled, false, '输入内容后「发送」按钮应当可用')
+
+    const event = await pressEnter(view)
+    assert.equal(event.defaultPrevented, true, '非合成态的 Enter 应当被 preventDefault（交给 sendMessage）')
+
+    await until(view, () => streamCalls.length > 0)
+    assert.equal(streamCalls.length, 1, '非合成态按 Enter 应当恰好发一次流式请求')
+    const body = JSON.parse(streamCalls[0].options.body)
+    assert.equal(body.question, 'q-plain', '发出的应当就是输入框里的问题')
+  } finally {
+    await close(view)
+  }
+})
+
+test('Shift+Enter：非合成态按下不发送、不阻止默认行为', async () => {
+  const { view, streamCalls } = await mountChat()
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    const textarea = view.query('textarea')
+    textarea.value = 'q-shift'
+    textarea.dispatchEvent(new Event('input', { bubbles: true }))
+    await view.flush(3)
+
+    const event = await pressEnter(view, { shiftKey: true })
+    assert.equal(event.defaultPrevented, false, 'Shift+Enter 是换行，不应当被 preventDefault')
+
+    await settle(view)
+    assert.equal(streamCalls.length, 0, 'Shift+Enter 不得发出流式请求')
+    assert.equal(view.query('textarea').value, 'q-shift', '输入框内容应当留在原地（换行而非清空）')
+  } finally {
+    await close(view)
+  }
+})
+
+test('IME：组字中按 Enter 不发送、也不吃掉候选框的默认行为', async () => {
+  const { view, streamCalls } = await mountChat()
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    const textarea = await typeDuringComposition(view, 'shijie')
+    // 前置闸门（防假绿）：DOM 里已经有未上屏的文本，但 v-model 没跟着走 ——
+    // el-input 在 isComposing 的 input 上早退，`question` 仍是空串，按钮因此仍禁用。
+    // 少了 vueMount 里的 CompositionEvent 全局，compositionstart 会在 emit 校验器里
+    // 抛 ReferenceError 并被 Vue 吞掉，isComposing 无从置起，这条前置会先红。
+    assert.equal(textarea.value, 'shijie', '前置：DOM 里应当有未上屏的文本')
+    assert.equal(view.buttonByText('发送').disabled, true, '前置：组字中 v-model 不应跟着 DOM 走')
+
+    const event = await pressEnter(view, { isComposing: true })
+    assert.equal(event.defaultPrevented, false, '组字中的 Enter 应当留给输入法选字，不得被吃掉')
+
+    await settle(view)
+    assert.equal(streamCalls.length, 0, '组字中的 Enter 不得发出流式请求')
+  } finally {
+    await close(view)
+  }
+})
+
+test('IME：组字中按 Enter 不得把未上屏文本之外的旧文本发出去（issue #240 原症状）', async () => {
+  const { view, streamCalls } = await mountChat()
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    // 先正常输入一段并让它上屏（v-model = '你好'），再进入合成态打 '你好shijie'。
+    const textarea = view.query('textarea')
+    textarea.value = '你好'
+    textarea.dispatchEvent(new Event('input', { bubbles: true }))
+    await view.flush(3)
+    assert.equal(view.buttonByText('发送').disabled, false, '前置：上屏后按钮应当可用')
+
+    await typeDuringComposition(view, '你好shijie')
+    assert.equal(textarea.value, '你好shijie', '前置：DOM 里是尚未上屏的新文本')
+
+    const event = await pressEnter(view, { isComposing: true })
+    assert.equal(event.defaultPrevented, false, '组字中的 Enter 不得被 preventDefault')
+
+    await settle(view)
+    // 修复前的红：这里恰好 1 次请求，且 body.question === '你好' —— 旧文本被发出去、
+    // 合成中的候选框被打掉，就是 #240 的字面症状。
+    assert.equal(streamCalls.length, 0, '组字中的 Enter 不得发出流式请求（尤其是旧文本）')
+  } finally {
+    await close(view)
+  }
+})
+
+test('IME：仅 keyCode 229（旧引擎 / isComposing 缺失）时同样不发送', async () => {
+  const { view, streamCalls } = await mountChat()
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    const textarea = view.query('textarea')
+    textarea.value = 'q-229'
+    textarea.dispatchEvent(new Event('input', { bubbles: true }))
+    await view.flush(3)
+    assert.equal(view.buttonByText('发送').disabled, false, '前置：非空输入时按钮应当可用')
+
+    // 老引擎在「输入法正在处理」时只给 keyCode 229，不给 isComposing。
+    const event = await pressEnter(view, { keyCode: 229 })
+    assert.equal(event.defaultPrevented, false, '229 也是组字，不得被 preventDefault')
+
+    await settle(view)
+    assert.equal(streamCalls.length, 0, '仅凭 keyCode 229 就应当拦下这次 Enter')
+  } finally {
+    await close(view)
+  }
+})
+
+test('IME：compositionend 之后按 Enter 发送的是上屏后的全文', async () => {
+  const { view, streamCalls } = await mountChat()
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    const textarea = await typeDuringComposition(view, '你好shijie')
+    textarea.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }))
+    await view.flush(3)
+    // 上屏后 el-input 会把合成结果补进 v-model（handleCompositionEnd -> handleInput）。
+    assert.equal(view.buttonByText('发送').disabled, false, '上屏后按钮应当可用')
+
+    const event = await pressEnter(view)
+    assert.equal(event.defaultPrevented, true, '上屏之后的 Enter 应当照常被 sendMessage 接管')
+
+    await until(view, () => streamCalls.length > 0)
+    assert.equal(streamCalls.length, 1, '上屏后的 Enter 应当恰好发一次流式请求')
+    const body = JSON.parse(streamCalls[0].options.body)
+    assert.equal(body.question, '你好shijie', '发出的应当是上屏后的全文')
   } finally {
     await close(view)
   }
