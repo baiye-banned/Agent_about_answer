@@ -32,7 +32,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta
-from email.utils import formatdate
+from email.utils import formatdate, parsedate_to_datetime
 from types import SimpleNamespace
 
 import httpx
@@ -403,7 +403,12 @@ def test_sweep_signs_a_real_oss_delete_request(api, monkeypatch):
     ).decode("utf-8")
     assert request.headers["Authorization"] == f"OSS test-id:{expected}"
     assert request.headers["Host"] == OSS_HOST
-    assert date == formatdate(usegmt=True)
+    # Date 头是「签发那一刻」的墙钟读数。这里再取一次 formatdate 做相等断言，就等于要求
+    # 两次互不相关的读数恰好落在同一秒——跨过秒边界必假红。改为校验它是规范的 RFC-2822
+    # GMT 时间（回读再格式化要逐字相同），且与当前时刻的偏差落在容忍窗口内。
+    requested_at = parsedate_to_datetime(date)
+    assert formatdate(requested_at.timestamp(), usegmt=True) == date
+    assert abs(requested_at.timestamp() - time.time()) <= 5
     # 回收不该带上传时那条公开读 ACL 头：签名串里没有它，带上就对不上了。
     assert "x-oss-object-acl" not in request.headers
     assert "content-type" not in request.headers
