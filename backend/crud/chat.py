@@ -125,14 +125,22 @@ def list_messages(
     return rows
 
 
-def list_conversation_attachment_keys(db: Session, cid: str, user_id: int) -> list[str] | None:
-    """会话内所有消息引用到的 OSS 对象键，去重后按「旧 -> 新」返回。
+def list_conversation_attachment_owners(
+    db: Session, cid: str, user_id: int
+) -> list[tuple[str, int | None]] | None:
+    """会话内所有消息引用到的 OSS 对象键，连同**属主**一起，去重后按「旧 -> 新」返回。
 
     必须在会话行被删除之前调用：`messages` 随会话级联删除，附件列里的对象键会一起消失，
     删完之后就再也说不清这个会话扔下过哪些对象。只看 attachments 一列，不把正文
     （LONGTEXT）读进内存；也不走 list_messages——那个有分页上限，翻不到的消息会漏收。
 
-    会话不存在或不属于该用户时返回 None，与 list_messages 的约定一致。
+    属主取自 `chat_attachment_uploads` 的 `user_id`（issue #233）：那把键是谁铸的，就只有
+    谁能回收它。键在附件列里出现**不构成归属凭据**——附件列由客户端回带，任何登录用户都能
+    在自己的消息里写上别人的键，拿它当凭据等于让任何人借自己的会话删别人的对象。
+    登记表里查无此键（历史数据、或客户端编的键）时属主是 None，调用方据此拒签。
+
+    一次查询取回整批属主（而不是逐键查）：这是删会话路径上的热查询，键多时逐键会变成
+    N+1。会话不存在或不属于该用户时返回 None，与 list_messages 的约定一致。
     """
     if not get_conversation(db, cid, user_id):
         return None
@@ -155,7 +163,15 @@ def list_conversation_attachment_keys(db: Session, cid: str, user_id: int) -> li
                 continue
             seen.add(object_key)
             keys.append(object_key)
-    return keys
+    if not keys:
+        return []
+
+    owners = dict(
+        db.query(ChatAttachmentUpload.object_key, ChatAttachmentUpload.user_id)
+        .filter(ChatAttachmentUpload.object_key.in_(keys))
+        .all()
+    )
+    return [(key, owners.get(key)) for key in keys]
 
 
 def register_attachment_upload(db: Session, object_key: str, user_id: int) -> ChatAttachmentUpload:
@@ -184,6 +200,11 @@ def confirm_attachment_uploads(db: Session, object_keys: list[str], user_id: int
     只消费 user_id 自己的行：附件列由客户端回带，一条消息可以引用一把别人铸的键（形态校验
     只认键的形状，不认归属）。若发送方也能替别人消费，那把键就被这条消息永久钉住，
     原主「上传了没发送」的对象再也回不到清扫任务手里。
+
+    消费是**盖 `consumed_at` 而不是删行**（issue #233）：行是归属的唯一凭据，删掉它，删会话
+    时就只剩「这个键出现在我的会话里」这种伪判据可用。行留下的副作用只是「已消费的行不再
+    是清扫候选」——由 list_pending_attachment_uploads / claim_attachment_upload 上的
+    `consumed_at IS NULL` 过滤承担（与原先物理删除时的可见行为一致）。
     """
     keys = [key for key in dict.fromkeys(object_keys or []) if isinstance(key, str) and key]
     if not keys:
@@ -194,7 +215,10 @@ def confirm_attachment_uploads(db: Session, object_keys: list[str], user_id: int
             ChatAttachmentUpload.user_id == user_id,
             ChatAttachmentUpload.object_key.in_(keys),
         )
-        .delete(synchronize_session=False)
+        .update(
+            {ChatAttachmentUpload.consumed_at: datetime.now()},
+            synchronize_session=False,
+        )
     )
 
 
@@ -207,14 +231,19 @@ def list_pending_attachment_uploads(
 ) -> list[ChatAttachmentUpload]:
     """「桶里有、库里没有」的对账入口：本服务铸过、还没有被任何消息消费的对象键。
 
-    这是 #142 要补的那块——上传即登记之后，行还在这张表里就等于「服务端写过一个对象，
-    但没有任何消息引用它」。清扫任务用 older_than 取超期的那批，排查/导出可以不加时间
-    条件看全量，也可以按 user_id 收窄到单个账号。
+    这是 #142 要补的那块——上传即登记之后，行还在这张表里且未被消费就等于「服务端写过一个
+    对象，但没有任何消息引用它」。清扫任务用 older_than 取超期的那批，排查/导出可以不加
+    时间条件看全量，也可以按 user_id 收窄到单个账号。
+
+    `consumed_at IS NULL` 这道过滤是 #233 引入的：消费从「删行」改成「盖时间戳」之后，
+    已消费的行会留在表里，不加这道过滤就会把活消息引用的对象当成孤儿候选——比不修还糟
+    （对象存储没有回收站）。这也是老代码与新代码不能同时在线的原因，见
+    database/session.py 的补列分支与 scripts/backfill_attachment_owner.py 的回滚说明。
 
     按 created_at 升序（同刻按 object_key 兜底定序）：一批超过 limit 时，先被回收的
     是积压更久的那批，且顺序稳定可复现。
     """
-    query = db.query(ChatAttachmentUpload)
+    query = db.query(ChatAttachmentUpload).filter(ChatAttachmentUpload.consumed_at.is_(None))
     if older_than is not None:
         query = query.filter(ChatAttachmentUpload.created_at < older_than)
     if user_id is not None:
@@ -239,6 +268,10 @@ def claim_attachment_upload(db: Session, object_key: str, older_than) -> dict | 
     按自己先前那份快照动手，而是每一步都要先赢下这一行；赢不下来就说明这条键已经成了正式
     引用（或已被另一条清扫处理），对象必须留着。对象存储没有回收站，删错没有第二遍。
 
+    `consumed_at IS NULL` 必须同时出现在「读」和「删」两处（issue #233）：读的那处少了它，
+    已被消费的行会被当成候选交给调用方去签 DELETE；删的那处少了它，一次领取会把一条已被
+    消费的登记行删掉，归属凭据随之消失。
+
     返回的行数据交给调用方在删除对象失败时**放回队列**（restore_attachment_upload），所以
     带上 user_id 与 created_at。
     """
@@ -247,6 +280,7 @@ def claim_attachment_upload(db: Session, object_key: str, older_than) -> dict | 
         .filter(
             ChatAttachmentUpload.object_key == object_key,
             ChatAttachmentUpload.created_at < older_than,
+            ChatAttachmentUpload.consumed_at.is_(None),
         )
         .first()
     )
@@ -258,6 +292,7 @@ def claim_attachment_upload(db: Session, object_key: str, older_than) -> dict | 
         .filter(
             ChatAttachmentUpload.object_key == object_key,
             ChatAttachmentUpload.created_at < older_than,
+            ChatAttachmentUpload.consumed_at.is_(None),
         )
         .delete(synchronize_session=False)
     )
@@ -273,6 +308,38 @@ def restore_attachment_upload(db: Session, *, object_key: str, user_id: int, cre
     """
     db.add(ChatAttachmentUpload(object_key=object_key, user_id=user_id, created_at=created_at))
     db.commit()
+
+
+def delete_attachment_uploads(db: Session, object_keys: list[str], requester_id: int) -> int:
+    """释放（物理删掉）已经回收完成的登记行，返回释放的条数，并提交。
+
+    这是纯粹的增长控制（issue #233）：消费改成盖 `consumed_at` 之后，行不再随发送消失，
+    删会话时得有人把它们收走，否则这张表只增不减。调用方是「对象确实删掉了」的那批键
+    ——行留着已经没有用处（对象不在了，归属也无从主张），留着只是垃圾。
+
+    只释放 requester_id 自己铸的行（`user_id = ?`）：别人的行是别人的账，哪怕刚刚顺手
+    删掉了它的对象，也没有资格替别人销账。这在正常路径上不会命中——回收判据本身就是
+    「属主 == 请求方」。
+
+    **逐键独立，绝不整批 `IN`**：调用方传进来的是「删成功的键」，一次整批删除会把
+    「哪把键释放了、哪把没有」压成一个数字。一旦某把键其实没删成功，它的行会跟着整批
+    消失，从此既不在清扫候选里（已被消费），也不在回收路径上，泄漏没有任何补偿入口。
+    逐键调用换来的是失败可归因，代价可以接受：只在删会话时走一次，键的数量是人的输入规模。
+    """
+    released = 0
+    for object_key in dict.fromkeys(object_keys or []):
+        if not isinstance(object_key, str) or not object_key:
+            continue
+        released += (
+            db.query(ChatAttachmentUpload)
+            .filter(
+                ChatAttachmentUpload.object_key == object_key,
+                ChatAttachmentUpload.user_id == requester_id,
+            )
+            .delete(synchronize_session=False)
+        )
+    db.commit()
+    return released
 
 
 def drop_attachment_upload(db: Session, object_key: str) -> bool:

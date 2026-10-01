@@ -177,17 +177,42 @@ def _service_minted_attachments(attachments: list[dict] | None, conversation_id:
     return accepted
 
 
-def _reclaim_chat_attachments(object_keys: list[str]) -> None:
+def _reclaim_chat_attachments(db: Session, attachment_owners: list[tuple[str, int | None]],
+                              requester_id: int) -> None:
     """尽力回收会话里的聊天附件对象，任何一个删不掉都不影响会话删除的结果。
 
     顺序是「先落库、后回收」：数据库是权威，最坏情况是 OSS 上多留一个孤儿对象（占空间、
     可重跑、可对账）；反过来先删对象再删行，一旦删行失败，用户会看到一个仍然存在的会话里
     图片全部失效——对象存储没有回收站，那是不可逆的内容丢失，比泄漏一个对象严重得多。
 
-    失败只记 warning 不上抛：会话此时已经删掉了，再把回收失败变成 5xx 只会让用户以为
-    没删成功而去重试。日志带上 object_key，便于按对象对账后重跑（删除本身是幂等的）。
+    归属判据（issue #233）在这里，而且是**先于形态护栏**的第一道闸：一把键只有
+    `chat_attachment_uploads` 里的属主与请求方是同一个人，才轮到 `_delete_oss_object`
+    去签发 DELETE。附件列由客户端回带（`schema/schemas.py` 的 `attachments: list[dict]`
+    不校验），「这把键出现在我的会话消息里」不构成归属凭据——拿它当凭据，任何登录用户都
+    能在自己的会话里写上别人的键，借服务的凭据删掉别人的对象。
+
+    没有登记行（属主为 None，例如历史数据或客户端编的键）与属主是别人，都按「拒签」处理：
+    只留一条带 object_key 的 warning，**不回显给用户**——会话已经删掉了，把「有一把键没删」
+    写进响应体只会泄露别人对象的存在，且用户对此无能为力。
+
+    删除失败（含被形态护栏拒签的 ForeignObjectKeyError）同样只记 warning 不上抛：会话此
+    时已经删掉了，再把回收失败变成 5xx 只会让用户以为没删成功而去重试。日志带上 object_key，
+    便于按对象对账后重跑（删除本身是幂等的）。
+
+    回收成功的键在这里、也只在**删除确实没抛异常**之后释放登记行：以「删成功」为准逐键
+    释放，失败（含 404 之外的状态码）的行留着，它就是这条泄漏唯一的对账线索。释放交给
+    crud 时仍然是逐键的，理由见 crud_chat.delete_attachment_uploads。
     """
-    for object_key in object_keys:
+    reclaimed_keys: list[str] = []
+    for object_key, owner_id in attachment_owners:
+        if owner_id != requester_id:
+            logger.warning(
+                "chat attachment reclaim skipped, not the owner: object_key=%s owner_id=%s requester_id=%s",
+                object_key,
+                owner_id,
+                requester_id,
+            )
+            continue
         try:
             _delete_oss_object(object_key)
         except Exception as exc:
@@ -197,6 +222,10 @@ def _reclaim_chat_attachments(object_keys: list[str]) -> None:
                 exc,
                 exc_info=exc,
             )
+            continue
+        reclaimed_keys.append(object_key)
+    if reclaimed_keys:
+        crud_chat.delete_attachment_uploads(db, reclaimed_keys, requester_id)
 
 
 def reclaim_orphan_chat_attachments(db: Session, *, now: datetime | None = None,
@@ -342,13 +371,15 @@ def schedule_orphan_attachment_sweep(interval_seconds: float | None = None,
 def delete_conversation(cid: str, user: User = Depends(get_current_user),
                         db: Session = Depends(get_db)):
     # 对象键必须在删行之前取：messages 随会话级联删除，删完就再也读不到引用了哪些对象。
-    attachment_keys = crud_chat.list_conversation_attachment_keys(db, cid, user.id)
+    # 连属主一起取：回收判据是「谁铸的键」而不是「谁的消息里出现过它」，见
+    # _reclaim_chat_attachments 与 crud_chat.list_conversation_attachment_owners。
+    attachment_owners = crud_chat.list_conversation_attachment_owners(db, cid, user.id)
     conv = crud_chat.delete_conversation(db, cid, user.id)
     if not conv:
         raise HTTPException(404, "对话不存在")
     # clean checkpointer state
     delete_thread_checkpoints(cid)
-    _reclaim_chat_attachments(attachment_keys or [])
+    _reclaim_chat_attachments(db, attachment_owners or [], user.id)
     return {"message": "ok"}
 
 
