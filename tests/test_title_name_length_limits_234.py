@@ -24,12 +24,14 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.dialects.mysql import LONGTEXT
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from database import session as db_session
 from database.session import Base
-from model.models import Conversation, KnowledgeBase, RevokedToken, User
+from model.models import Conversation, KnowledgeBase, KnowledgeFile, RevokedToken, User
 from router import chat as chat_router
 from router import knowledge as knowledge_router
 from schema import schemas
@@ -48,12 +50,31 @@ TITLE_COLUMN_WIDTH = 200
 NAME_COLUMN_WIDTH = 100
 
 
+@compiles(LONGTEXT, "sqlite")
+def _compile_longtext_as_text(_type, _compiler, **_kwargs):
+    """把 MySQL 的 LONGTEXT 在 SQLite 下渲染成 TEXT（与 tests/test_knowledge_base_name_race.py 同款垫片）。
+
+    KnowledgeFile.content 是 LONGTEXT，SQLite 方言不认这个类型名；不加垫片直接把它塞进
+    `create_all` 会得到 `CompileError: ... can't render element`。
+    """
+    return "TEXT"
+
+
 @pytest.fixture()
 def api():
-    """真路由 + 内存 SQLite 的最小应用（与 tests/test_list_page_caps_191.py 同构）。
+    """真路由 + 内存 SQLite 的最小应用（建表口径同 tests/test_knowledge_base_name_race.py）。
 
-    只建这四张表：它们都不含 LONGTEXT 列，所以不需要 `@compiles(LONGTEXT, "sqlite")` 补丁
-    （那个补丁是 KnowledgeFile/Message 才要的，本套用例不碰）。
+    建这五张表：User / RevokedToken / KnowledgeBase / Conversation，**外加 KnowledgeFile**。
+
+    KnowledgeFile 不是可选项，哪怕本套用例的 T1/T2/T3 打的是「超长必被拒」：T3 命中的 KB
+    重命名在**被接受**时会调 `crud_knowledge_base.count_knowledge_files` 给响应体算文件数
+    （service/knowledge_service.py:432），那条 SQL 打在 knowledge_files 上。表不在就抛
+    `OperationalError: no such table: knowledge_files`——用例会炸成异常红，看着像「超长没被
+    拒」的反面，其实是 fixture 缺表（实测：合法短名的 rename 走通到这一行即抛）。
+    `create_knowledge_base` 走的是「新库名下不可能有文件、直接给 0」的短路（同文件 :405），
+    所以借道 create 的 T2 不会暴露这个缺口，只有 rename 这条被接受路径会。
+
+    KnowledgeFile 带 LONGTEXT 列，故需上面的 `@compiles` 垫片；只加表不加垫片会 `CompileError`。
     """
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
@@ -64,6 +85,7 @@ def api():
             User.__table__,
             RevokedToken.__table__,
             KnowledgeBase.__table__,
+            KnowledgeFile.__table__,
             Conversation.__table__,
         ],
     )
