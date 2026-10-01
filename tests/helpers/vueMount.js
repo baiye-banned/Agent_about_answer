@@ -59,6 +59,7 @@ for (const key of [
   'FocusEvent',
   'InputEvent',
   'ClipboardEvent',
+  'CompositionEvent',
   'CustomEvent',
   'MutationObserver',
   'requestAnimationFrame',

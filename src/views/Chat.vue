@@ -640,6 +640,7 @@ function sendMessage() {
 }
 
 function handleInputEnter(event) {
+  if (event.isComposing || event.keyCode === 229) return
   if (event.shiftKey) return
   event.preventDefault()
   sendMessage()
