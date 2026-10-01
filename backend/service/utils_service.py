@@ -57,7 +57,11 @@ def _build_sources(chunks: list[dict]) -> list[dict]:
 
 def resolve_image_upload_type(content_type: str | None, filename: str | None = None, *, allow_filename_fallback: bool = False) -> tuple[str, str] | None:
     resolved_type = _normalize_content_type(content_type)
-    if not resolved_type and allow_filename_fallback:
+    # 回退触发条件是「客户端给的类型不携带格式信息」，不是「客户端没给类型」：通用类型
+    # （空、两种 octet-stream，见 :29）无法据此判断真实格式，按扩展名回退；**明确**的类型
+    # （如 text/plain）不回退——它与「未知」不同类，放行它等于让判据退化成「只看扩展名」。
+    # 与 resolve_knowledge_upload_type 共用同一张表（issue #237）。
+    if resolved_type in GENERIC_UPLOAD_CONTENT_TYPES and allow_filename_fallback:
         resolved_type = _normalize_content_type(mimetypes.guess_type(filename or "")[0])
     ext = IMAGE_UPLOAD_TYPES.get(resolved_type)
     if not ext:
