@@ -678,6 +678,9 @@ def _save_user_message(cid: str, user_id: int, display_question: str,
             blocked = crud_chat.list_blocked_attachment_uploads(db, requested_keys)
             if blocked:
                 raise AttachmentReclaimedError(blocked[0])
+        # 新消息即「最近活动」：把会话行一起 touch，侧栏才会把它顶到最前（issue #239）。
+        # 与上面两处写入共用同一个 db、同一次 commit——分开提交会出现单边状态。
+        crud_chat.touch_conversation(db, cid, user_id)
         db.commit()
         db.refresh(user_message)
         return user_message.id

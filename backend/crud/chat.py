@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, literal, or_
+from sqlalchemy import and_, func, literal, or_
 from sqlalchemy.orm import Session, selectinload
 
 from config import CHAT_ATTACHMENT_LEASE_SECONDS
@@ -102,11 +102,16 @@ def list_conversations(
        会话按它排序不稳定，翻页会重复或漏行。补一个唯一且不重复的主键做末位键，
        `(updated_at, id)` 就是全序，游标比较才有确定答案。
 
-    已知边界：`updated_at` 是可变的（新消息、重命名都会改写它）。翻页途中被改写的那个会话
-    会跳到游标之前（用户已经翻过的区间），它要么已经在上一次响应里、要么要等下一次整表刷新
-    才出现——侧栏每次回答结束都会整表刷新，收敛得掉。反过来把序键换成不可变的 `created_at`
-    能彻底消掉这个边界，但侧栏会从「最近活动优先」变成「创建时间优先」，
-    属于本单之外的可见行为变更，不做。
+    已知边界：`updated_at` 是可变的——四类写入方都会改写它：新消息（本单新增的 `touch_conversation`）、
+    重命名（`rename_conversation`）、记忆摘要写入（`rag/memory_service.py` 的
+    `_write_memory_summary_text`）、删除知识库时的会话改绑（`crud/knowledge_base.py`）；
+    启动期那条裸 SQL 回填（`database/session.py`）绕过 ORM、**不会**改写它（有意为之）。
+    翻页途中被改写的那个会话会跳到游标之前（用户已经翻过的区间），它要么已经在上一次响应里、
+    要么要等侧栏下一次刷新才出现——侧栏每轮问答结束后都会重取最新一页并重置游标
+    （`src/stores/chat.js` 的 `fetchConversations`），收敛得掉。新消息 bump 之后这个边界被触发
+    的频率比修之前高（每问一次就顶一次），但形状没变：不重复、不静默丢行。反过来把序键换成
+    不可变的 `created_at` 能彻底消掉它，但侧栏会从「最近活动优先」变成「创建时间优先」，
+    属于本单之外的可见行为变更，不做（见 issue #239 的修复计划）。
 
     `before` 是 (updated_at, id) 复合游标，两者必须同时给出（service 层负责拦半个游标）。
     """
@@ -140,6 +145,30 @@ def list_conversations(
 
 def get_conversation(db: Session, cid: str, user_id: int) -> Conversation | None:
     return db.query(Conversation).filter_by(id=cid, user_id=user_id).first()
+
+
+def touch_conversation(db: Session, cid: str, user_id: int) -> bool:
+    """把会话的 updated_at 推到现在，让它回到侧栏「最近活动」的最前面。
+
+    **故意不提交**（同 `confirm_attachment_uploads`）：调用方必须把这次 touch 与消息行、
+    附件登记行的写入放进同一次 commit，否则会出现「消息已落库但侧栏没动」或
+    「侧栏动了但消息没落库」的单边状态。
+
+    按 (id, user_id) 定位，与 `get_conversation` 同一形状：用户域限定不是可选的——
+    cid 来自请求体，不限定就等于「拿别人的 cid 顶别人的会话」。
+
+    用 `func.now()` 而不是 `datetime.now()`：前者落到列里是秒级文本（与列默认值同形状，
+    `seconds_text` 的前提），后者会引入带微秒的第三种文本形状。
+
+    读改写而不是 `query(...).update({...})`：后者在本仓库的 `FakeDb` 替身上不存在
+    （`tests/conftest.py` 只实现了 `filter_by`/`first`），会让所有把 `stream_chat` 跑在
+    FakeDb 上的用例集体报错；这条窄路径在替身上退化成静默 no-op，是既有用例零改写的正路。
+    """
+    conversation = get_conversation(db, cid, user_id)
+    if conversation is None:
+        return False
+    conversation.updated_at = func.now()
+    return True
 
 
 def list_messages(
