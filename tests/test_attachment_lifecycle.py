@@ -275,6 +275,11 @@ def test_deleting_conversation_deletes_referenced_attachment_objects(api, oss_re
     assert api.checkpointer_calls == ["c-del"]
     assert api.db.query(Conversation).filter_by(id="c-del").first() is None
     assert api.db.query(Message).filter_by(conversation_id="c-del").first() is None
+    # 阳性对照的另一半（issue #260）：正常删除下登记行也必须清干净。T1 断的是
+    # 「清理失败 ⇒ 登记行原样留下」，这里断的是「清理成功 ⇒ 登记行一条不剩」，
+    # 两侧合起来才说明四态的一致性，而不是「登记行反正没人动」。
+    for key in (KEY_A, KEY_B, KEY_C):
+        assert api.db.query(ChatAttachmentUpload).filter_by(object_key=key).count() == 0
 
 
 def test_attachment_delete_request_is_signed_for_oss_delete(api, monkeypatch):
@@ -382,6 +387,110 @@ def test_deleting_missing_conversation_does_not_touch_object_storage(api, oss_re
 
     assert response.status_code == 404
     assert oss_requests.requests == []
+    # 闸门位移护栏（issue #260）：404 仍必须在**任何清理之前**返回。存在性/归属判定被
+    # 提到 checkpointer 清理之前后，这条断言钉住「清理不会为不存在的会话跑一遍」。
+    assert api.checkpointer_calls == []
+
+
+def test_a_failing_checkpointer_purge_leaves_no_half_deleted_conversation(api, oss_requests, monkeypatch):
+    """清理失败 ⇒ 会话、消息、登记行、对象全部保持原样（issue #260）。
+
+    修复前：`crud_chat.delete_conversation` 先提交（会话/消息已成事实），随后
+    `delete_thread_checkpoints` 抛错 ⇒ 请求 5xx 但库里已经删干净，登记行停在
+    `consumed`（既不在清扫候选 P 里，也不在墓碑 R 里），对象从此无人回收。
+    修复后：清理落在那一次 commit 之前，失败 = 这次删除整体没发生。
+    """
+    _add_conversation(api, "c-cp-fail", [_attachments_column(KEY_A)])
+    _seed_owned_upload(api, KEY_A, api.alice.id)   # consumed_at 已设（默认），正是残留形态
+
+    def _boom(_cid):
+        raise RuntimeError("checkpointer unavailable")
+
+    monkeypatch.setattr(chat_service, "delete_thread_checkpoints", _boom)
+
+    with pytest.raises(RuntimeError):              # 失败仍须上抛（5xx），不得被吞
+        api.client.delete("/api/chat/conversations/c-cp-fail")
+
+    # 四态一致：全部保持删除前的样子。
+    assert api.db.query(Conversation).filter_by(id="c-cp-fail").count() == 1
+    assert api.db.query(Message).filter_by(conversation_id="c-cp-fail").count() == 1
+    assert api.db.query(ChatTraceSession).filter_by(conversation_id="c-cp-fail").count() == 0  # 夹具未造轨迹
+    row = api.db.query(ChatAttachmentUpload).filter_by(object_key=KEY_A).one()
+    assert row.consumed_at is not None and row.claimed_at is None and row.reclaimed_at is None
+    assert oss_requests.requests == []             # 对象没被动过
+
+    # 无半完成态：这把「已消费但会话已删」的键也不该被清扫当成孤儿（判据护栏）。
+    assert chat_service.reclaim_orphan_chat_attachments(api.db)["candidates"] == 0
+
+
+def test_retrying_the_deletion_after_a_failed_purge_removes_everything(api, oss_requests, monkeypatch):
+    """失败后重试是一次完整重试：200 且四态归零（issue #260）。
+
+    与上一条同源——清理前失败留下了「什么都没变」的状态，所以第二次删除必须能走完整条链路，
+    而不是撞上「会话已经没了」的 404（修复前正是 404）。
+    """
+    _add_conversation(api, "c-cp-retry", [_attachments_column(KEY_A)])
+    _seed_owned_upload(api, KEY_A, api.alice.id)
+
+    def _boom(_cid):
+        raise RuntimeError("checkpointer unavailable")
+
+    monkeypatch.setattr(chat_service, "delete_thread_checkpoints", _boom)
+    with pytest.raises(RuntimeError):
+        api.client.delete("/api/chat/conversations/c-cp-retry")
+
+    # 重新装回夹具的记录器（不用 monkeypatch.undo()：那会把夹具的记录器一并撤掉）。
+    monkeypatch.setattr(chat_service, "delete_thread_checkpoints", api.checkpointer_calls.append)
+
+    response = api.client.delete("/api/chat/conversations/c-cp-retry")
+
+    assert response.status_code == 200
+    assert api.checkpointer_calls == ["c-cp-retry"]
+    assert api.db.query(Conversation).filter_by(id="c-cp-retry").count() == 0
+    assert api.db.query(Message).filter_by(conversation_id="c-cp-retry").count() == 0
+    assert api.db.query(ChatAttachmentUpload).filter_by(object_key=KEY_A).count() == 0
+    assert len(oss_requests.requests) == 1
+
+
+def test_the_checkpointer_purge_runs_while_the_conversation_row_still_exists(api, oss_requests, monkeypatch):
+    """次序护栏：清理跑在会话行仍在时 ⇒ 它必须在那一次 commit 之前（issue #260）。
+
+    与既有 `test_attachment_objects_are_deleted_only_after_the_rows_are_gone`（删行失败时
+    一个对象都不许删）互为对偶，两侧一起把「清理前置 / 落库在后 / 回收在最后」钉死。
+    """
+    _add_conversation(api, "c-order-cp", [_attachments_column(KEY_A)])
+    seen = []
+
+    def _recording_purge(cid):
+        seen.append((cid, api.db.query(Conversation).filter_by(id=cid).count()))
+
+    monkeypatch.setattr(chat_service, "delete_thread_checkpoints", _recording_purge)
+
+    assert api.client.delete("/api/chat/conversations/c-order-cp").status_code == 200
+    assert seen == [("c-order-cp", 1)]   # 调用时会话行还在 ⇒ 未提交
+
+
+def test_a_failing_registration_release_does_not_turn_a_deletion_into_a_5xx(api, oss_requests, monkeypatch):
+    """M3 护栏：回收段落账提交失败不得把 200 变成 5xx（issue #260）。
+
+    分界线是 `crud/chat.py` 那次 `db.commit()`。它之后的动作（删对象、释放登记行）只允许
+    best-effort：失败留下的是「多一行指向已删对象的账本」，而不是「删了一半还报错」。
+    """
+    _add_conversation(api, "c-ledger", [_attachments_column(KEY_A)])
+    _seed_owned_upload(api, KEY_A, api.alice.id)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("ledger commit failed")
+
+    monkeypatch.setattr(chat_service.crud_chat, "delete_attachment_uploads", _boom)
+
+    response = api.client.delete("/api/chat/conversations/c-ledger")
+
+    assert response.status_code == 200            # M3 的核心断言
+    api.db.close()                                # 读已提交状态（关会话会回滚未提交事务）
+    assert api.db.query(Conversation).filter_by(id="c-ledger").count() == 0
+    assert len(oss_requests.requests) == 1        # 对象确实删了
+    assert api.db.query(ChatAttachmentUpload).filter_by(object_key=KEY_A).count() == 1   # 账本行留下
 
 
 # ---------------------------------------------------------------------------
