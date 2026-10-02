@@ -425,7 +425,7 @@ flowchart LR
 | `auth.js` | `authAPI.login()` / `authAPI.logout()` | 登录和退出 |
 | `user.js` | `userAPI.getProfile()` / `updatePassword()` / `uploadAvatar()` | 用户资料和头像 |
 | `knowledge.js` | `knowledgeAPI.getList()` / `getBases()` / `createBase()` / `renameBase()` / `deleteBase()` / `getDetail()` / `getContent()` / `upload()` / `delete()` / `batchDelete()` | 知识库和知识文件 CRUD |
-| `chat.js` | `chatAPI.getConversations()` / `getMessages()` / `getTrace()` / `getMessageTrace()` / `uploadAttachment()` / `streamChat()` | 聊天、Trace 和附件上传 |
+| `chat.js` | `chatAPI.getConversations()` / `getMessages()` / `getTrace()` / `getMessageTrace()` / `setMessageFeedback()` / `uploadAttachment()` / `streamChat()` | 聊天、Trace 和附件上传 |
 
 ### `src/stores/user.js`
 
@@ -499,6 +499,7 @@ flowchart LR
 | `startEvaluationPolling()` / `stopEvaluationPolling()` | 方法 | 轮询 RAGAS 状态 |
 | `markLocalEvaluationTimeout()` | 方法 | 本地 pending 超时处理 |
 | `renameConversation()` | 方法 | 重命名会话 |
+| `setMessageFeedback()` | 方法 | 消息反馈：乐观落态，失败回滚到调用前的值 |
 | `clearMessages()` | 方法 | 清空当前对话 |
 | `normalizeMessage()` | 方法 | 消息归一化 |
 
@@ -790,6 +791,8 @@ flowchart LR
 | `delete_conversation()` | 路由 | 删除会话 |
 | `RenameRequest` | Pydantic 模型 | 重命名会话请求 |
 | `rename_conversation()` | 路由 | 重命名会话 |
+| `MessageFeedbackRequest` | Pydantic 模型 | 消息反馈请求（`feedback`：1=赞 / -1=踩 / 0=取消） |
+| `submit_message_feedback()` | 路由 | `/api/chat/messages/{message_id}/feedback` |
 | `serialize_message()` | 方法 | 消息序列化（`backend/crud/chat.py`） |
 | `_trace_sse_payloads()` | 方法 | Trace SSE payload |
 | `trace_service._safe_trace_add()` / `_safe_trace_finish()` / `_safe_trace_attach()` | 方法 | 保护 Trace 的安全封装 |
