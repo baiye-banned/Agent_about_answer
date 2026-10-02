@@ -627,6 +627,9 @@ def delete_conversation(db: Session, cid: str, user_id: int) -> Conversation | N
     # 关掉开关只是不再写新轨迹，已经写下的行仍然要随会话删除。
     crud_trace.delete_trace_sessions_for_conversation(db, cid)
     db.delete(conversation)
+    # ↓ 点无可退（issue #260）：这一行之后，会话/消息/轨迹已成事实。调用方必须把所有
+    # 不在这条事务里的前置清理（checkpointer 等外部状态）放在这里之前；本行之后的动作
+    # 只允许 best-effort，不得再把成功删除变成 5xx。
     db.commit()
     return conversation
 

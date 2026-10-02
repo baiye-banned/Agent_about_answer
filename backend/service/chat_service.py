@@ -250,7 +250,13 @@ def _reclaim_chat_attachments(db: Session, attachment_owners: list[tuple[str, in
             continue
         reclaimed_keys.append(object_key)
     if reclaimed_keys:
-        crud_chat.delete_attachment_uploads(db, reclaimed_keys, requester_id)
+        try:
+            crud_chat.delete_attachment_uploads(db, reclaimed_keys, requester_id)
+        except Exception as exc:
+            # 会话已删、对象已删，这里唯一失败的是账本落账。不让它把 200 变成 5xx：
+            # 行留下即对账凭据（crud/chat.py:599-601），与 :223-225 的既定方针一致。
+            logger.warning("chat attachment reclaim: releasing registration rows failed: "
+                           "keys=%d error=%s", len(reclaimed_keys), exc, exc_info=exc)
 
 
 def reclaim_orphan_chat_attachments(db: Session, *, now: datetime | None = None,
@@ -446,12 +452,22 @@ def delete_conversation(cid: str, user: User = Depends(get_current_user),
     # 连属主一起取：回收判据是「谁铸的键」而不是「谁的消息里出现过它」，见
     # _reclaim_chat_attachments 与 crud_chat.list_conversation_attachment_owners。
     attachment_owners = crud_chat.list_conversation_attachment_owners(db, cid, user.id)
+    if attachment_owners is None:
+        # 存在性/归属闸（issue #260）：与 crud_chat.delete_conversation 用的是同一个
+        # get_conversation 判据，所以 404 的结果集合不变，只是提前到任何写之前返回。
+        # 闸门同时保证下面 attachment_owners 非 None——「去掉 or []」与它同进同退。
+        raise HTTPException(404, "对话不存在")
+    # 清理前置（issue #260）：checkpointer 的清理必须落在「点无可退」之前。
+    # crud_chat.delete_conversation 里那一次 commit 之后，会话与消息已成事实；此时若
+    # 清理抛错，请求 5xx 但状态已变——登记行停在 consumed、对象永不回收（#260）。
+    # 放在 commit 之前，清理失败 = 这次删除整体没发生，用户重试是一次完整的重试。
+    delete_thread_checkpoints(cid)
     conv = crud_chat.delete_conversation(db, cid, user.id)
     if not conv:
+        # 并发删除兜底：另一方已经删掉了。上面的清理是幂等的（DELETE ... WHERE thread_id = ?），
+        # 这里按 404 收尾，对外语义与「会话不存在」一致。
         raise HTTPException(404, "对话不存在")
-    # clean checkpointer state
-    delete_thread_checkpoints(cid)
-    _reclaim_chat_attachments(db, attachment_owners or [], user.id)
+    _reclaim_chat_attachments(db, attachment_owners, user.id)   # 闸门已保证非 None，不再需要 `or []`
     return {"message": "ok"}
 
 
