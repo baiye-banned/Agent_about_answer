@@ -92,7 +92,28 @@
               @change="chatStore.toggleConversationSelection(conversation.id)"
             />
             <el-icon :size="15"><ChatLineRound /></el-icon>
-            <span class="flex-1 truncate">{{ conversation.title || '未命名对话' }}</span>
+            <!-- 行内改名（issue #257）：编辑态把标题换成输入框，回车提交 / Esc 取消 /
+                 失焦取消（与 Chat.vue 的发送框相反，那里失焦是提交）。 -->
+            <el-input
+              v-if="editingConversationId === conversation.id"
+              ref="renameInputRef"
+              v-model.trim="editingTitle"
+              size="small"
+              maxlength="40"
+              @keyup.enter="submitRename(conversation, $event)"
+              @keyup.esc="cancelRename()"
+              @blur="cancelRename()"
+              @click.stop
+            />
+            <span v-else class="flex-1 truncate">{{ conversation.title || '未命名对话' }}</span>
+            <el-button
+              v-if="!chatStore.historyManageMode"
+              link
+              size="small"
+              :icon="Edit"
+              class="rename-entry opacity-0 group-hover:opacity-100"
+              @click.stop="startRename(conversation)"
+            />
             <el-popconfirm
               v-if="!chatStore.historyManageMode"
               title="确定删除该对话吗？"
@@ -166,7 +187,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   ArrowDown,
@@ -174,10 +195,12 @@ import {
   ChatLineRound,
   Connection,
   Delete,
+  Edit,
   FolderOpened,
   Operation,
   Plus,
 } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import { useChatStore } from '@/stores/chat'
 import { useUserStore } from '@/stores/user'
 import { confirmCenteredDelete } from '@/utils/confirm'
@@ -198,12 +221,61 @@ const allConversationsSelected = computed(() =>
   chatStore.selectedConversationIds.length === chatStore.conversations.length
 )
 
+// 行内改名（issue #257）：同一时刻至多一行处于编辑态，null 表示没有。
+const editingConversationId = ref(null)
+const editingTitle = ref('')
+const renameInputRef = ref(null)
+
 onMounted(() => {
   userStore.fetchProfile().catch(() => {})
   chatStore.fetchConversations()
 })
 
+function focusRenameInput() {
+  // `ref` 写在 v-for 里时 Vue 会带上 ref_for，落下来的是数组而不是单个实例；
+  // 同一时刻至多一个编辑框，取末尾那个即可。
+  const target = renameInputRef.value
+  const input = Array.isArray(target) ? target[target.length - 1] : target
+  input?.focus()
+}
+
+function startRename(conversation) {
+  // 换行编辑前先收掉上一行 —— 走的是同一个「退出编辑态」出口。
+  cancelRename()
+  editingConversationId.value = conversation.id
+  editingTitle.value = conversation.title || ''
+  nextTick(focusRenameInput)
+}
+
+async function submitRename(conversation, event) {
+  // 输入法组字中的回车是「上屏」不是「提交」（同 Chat.vue 发送框的守卫）。
+  if (event.isComposing || event.keyCode === 229) return
+
+  const id = conversation.id
+  const next = editingTitle.value.trim()
+  // 先同步退出编辑态、再 await：提交与失焦是两条会互相追尾的路径，
+  // 后到的那一方会被 cancelRename 的 null 挡掉。
+  editingConversationId.value = null
+  editingTitle.value = ''
+  if (!next || next === conversation.title) return
+
+  try {
+    await chatStore.renameConversation(id, next)
+    ElMessage.success('已重命名')
+  } catch {
+    // await 在赋值之前，失败的标题不会写进列表，这里只需退出编辑态并告知。
+    ElMessage.error('重命名失败')
+  }
+}
+
+function cancelRename() {
+  if (editingConversationId.value === null) return
+  editingConversationId.value = null
+  editingTitle.value = ''
+}
+
 function newConversation() {
+  cancelRename()
   chatStore.exitHistoryManageMode()
   chatStore.clearMessages()
   router.push('/chat')
@@ -216,6 +288,9 @@ function selectConversation(id) {
 }
 
 function handleConversationClick(id) {
+  // 正在改名的这一行：点在编辑框上的事件已经被 @click.stop 挡住，这里是兜底 ——
+  // 不允许「正在编辑的行」被这一下顺手选中/跳转。
+  if (editingConversationId.value === id) return
   if (chatStore.historyManageMode) {
     chatStore.toggleConversationSelection(id)
     return
@@ -231,6 +306,8 @@ async function removeConversation(id) {
 }
 
 function toggleHistoryManageMode() {
+  // 管理模式每行会换成复选框、改名入口随之收起，编辑态在这里先收干净。
+  cancelRename()
   if (chatStore.historyManageMode) {
     chatStore.exitHistoryManageMode()
     return
