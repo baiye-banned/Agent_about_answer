@@ -743,6 +743,10 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
             "当前并发聊天请求已达上限，请稍后重试。",
             headers={"Retry-After": "1"},
         )
+    # 并发槽的归属分两段：外层持有到「把流交出去」为止，此后由生成器自持（各自 finally 归还）。
+    # handed_off 就是这条交接线——交付前任何退出（普通异常、取消等 BaseException 族）都由外层
+    # 兜底归还；交付后外层绝不 release，避免与生成器 finally 重复释放、把容量算大。
+    handed_off = False
     try:
         trace = TraceRecorder(user_id=principal.user_id)
         await trace.add(
@@ -833,7 +837,9 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 finally:
                     slot.release()
 
-            return StreamingResponse(failure_stream(), media_type="text/event-stream")
+            response = StreamingResponse(failure_stream(), media_type="text/event-stream")
+            handed_off = True
+            return response
         title_source = raw_question or effective_question or display_question
         title = title_source[:30] + ("..." if len(title_source) > 30 else "")
         conversation = await asyncio.to_thread(
@@ -904,7 +910,9 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                 finally:
                     slot.release()
 
-            return StreamingResponse(reclaimed_stream(), media_type="text/event-stream")
+            response = StreamingResponse(reclaimed_stream(), media_type="text/event-stream")
+            handed_off = True
+            return response
         await trace.add(
             "user_message_saved",
             "Message",
@@ -1363,9 +1371,12 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                     # 一条，一次断连就会永久占着一个槽。
                     slot.release()
 
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
-    except Exception:
-        # 鉴权之后、StreamingResponse 之前失败：生成器的 finally 够不到这条路径，
-        # 外层收尾必须把槽还回去，否则一次失败就永久占着一个槽（issue #183）。
-        slot.release()
-        raise
+        response = StreamingResponse(event_stream(), media_type="text/event-stream")
+        handed_off = True
+        return response
+    finally:
+        # 流还没交出去就退出（占槽后、StreamingResponse 之前的失败或被取消）：生成器的
+        # finally 够不到这段窗口，外层必须把槽还回去。取消/GeneratorExit 属于 BaseException，
+        # 早先那条 `except Exception` 接不住，一次取消就永久占着一个槽（issue #258）。
+        if not handed_off:
+            slot.release()
