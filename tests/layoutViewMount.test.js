@@ -62,12 +62,16 @@ function createTestRouter() {
 
 async function mountLayout({ conversations = [CONV1, CONV2], route = '/chat' } = {}) {
   resetRequestStub()
+  // 每个用例拿到一份副本：store 的 renameConversation 是**就地改写**标题
+  // （src/stores/chat.js 里 `conversation.title = title`），共用同一批对象会让
+  // 上一个用例改过的名字漏进下一个（CONV1 是模块级常量，一改全脏）。
+  const seed = conversations.map((conversation) => ({ ...conversation }))
   // 有 token 才会真的去拉 profile（useUserStore.fetchProfile 在无 token 时直接返回）。
   localStorage.setItem('token', 'test-token')
   localStorage.setItem('username', '张三')
 
   respond('get', (url) => {
-    if (url === '/chat/conversations') return conversations
+    if (url === '/chat/conversations') return seed
     if (url === '/user/profile') return PROFILE
     return {}
   })
@@ -195,6 +199,318 @@ test('管理模式开关与「新建对话」：壳的接线真的改了 store �
     assert.equal(router.currentRoute.value.path, '/chat', '点「新建对话」应当回到 /chat')
     const manageCleared = !view.text().includes('全选')
     assert.equal(manageCleared, true, '「新建对话」应当顺带退出管理模式')
+  } finally {
+    await close(view)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// d. 重命名：侧栏会话行内改名（issue #257）
+// ---------------------------------------------------------------------------
+//
+// 被测路径是三层接力：模板里的行内编辑框 -> store 的 renameConversation ->
+// `PUT /chat/conversations/:id`（替身记在 calls 里）。
+//
+// 选择器约定：不用按钮下标（标题行的管理/新建按钮、以及管理模式里的复选框都会动到
+// `queryAll('button')` 的下标），改用一个稳定的类名 `rename-entry`；
+// 输入框本身在非管理模式下是全壳唯一的一个，直接 `view.query('input')`。
+//
+// 事件一律真派发（`Event('input')` / `KeyboardEvent('keyup')` / `FocusEvent('blur')`），
+// 不直接调组件内部方法——这样 v-model、`.stop`、按键修饰符都是真的在执行。
+
+// 重命名入口：每行一个，顺序与会话行一致。
+function renameIcons(view) {
+  return view.queryAll('.rename-entry')
+}
+
+// 历史对话行（模板 :74 起，行根是 `<button class="group …">`）。
+function conversationRows(view) {
+  return view.queryAll('button.group')
+}
+
+function putCalls() {
+  return calls.filter((entry) => entry.method === 'put')
+}
+
+async function openRename(view, index) {
+  const icon = renameIcons(view)[index]
+  assert.ok(icon, `第 ${index + 1} 行应当渲染出重命名入口`)
+  icon.click()
+  await settle(view)
+  const input = view.query('input')
+  assert.ok(input, '进入编辑态后应当渲染出输入框')
+  return input
+}
+
+// v-model 靠 input 事件回填，直接改 `.value` 不派事件 store 侧是收不到的。
+function typeInto(input, value) {
+  input.value = value
+  input.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
+function pressKey(node, key, init = {}) {
+  node.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true, ...init }))
+}
+
+test('重命名 R1：点图标进入编辑态，输入框预填当前标题并自动聚焦', async () => {
+  const { view } = await mountLayout()
+
+  try {
+    const input = await openRename(view, 0)
+
+    assert.equal(view.queryAll('input').length, 1, '同一时刻只应当有一个输入框')
+    assert.equal(input.value, CONV1.title, '输入框应当预填当前标题')
+    const focused = await until(view, () => document.activeElement === input)
+    assert.ok(focused, '进入编辑态后输入框应当自动获得焦点')
+  } finally {
+    await close(view)
+  }
+})
+
+test('重命名 R2：点另一行的图标只保留一个编辑框，并切到新行', async () => {
+  const { view } = await mountLayout()
+
+  try {
+    const first = await openRename(view, 1)
+    assert.equal(first.value, CONV2.title, '应当先进入第二行的编辑态')
+
+    renameIcons(view)[0].click()
+    await settle(view)
+
+    const inputs = view.queryAll('input')
+    assert.equal(inputs.length, 1, '切行之后仍应当只有一个输入框')
+    assert.equal(inputs[0].value, CONV1.title, '编辑框应当切到新行并预填它的标题')
+  } finally {
+    await close(view)
+  }
+})
+
+test('重命名 R3：回车提交，发一次 PUT、就地更新标题并提示成功', async () => {
+  const { view } = await mountLayout()
+
+  try {
+    const input = await openRename(view, 0)
+    typeInto(input, '改过的标题')
+    pressKey(input, 'Enter')
+    await settle(view)
+
+    const puts = putCalls()
+    assert.equal(puts.length, 1, '提交应当只发一次 PUT')
+    assert.equal(puts[0].args[0], '/chat/conversations/c1', '应当打到这条会话的端点')
+    assert.deepEqual(puts[0].args[1], { title: '改过的标题' }, '请求体应当是 { title }')
+
+    assert.match(view.text(), /改过的标题/, '列表应当显示新标题')
+    assert.doesNotMatch(view.text(), /第一段对话/, '旧标题应当被替换')
+    assert.ok(
+      view.messages.some((entry) => entry.level === 'success' && entry.message === '已重命名'),
+      '提交成功应当提示「已重命名」'
+    )
+    assert.equal(view.queryAll('input').length, 0, '提交之后应当退出编辑态')
+  } finally {
+    await close(view)
+  }
+})
+
+test('重命名 R4：Esc 取消，不提交且保留原标题', async () => {
+  const { view } = await mountLayout()
+
+  try {
+    const input = await openRename(view, 0)
+    typeInto(input, '不该保存的标题')
+    pressKey(input, 'Escape')
+    await settle(view)
+
+    assert.equal(putCalls().length, 0, 'Esc 不应当发请求')
+    assert.match(view.text(), /第一段对话/, '取消后应当保留原标题')
+    assert.doesNotMatch(view.text(), /不该保存的标题/, '草稿不应当出现在列表里')
+    assert.equal(view.queryAll('input').length, 0, '取消之后应当退出编辑态')
+  } finally {
+    await close(view)
+  }
+})
+
+test('重命名 R5：失焦取消，不提交且保留原标题', async () => {
+  const { view } = await mountLayout()
+
+  try {
+    const input = await openRename(view, 0)
+    typeInto(input, '失焦丢弃的标题')
+    input.dispatchEvent(new FocusEvent('blur'))
+    await settle(view)
+
+    assert.equal(putCalls().length, 0, '失焦不应当发请求')
+    assert.match(view.text(), /第一段对话/, '失焦取消后应当保留原标题')
+    assert.equal(view.queryAll('input').length, 0, '失焦之后应当退出编辑态')
+  } finally {
+    await close(view)
+  }
+})
+
+test('重命名 R6：输入框带 40 字上限', async () => {
+  const { view } = await mountLayout()
+
+  try {
+    const input = await openRename(view, 0)
+    // jsdom 不实现 maxlength 的截断（程序化写 .value 多长就是多长），所以只能钉属性本身。
+    assert.equal(input.getAttribute('maxlength'), '40', '输入框应当带 40 字上限')
+  } finally {
+    await close(view)
+  }
+})
+
+test('重命名 R7：纯空白标题被拦截，不发请求', async () => {
+  const { view } = await mountLayout()
+
+  try {
+    const input = await openRename(view, 0)
+    typeInto(input, '   ')
+    pressKey(input, 'Enter')
+    await settle(view)
+
+    assert.equal(putCalls().length, 0, '纯空白不应当发请求')
+    assert.match(view.text(), /第一段对话/, '列表里的标题不应当变化')
+    assert.equal(view.queryAll('input').length, 0, '拦截之后仍然退出编辑态')
+  } finally {
+    await close(view)
+  }
+})
+
+test('重命名 R8：与原标题相同则短路，不发请求', async () => {
+  const { view } = await mountLayout()
+
+  try {
+    // 一个字都不改，直接回车。
+    const input = await openRename(view, 0)
+    pressKey(input, 'Enter')
+    await settle(view)
+
+    assert.equal(putCalls().length, 0, '同名不应当发请求')
+    assert.match(view.text(), /第一段对话/, '列表里的标题不应当变化')
+    assert.equal(view.queryAll('input').length, 0, '短路之后仍然退出编辑态')
+  } finally {
+    await close(view)
+  }
+})
+
+test('重命名 R9：请求失败时保留原标题、退出编辑态并提示失败', async () => {
+  const { view } = await mountLayout()
+
+  try {
+    respond('put', () => {
+      throw new Error('boom')
+    })
+
+    const input = await openRename(view, 0)
+    typeInto(input, '会失败的标题')
+    pressKey(input, 'Enter')
+    await settle(view)
+
+    assert.equal(putCalls().length, 1, '应当尝试提交一次')
+    assert.match(view.text(), /第一段对话/, '失败后应当保留原标题')
+    assert.doesNotMatch(view.text(), /会失败的标题/, '失败的标题不应当写进列表')
+    assert.ok(
+      view.messages.some((entry) => entry.level === 'error' && entry.message === '重命名失败'),
+      '提交失败应当提示「重命名失败」'
+    )
+    assert.equal(view.queryAll('input').length, 0, '失败之后应当退出编辑态')
+  } finally {
+    await close(view)
+  }
+})
+
+test('重命名 R10：管理模式里不出现重命名入口，编辑态随之中止', async () => {
+  const { view } = await mountLayout()
+
+  try {
+    await openRename(view, 0)
+
+    // 标题行第一个圆形按钮是管理模式开关（模板 :29）。
+    const circleButtons = view
+      .queryAll('button')
+      .filter((node) => node.classList.contains('is-circle'))
+    circleButtons[0].click()
+    await until(view, () => view.text().includes('全选'))
+    await settle(view)
+
+    assert.equal(renameIcons(view).length, 0, '管理模式不应当渲染重命名入口')
+    // 增量断言：不写死输入框数量（管理模式本来就有每行一个复选框），
+    // 只钉「除复选框之外没有多余的输入框」。
+    const checkboxes = view.queryAll('.el-checkbox')
+    assert.ok(checkboxes.length > 0, '管理模式每行应当有选择框')
+    assert.equal(
+      view.queryAll('input').length,
+      checkboxes.length,
+      '编辑框应当收起来，只剩下每行的选择框'
+    )
+  } finally {
+    await close(view)
+  }
+})
+
+test('重命名 R11：编辑态内点击不切换会话', async () => {
+  const { view, router } = await mountLayout({ route: '/chat' })
+  const { useChatStore } = await import(
+    new URL('../src/stores/chat.js', import.meta.url).href
+  )
+
+  try {
+    const chatStore = useChatStore(view.pinia)
+    const beforeSelect = chatStore.currentId
+
+    const input = await openRename(view, 0)
+    input.click()
+    await settle(view)
+
+    assert.equal(
+      router.currentRoute.value.path,
+      '/chat',
+      '编辑态内点击不应当把路由推到会话详情'
+    )
+    assert.equal(chatStore.currentId, beforeSelect, '编辑态内点击不应当改写当前会话')
+    assert.ok(view.query('input'), '编辑态内点击不应当把编辑框点没了')
+  } finally {
+    await close(view)
+  }
+})
+
+test('重命名 R12：改名之后当即行序不变（重排发生在下次拉取列表）', async () => {
+  const { view } = await mountLayout()
+
+  try {
+    const before = conversationRows(view).map((row) => row.textContent)
+    assert.match(before[0], /第一段对话/, '改名之前第一行应当是第一条会话')
+
+    const input = await openRename(view, 0)
+    typeInto(input, '改名后的第一段')
+    pressKey(input, 'Enter')
+    await settle(view)
+
+    const after = conversationRows(view).map((row) => row.textContent)
+    assert.equal(after.length, before.length, '行数不应当变化')
+    assert.match(after[0], /改名后的第一段/, '改名的那一行应当还在原位')
+    assert.match(after[1], /第二段对话/, '另一行的位置与内容都不应当被牵动')
+    // 自足：这条用例不与 R3 共用一次 mount，否则「行序没变」可能只是巧合地成立。
+    assert.equal(putCalls().length, 1, '这条用例自己发过一次提交')
+  } finally {
+    await close(view)
+  }
+})
+
+test('重命名 R13：IME 组字中的回车不提交', async () => {
+  const { view } = await mountLayout()
+
+  try {
+    const input = await openRename(view, 0)
+    typeInto(input, '半成品输入')
+    pressKey(input, 'Enter', { isComposing: true })
+    await settle(view)
+
+    assert.equal(putCalls().length, 0, '组字中的回车不应当提交')
+    assert.equal(view.messages.length, 0, '组字中的回车不应当弹提示')
+    const stillEditing = view.query('input')
+    assert.ok(stillEditing, '组字中的回车之后应当仍处于编辑态')
+    // 编辑态里标题在输入框的 value 上、不在 textContent 里，所以这里钉 value。
+    assert.equal(stillEditing.value, '半成品输入', '草稿应当原样留在输入框里')
   } finally {
     await close(view)
   }

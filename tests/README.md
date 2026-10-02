@@ -173,7 +173,12 @@ a control case with the sanitiser bypassed proves the payload really would reach
 negative assertions cannot pass vacuously); `chatViewMount.test.js` drives a question through a real
 streaming response and reads the answer off the real `MarkdownRenderer` child;
 `layoutViewMount.test.js` clicks the sidebar menu and pins that the route and the active item move
-together; `loginViewMount.test.js` covers the credential payload, the form-level error, the
+together, and drives the sidebar's inline rename (issue #257) end to end - the hover-revealed entry,
+the prefill and the autofocus, Enter sending exactly one `PUT` and the new title showing in place
+while the row order deliberately stays put until the next list fetch, Esc and blur cancelling
+without a request, the whitespace and same-name short-circuits, a failed `PUT` keeping the old title
+and toasting an error, the composing-Enter guard, and the in-editor click not switching
+conversations; `loginViewMount.test.js` covers the credential payload, the form-level error, the
 `redirect` target and that real validation blocks the request; `userProfileViewMount.test.js` covers
 the password change both ways (success clears all three fields and sends neither the confirmation
 field nor anything else, failure keeps them) plus the avatar's local file validation; and
