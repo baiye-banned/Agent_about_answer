@@ -417,6 +417,9 @@ def test_concurrent_stream_over_limit_is_rejected_before_the_slot_frees(stream_a
         async with _client(stream_api.app) as client:
             first = asyncio.create_task(client.post("/api/chat/stream", json=payload, headers=STREAM_HEADERS))
             await asyncio.wait_for(started.wait(), timeout=5)  # 前提：第 1 路已经占住并发槽
+            # 此刻第 1 路已交付、正在流（started 由假上游在被迭代时置位）：槽必须仍由生成器自持。
+            # 若改成无标志的 try/finally，槽早在交付瞬间就被外层还掉，这里会是 0，本断言直接红。
+            assert stream_api.gate.in_flight == 1, "流已交付但槽没被生成器自持：外层提前释放，容量被放大"
 
             second = await asyncio.wait_for(
                 client.post("/api/chat/stream", json=payload, headers=STREAM_HEADERS), timeout=5
@@ -490,7 +493,11 @@ def test_stream_exception_releases_the_slot(stream_api, monkeypatch):
 
 
 def test_failure_before_the_stream_starts_releases_the_slot(stream_api, monkeypatch):
-    """流还没开始就失败（知识库解析抛错）也要归还并发槽：这条路径不经过生成器的 finally。"""
+    """流还没开始就失败（知识库解析抛错）也要归还并发槽：这条路径不经过生成器的 finally。
+
+    （issue #258 扩展：不再只靠后续请求 200 间接证明，直接把槽计数带出来断言。它由此成为
+    取消路径的阳性对照——两者走同一个 finally，一红一绿即定位到 BaseException 这个分界。）
+    """
 
     async def _scenario():
         def exploding_resolve(*_args, **_kwargs):
@@ -513,6 +520,7 @@ def test_failure_before_the_stream_starts_releases_the_slot(stream_api, monkeypa
             failure = exc
         else:
             failure = None
+        gate_in_flight_after = stream_api.gate.in_flight
 
         monkeypatch.setattr(
             chat_service, "resolve_knowledge_base", lambda db, kid, user_id: FakeKnowledgeBase()
@@ -524,11 +532,12 @@ def test_failure_before_the_stream_starts_releases_the_slot(stream_api, monkeypa
                 ),
                 timeout=5,
             )
-        return failure, follow_up
+        return failure, follow_up, gate_in_flight_after
 
-    failure, follow_up = asyncio.run(_scenario())
+    failure, follow_up, gate_in_flight_after = asyncio.run(_scenario())
 
     assert failure is not None, "知识库解析抛出的异常被吞掉了，本用例没覆盖到「流开始前失败」"
+    assert gate_in_flight_after == 0, "窗口内普通异常时并发槽没有直接归还"
     assert follow_up.status_code == 200, "流开始之前失败时并发槽没有归还（外层收尾漏了 release）"
 
 
@@ -587,6 +596,64 @@ def test_client_disconnect_releases_the_slot(stream_api, monkeypatch):
     assert in_flight_while_streaming == 1, "流式请求没有占住并发槽，本用例测不出泄漏"
     assert after_disconnect == 0, "客户端断开后并发槽没有归还"
     assert follow_up.status_code == 200, "断开之后下一路被拒，说明槽留在了上一个请求手里"
+
+
+def test_cancelling_the_request_inside_the_pre_stream_window_releases_the_slot(stream_api, monkeypatch):
+    """取消落在占槽后、交出 StreamingResponse 之前：并发槽必须归还（issue #258）。
+
+    既有 test_client_disconnect_releases_the_slot（:564-589）走的是 aclose() → 生成器
+    finally，测不到这段窗口；本用例把 try 段内的一次真实 await 拉长成可控窗口后再取消。
+    """
+
+    async def _scenario():
+        entered = asyncio.Event()
+
+        async def hanging_build_effective_question(question, attachments):
+            # 停在一个真实的协程 await 上（非 to_thread）：取消能立刻落进这段窗口。
+            entered.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(chat_service, "_build_effective_question", hanging_build_effective_question)
+
+        # 直接 await stream_chat 造任务（与 :570 既有断连用例同形）：避开 ASGITransport 把
+        # 异常包进 anyio 异常组（见 :471 注记），取消类型断言更确定。
+        task = asyncio.create_task(
+            chat_service.stream_chat(ChatRequest(question="第一次提问"), authorization="Bearer token")
+        )
+
+        await asyncio.wait_for(entered.wait(), timeout=5)  # 前提：已占槽且停在窗口内
+        in_flight_before_cancel = stream_api.gate.in_flight
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            cancelled = True
+        else:
+            cancelled = False
+
+        in_flight_after_cancel = stream_api.gate.in_flight
+
+        # 恢复成不挂起的桩，否则下面这路会跟着挂住。
+        async def restored_build_effective_question(question, attachments):
+            return question, {"status": "skipped"}
+
+        monkeypatch.setattr(chat_service, "_build_effective_question", restored_build_effective_question)
+        async with _client(stream_api.app) as client:
+            follow_up = await asyncio.wait_for(
+                client.post(
+                    "/api/chat/stream", json={"question": "第二次提问"}, headers=STREAM_HEADERS
+                ),
+                timeout=5,
+            )
+        return in_flight_before_cancel, cancelled, in_flight_after_cancel, follow_up
+
+    in_flight_before_cancel, cancelled, in_flight_after_cancel, follow_up = asyncio.run(_scenario())
+
+    assert in_flight_before_cancel == 1, "取消前槽没被占住，本用例没测到泄漏"
+    assert cancelled, "取消没有穿透到调用方（被吞掉或异常类型不对）"
+    assert in_flight_after_cancel == 0, "窗口内取消后并发槽没有归还（外层 finally 漏了 release）"
+    assert follow_up.status_code == 200, "取消之后下一路被拒，说明槽留在了被取消的请求手里"
 
 
 # ---------------------------------------------------------------------------
@@ -672,3 +739,18 @@ def test_failure_window_ignores_zero_and_negative_thresholds():
     assert window.max_failures == 1
     assert window.window_seconds == 1
     assert rate_limit.ConcurrencyGate(0).limit == 1
+
+
+def test_repeated_release_does_not_change_the_effective_capacity():
+    """重复 release 必须是 no-op（issue #258）：交接线两侧各释放一次不该把容量算大或算小。"""
+    gate = rate_limit.ConcurrencyGate(2)
+    slot = gate.try_acquire()
+    slot.release()
+    slot.release()  # 重复释放必须是 no-op
+    assert gate.in_flight == 0, "重复 release 把计数多扣/压负"
+    held = [gate.try_acquire(), gate.try_acquire()]
+    assert all(s is not None for s in held), "重复 release 之后容量被算小了"
+    assert gate.try_acquire() is None, "重复 release 把容量算大了"
+    for s in held:
+        s.release()
+    assert gate.in_flight == 0
