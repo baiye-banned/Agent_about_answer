@@ -73,6 +73,8 @@ def serialize_message(message: Message) -> dict:
         "ragas_status": message.ragas_status or "",
         "ragas_scores": load_json_value(message.ragas_scores, {}),
         "ragas_error": message.ragas_error or "",
+        # 未反馈统一回 0：存量行与新建行同款语义（issue #250）。
+        "feedback": message.feedback or 0,
         "retrieval_trace": retrieval_trace,
         "image_analysis_status": retrieval_trace.get("image_analysis_status", ""),
         "image_analysis_error": retrieval_trace.get("image_analysis_error", ""),
@@ -652,3 +654,11 @@ def get_message_by_user(db: Session, message_id: int, user_id: int) -> Message |
 
 def get_trace_session_by_message(db: Session, message_id: int, user_id: int) -> ChatTraceSession | None:
     return db.query(ChatTraceSession).filter_by(message_id=message_id, user_id=user_id).first()
+
+
+def set_message_feedback(db: Session, message: Message, feedback: int) -> Message:
+    # 幂等：同值重复提交不产生新行、不改 created_at，只覆盖 feedback 列。
+    message.feedback = feedback
+    db.commit()
+    db.refresh(message)
+    return message

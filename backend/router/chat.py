@@ -6,6 +6,7 @@ from service.chat_service import (
     get_messages,
     list_conversations,
     rename_conversation,
+    submit_message_feedback,
     upload_chat_attachment,
     stream_chat,
 )
@@ -20,3 +21,6 @@ router.add_api_route("/api/chat/conversations/{cid}", delete_conversation, metho
 router.add_api_route("/api/chat/conversations/{cid}", rename_conversation, methods=["PUT"])
 router.add_api_route("/api/chat/attachments", upload_chat_attachment, methods=["POST"])
 router.add_api_route("/api/chat/stream", stream_chat, methods=["POST"])
+router.add_api_route(
+    "/api/chat/messages/{message_id}/feedback", submit_message_feedback, methods=["POST"]
+)

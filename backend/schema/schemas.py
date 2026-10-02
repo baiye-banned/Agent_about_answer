@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -58,3 +58,9 @@ CONVERSATION_TITLE_MAX_LENGTH = 40
 
 class RenameRequest(BaseModel):
     title: str = Field(max_length=CONVERSATION_TITLE_MAX_LENGTH)
+
+
+class MessageFeedbackRequest(BaseModel):
+    # 1=赞 / -1=踩 / 0=取消（issue #250）。闭集用 Literal：非法值由框架统一产出 422，
+    # 不依赖 service 层手抛，避免漏判。
+    feedback: Literal[-1, 0, 1]

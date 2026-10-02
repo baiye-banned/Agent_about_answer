@@ -56,6 +56,13 @@ def _ensure_schema_columns():
         if "retrieval_trace" not in columns:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE messages ADD COLUMN retrieval_trace LONGTEXT"))
+        # 消息级反馈（issue #250）。NOT NULL DEFAULT 0 让存量消息落在「未反馈」，
+        # 与新建消息一致，无需回填脚本（同 users.token_version）。
+        if "feedback" not in columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE messages ADD COLUMN feedback SMALLINT NOT NULL DEFAULT 0")
+                )
         _ensure_mysql_text_column("messages", "content", "LONGTEXT", nullable=False)
         _ensure_mysql_varchar_column("messages", "role", 10, nullable=False)
         _ensure_mysql_text_column("messages", "sources", "TEXT")

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, Integer, SmallInteger, String, Text, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -102,6 +102,9 @@ class Message(Base):
     ragas_scores = Column(Text, default="")
     ragas_error = Column(Text, default="")
     retrieval_trace = Column(LONGTEXT, default="")
+    # 消息级人工反馈（issue #250）：1=赞、-1=踩、0=未反馈。NOT NULL DEFAULT 0 让存量行直接
+    # 落在「未反馈」，与新建消息一致，不需要回填脚本（与 users.token_version 同款语义）。
+    feedback = Column(SmallInteger, nullable=False, default=0, server_default="0")
     created_at = Column(DateTime, server_default=func.now())
 
     conversation = relationship("Conversation", back_populates="messages")

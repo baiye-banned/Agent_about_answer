@@ -26,7 +26,7 @@ from database.session import SessionLocal, get_db
 from rag.learning_trace import TraceRecorder, compact_trace_reference
 from model.models import Conversation, Message, User, _new_id
 from rag.ragas_eval import schedule_ragas_evaluation
-from schema.schemas import ChatRequest, RenameRequest
+from schema.schemas import ChatRequest, MessageFeedbackRequest, RenameRequest
 from service import rate_limit
 from service.auth_service import authenticate, get_current_user
 from service.oss_service import (
@@ -461,6 +461,20 @@ def rename_conversation(cid: str, body: RenameRequest, user: User = Depends(get_
     if not conv:
         raise HTTPException(404, "对话不存在")
     return {"message": "ok"}
+
+
+def submit_message_feedback(message_id: int, body: MessageFeedbackRequest,
+                            user: User = Depends(get_current_user),
+                            db: Session = Depends(get_db)):
+    # 归属校验随查询一起做：查无此消息、或消息不属于当前用户，一律 404（不回显正文）。
+    message = crud_chat.get_message_by_user(db, message_id, user.id)
+    if not message:
+        raise HTTPException(404, "消息不存在")
+    # 反馈只针对「回答」：对提问点赞没有意义，前端不给入口，服务端兜底拦下。
+    if message.role != "assistant":
+        raise HTTPException(422, "只能对助手消息反馈")
+    crud_chat.set_message_feedback(db, message, body.feedback)
+    return {"message_id": message.id, "feedback": message.feedback}
 
 
 async def _attach_grounding_trace(
