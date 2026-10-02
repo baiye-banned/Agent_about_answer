@@ -614,6 +614,23 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  async function setMessageFeedback(messageId, feedback) {
+    const previous = messages.value.find((m) => m.id === messageId)?.feedback ?? 0
+    // 乐观更新：先落态，请求失败再回滚（回滚用捕获到的 previous，不用"取反"，
+    // 避免快速连点下把中间态当成原值）。
+    messages.value = messages.value.map((m) =>
+      m.id === messageId ? { ...m, feedback } : m
+    )
+    try {
+      await chatAPI.setMessageFeedback(messageId, feedback)
+    } catch (error) {
+      messages.value = messages.value.map((m) =>
+        m.id === messageId ? { ...m, feedback: previous } : m
+      )
+      throw error
+    }
+  }
+
   function clearMessages() {
     // 用户显式离开当前视图：在途流的「认领会话」「改写知识库」写入随之失效。
     viewEpoch += 1
@@ -636,6 +653,7 @@ export const useChatStore = defineStore('chat', () => {
       ragas_scores: message.ragas_scores || {},
       ragas_error: message.ragas_error || '',
       stream_error: message.stream_error || '',
+      feedback: message.feedback || 0,
       retrieval_trace: retrievalTrace,
       learning_trace: learningTrace,
       rag_gate: retrievalTrace.rag_gate || {},
@@ -692,6 +710,7 @@ export const useChatStore = defineStore('chat', () => {
     finishStreaming,
     deleteConversation,
     renameConversation,
+    setMessageFeedback,
     clearMessages,
   }
 })

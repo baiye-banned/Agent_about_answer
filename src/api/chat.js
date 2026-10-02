@@ -26,6 +26,10 @@ export const chatAPI = {
   getMessageTrace(messageId) {
     return request.get(`/chat/messages/${messageId}/trace`)
   },
+  // 消息级反馈（issue #250）：1=赞 / -1=踩 / 0=取消。
+  setMessageFeedback(messageId, feedback) {
+    return request.post(`/chat/messages/${messageId}/feedback`, { feedback })
+  },
   uploadAttachment(file, onProgress) {
     const formData = new FormData()
     formData.append('file', file)

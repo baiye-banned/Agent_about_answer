@@ -182,6 +182,26 @@
               <el-tooltip content="重新生成" placement="bottom">
                 <el-button link :icon="Refresh" @click="regenerate(index)" />
               </el-tooltip>
+              <el-tooltip content="有帮助" placement="bottom">
+                <el-button
+                  link
+                  :icon="Top"
+                  data-testid="feedback-up"
+                  :class="message.feedback === 1 ? 'text-brand-600' : 'text-slate-400'"
+                  :disabled="!message.id"
+                  @click="onFeedback(message, 1)"
+                />
+              </el-tooltip>
+              <el-tooltip content="没帮助" placement="bottom">
+                <el-button
+                  link
+                  :icon="Bottom"
+                  data-testid="feedback-down"
+                  :class="message.feedback === -1 ? 'text-brand-600' : 'text-slate-400'"
+                  :disabled="!message.id"
+                  @click="onFeedback(message, -1)"
+                />
+              </el-tooltip>
             </div>
           </div>
         </article>
@@ -438,6 +458,7 @@
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
+  Bottom,
   ChatDotSquare,
   CloseBold,
   CopyDocument,
@@ -448,6 +469,7 @@ import {
   Picture,
   Plus,
   Refresh,
+  Top,
 } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import MarkdownRenderer from '@/components/MarkdownRenderer.vue'
@@ -652,6 +674,13 @@ function stopGeneration() {
 
 async function copyMessage(content) {
   await copyText(content)
+}
+
+function onFeedback(message, value) {
+  // 再点同向 = 取消（归 0）：0 是"未反馈"的唯一表示，保证选中态是二元的。
+  const next = message.feedback === value ? 0 : value
+  // 失败提示由 request.js 拦截器统一给出；这里必须接住 rejection（store 回滚后会重新抛出）。
+  chatStore.setMessageFeedback(message.id, next).catch(() => {})
 }
 
 async function regenerate(index) {
