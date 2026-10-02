@@ -27,7 +27,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mountSfc } from './helpers/vueMount.js'
-import { calls, resetRequestStub, respond } from './helpers/stubApiRequest.js'
+import { calls, callsOf, resetRequestStub, respond } from './helpers/stubApiRequest.js'
 
 // vue-router 必须**动态** import，且排在 vueMount 之后 —— 它自己 import 'vue'，
 // 而 vue 的 runtime-dom 在模块求值时就抓走 document
@@ -425,6 +425,140 @@ test('IME：compositionend 之后按 Enter 发送的是上屏后的全文', asyn
     assert.equal(streamCalls.length, 1, '上屏后的 Enter 应当恰好发一次流式请求')
     const body = JSON.parse(streamCalls[0].options.body)
     assert.equal(body.question, '你好shijie', '发出的应当是上屏后的全文')
+  } finally {
+    await close(view)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// e. 消息反馈（issue #250）：👍/👎 的选中态、请求体、取消与失败回滚
+//
+// 视图这一层只有一条逻辑：`onFeedback` 把「再点同向 = 取消（归 0）」算出来，
+// 交给 store 的 setMessageFeedback，并接住 store 回滚后重新抛出的 rejection。
+// 所以这里钉三件事：按钮真的渲染出来了、点下去发出去的请求体对不对、
+// 失败后 DOM 有没有跟着 store 回到调用前的值。
+//
+// 失败提示（ElMessage）**不在**断言面内：整个 `api/request.js` 被换成了替身，
+// 弹提示的 axios 拦截器（src/api/request.js）根本没进模块图，替身也不负责弹。
+// 视图只保证「接住了 rejection、不让它变成未处理的 Promise」。
+// ---------------------------------------------------------------------------
+
+// 挂载用例的 views/Chat.vue 与测试这里 import 的是同一个 src/stores/chat.js
+//（同一个解析结果 -> 同一个模块实例），所以能从同一个 pinia 里取到视图正在用的 store。
+async function viewStore(view) {
+  const { useChatStore } = await import(new URL('../src/stores/chat.js', import.meta.url).href)
+  return useChatStore(view.pinia)
+}
+
+test('反馈按钮：助手消息上有 👍/👎，落库消息可点', async () => {
+  const { view } = await mountChat({ route: '/chat/c1' })
+
+  try {
+    // PERSISTED 里只有一条助手消息（id=2），所以恰好一组反馈按钮。
+    const ups = view.queryAll('[data-testid="feedback-up"]')
+    const downs = view.queryAll('[data-testid="feedback-down"]')
+    assert.equal(ups.length, 1, '助手消息上应当有一个「有帮助」按钮')
+    assert.equal(downs.length, 1, '助手消息上应当有一个「没帮助」按钮')
+    // 初始未反馈：两个都用「未选中」色，且因为消息已落库（有 id）都可点。
+    for (const button of [...ups, ...downs]) {
+      assert.equal(button.classList.contains('text-slate-400'), true, '未反馈时应当用未选中色')
+      assert.equal(button.disabled, false, '已落库的助手消息，反馈按钮应当可点')
+    }
+  } finally {
+    await close(view)
+  }
+})
+
+test('反馈按钮：点「有帮助」发出 feedback=1，按钮切到选中色', async () => {
+  const { view } = await mountChat({ route: '/chat/c1' })
+
+  try {
+    assert.equal(callsOf('post').length, 0, '前置：挂载后还没有任何 POST')
+    const up = view.query('[data-testid="feedback-up"]')
+    assert.ok(up, '页面上应当有「有帮助」按钮')
+
+    up.click()
+    await view.flush(2)
+
+    // 承重①：请求打到消息级反馈路由，body 是 { feedback: 1 }。
+    assert.deepEqual(callsOf('post'), [
+      { method: 'post', args: ['/chat/messages/2/feedback', { feedback: 1 }] },
+    ], '点「有帮助」应当向 /chat/messages/2/feedback 发 { feedback: 1 }')
+
+    // 承重②：选中态上屏（乐观更新，不等请求回来）。
+    assert.equal(up.classList.contains('text-brand-600'), true, '选中后应当用高亮色')
+    assert.equal(up.classList.contains('text-slate-400'), false, '选中后不应再是未选中色')
+  } finally {
+    await close(view)
+  }
+})
+
+test('反馈按钮：再点同向取消（feedback=0），选中态回落', async () => {
+  const { view } = await mountChat({ route: '/chat/c1' })
+
+  try {
+    const up = view.query('[data-testid="feedback-up"]')
+    up.click()
+    await view.flush(2)
+    assert.equal(up.classList.contains('text-brand-600'), true, '前置：第一次点应当选中')
+
+    up.click()
+    await view.flush(2)
+
+    // 「再点同向 = 取消」：第二次发出的是 0，而不是把 1 再发一遍。
+    assert.deepEqual(
+      callsOf('post').map((entry) => entry.args[1]),
+      [{ feedback: 1 }, { feedback: 0 }],
+      '第二次点击应当发 { feedback: 0 }（取消），而不是重复提交 1'
+    )
+    assert.equal(up.classList.contains('text-slate-400'), true, '取消后应当回到未选中色')
+  } finally {
+    await close(view)
+  }
+})
+
+test('反馈按钮：提交失败时回滚到调用前的值，并接住 rejection', async () => {
+  const { view } = await mountChat({ route: '/chat/c1' })
+
+  try {
+    const store = await viewStore(view)
+    respond('post', () => {
+      throw new Error('反馈提交失败')
+    })
+    const up = view.query('[data-testid="feedback-up"]')
+
+    up.click()
+    await view.flush(2)
+    // 先乐观选中，请求被拒后滚回去。
+    await settle(view)
+
+    assert.equal(up.classList.contains('text-slate-400'), true, '失败后按钮应当回到未选中色')
+    const message = store.messages.find((item) => item.id === 2)
+    assert.equal(message.feedback, 0, '失败后 store 里的值应当回滚到调用前的 0')
+    // 请求确实发出去了（不是因为没发才没变）。
+    assert.equal(callsOf('post').length, 1, '无论成败，请求都应当发出去一次')
+  } finally {
+    await close(view)
+  }
+})
+
+test('反馈按钮：没有 id 的本地消息按钮禁用，且点击不发请求', async () => {
+  const { view } = await mountChat({ route: '/chat/c1' })
+
+  try {
+    // 本地/流式中的助手消息没有 id（normalizeMessage 把缺省 id 归一成 null），
+    // 此时按钮必须禁用 —— 否则会发出 `/chat/messages/null/feedback` 这种打不中的请求。
+    const store = await viewStore(view)
+    store.addMessage({ role: 'assistant', content: '本地回答', isLocal: true })
+    await view.flush(2)
+
+    const localUp = view.queryAll('[data-testid="feedback-up"]').at(-1)
+    assert.ok(localUp, '本地助手消息也应当渲染出反馈按钮')
+    assert.equal(localUp.disabled, true, '没有 id 的消息，反馈按钮应当禁用')
+
+    localUp.click()
+    await view.flush(2)
+    assert.equal(callsOf('post').length, 0, '禁用的反馈按钮不得发出任何请求')
   } finally {
     await close(view)
   }

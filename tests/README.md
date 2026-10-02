@@ -263,6 +263,7 @@ Current files:
 - `test_llm_urls.py`
 - `test_memory_context.py`
 - `test_message_conversation_indexes_176.py`
+- `test_message_feedback_250.py`
 - `test_milvus_acceptance.py`
 - `test_milvus_client.py`
 - `test_mysql_password_guard.py`
@@ -501,7 +502,18 @@ path out of `main.app.openapi()["paths"]` rather than out of a walk over `main.a
 would make the assertion vacuously true; the 404 is taken from a request against the real `main.app`
 with a sibling `/api` route as the positive control that the whole app is still up, and a reverse
 lock keeps `save_checkpoint`/`load_checkpoint`/`delete_thread_checkpoints` callable, so removing the
-endpoint cannot pass by removing the module).
+endpoint cannot pass by removing the module). `test_message_feedback_250.py` covers the
+message-level like/dislike feedback added by issue #250: `POST
+/api/chat/messages/{message_id}/feedback` persists one of `1`/`-1`/`0` into the new
+`messages.feedback` column and echoes it back in conversation history (T1), re-sending a value is
+idempotent and leaves the row's `created_at` and row count untouched because the write is an
+in-place ORM assign plus `commit`/`refresh` rather than a bulk `update` (T2, which the shared
+`FakeDb` cannot support anyway), acting on someone else's message or an unknown id is a `404` with
+no content echoed and the stored value unchanged (T3/T4), a value outside `Literal[-1, 0, 1]` or a
+missing `feedback` key is a `422` whose `detail[0]["type"]` is `literal_error`/`missing` (T5),
+feedback on a user-authored message is rejected by the assistant-only role guard (T6), a freshly
+created message defaults to `0` (T7), and `_ensure_schema_columns()` adds the column to a legacy
+table idempotently so the pre-existing row reads back as `0` (T8).
 
 `conftest.py` puts `backend/` on `sys.path` so the tests can import application modules, and holds the test doubles shared by more than one test file: the `FakeQuery`/`FakeDb`/`FakeUser`/`FakeKnowledgeBase`/`FakeTraceRecorder` classes, the pytest fixtures built on them (`fake_user`, `fake_db`, `fake_knowledge_base`, `trace_recorder_cls`), and the SSE helpers (`collect_stream`, `parse_sse_frames`, `frames_of_type`, `streamed_content`). Test doubles used by a single file stay in that file.
 

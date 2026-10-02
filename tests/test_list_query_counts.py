@@ -333,6 +333,7 @@ def test_message_history_keeps_field_structure(api):
         "ragas_scores",
         "ragas_error",
         "retrieval_trace",
+        "feedback",
         "image_analysis_status",
         "image_analysis_error",
         "image_description",

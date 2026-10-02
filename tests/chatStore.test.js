@@ -5,6 +5,9 @@ import { registerHooks } from 'node:module'
 // 桩模块：只替换网络层，跑的是真实的 src/stores/chat.js。
 const stubSource = [
   'const pending = new Map()',
+  // 反馈是独立的出口：getMessages 的 pending 队列由 respond/respondError 驱动，
+  // 混在一起会让「消费一条反馈响应」顺手吃掉一条消息响应。
+  'const feedbackPending = new Map()',
   'const conversationResolvers = []',
   'export const streams = []',
   'export const getMessagesCalls = []',
@@ -20,6 +23,11 @@ const stubSource = [
   '  }),',
   '  deleteConversation: async () => {},',
   '  renameConversation: async () => {},',
+  '  setMessageFeedback: (id, feedback) => new Promise((resolve, reject) => {',
+  '    const queue = feedbackPending.get(id) || []',
+  '    queue.push({ resolve, reject, feedback })',
+  '    feedbackPending.set(id, queue)',
+  '  }),',
   '}',
   'export function respondConversations(list) {',
   '  conversationResolvers.splice(0).forEach((resolve) => resolve(list))',
@@ -53,10 +61,23 @@ const stubSource = [
   '  pending.set(id, queue)',
   '  if (entry) entry.reject(error)',
   '}',
+  'export function respondFeedback(id) {',
+  '  const queue = feedbackPending.get(id) || []',
+  '  const entry = queue.shift()',
+  '  feedbackPending.set(id, queue)',
+  '  if (entry) entry.resolve({})',
+  '}',
+  'export function respondFeedbackError(id, error) {',
+  '  const queue = feedbackPending.get(id) || []',
+  '  const entry = queue.shift()',
+  '  feedbackPending.set(id, queue)',
+  '  if (entry) entry.reject(error)',
+  '}',
   // 每条用例开始前清空桩状态：某条用例提前断言失败时可能留下没人消费的 resolver，
   // 若不清理，下一条用例的 respond() 会把它消费掉，导致该用例永远等不到自己的响应。
   'export function resetStub() {',
   '  pending.clear()',
+  '  feedbackPending.clear()',
   '  conversationResolvers.length = 0',
   '}',
   'export function streamChat(options) {',
@@ -100,7 +121,7 @@ globalThis.window = {
 
 const { createPinia, setActivePinia } = await import('pinia')
 const { useChatStore } = await import('../src/stores/chat.js')
-const { respond, respondLatest, respondError, respondConversations, resetStub, streams, getMessagesCalls, getMessagesParams } =
+const { respond, respondLatest, respondError, respondFeedback, respondFeedbackError, respondConversations, resetStub, streams, getMessagesCalls, getMessagesParams } =
   await import(chatApiStub)
 
 const conversation = (id, knowledgeBaseId = null) => ({
@@ -825,6 +846,36 @@ test('消息合并：会话已切走时只返回合并结果，不写当前视�
 
   assert.equal(merged.length, 2) // 合并结果照常返回
   assert.deepEqual(contents(store), ['A 的问题']) // 但不改写已切走会话的视图
+})
+
+
+// ---------------------------------------------------------------------------
+// 消息级反馈（issue #250）：setMessageFeedback 的乐观更新与失败回滚。
+// 「再点同向即取消」这层语义在 Chat.vue 的 onFeedback 里（视图组用例钉住），
+// 这里只保证 store 把值落对、失败时回到调用前的值并把异常抛给调用方。
+// ---------------------------------------------------------------------------
+
+test('setMessageFeedback：先乐观落态，失败时回滚到调用前的值', async () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+  store.addMessage({ id: 'm1', role: 'assistant', content: '回答' })
+  const feedbackOf = () => store.messages.find((item) => item.id === 'm1').feedback
+
+  assert.equal(feedbackOf(), 0)
+
+  // 成功路径：请求还没回来，界面已切到选中态；回来后仍是选中态。
+  const liked = store.setMessageFeedback('m1', 1)
+  assert.equal(feedbackOf(), 1)
+  respondFeedback('m1')
+  await liked
+  assert.equal(feedbackOf(), 1)
+
+  // 失败路径：回滚到「调用前」的值（这里是 1，不是取反后的 0），并照常抛出。
+  const rejected = store.setMessageFeedback('m1', -1)
+  assert.equal(feedbackOf(), -1)
+  respondFeedbackError('m1', new Error('反馈提交失败'))
+  await assert.rejects(rejected, /反馈提交失败/)
+  assert.equal(feedbackOf(), 1)
 })
 
 
