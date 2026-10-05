@@ -17,7 +17,8 @@ request.interceptors.request.use((config) => {
 })
 
 request.interceptors.response.use(
-  (response) => response.data,
+  // 下载需要响应头中的文件名；普通 JSON 请求仍只返回 data。
+  (response) => response.config?.returnFullResponse ? response : response.data,
   (error) => {
     const status = error.response?.status
     const message = getApiErrorMessage(error)

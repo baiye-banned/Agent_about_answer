@@ -74,6 +74,8 @@ end in `.test.js` are included as well.
 Current files:
 
 - `chatApi.test.js`
+- `chatExport.test.js`
+- `chatExportRequest.test.js`
 - `chatStore.test.js`
 - `chatStorePaging.test.js`
 - `chatViewMount.test.js`
@@ -216,7 +218,11 @@ page's last row (a conversation id alone cannot order a uuid-keyed list), overla
 refresh or a stream tail inserted are dropped id by id rather than duplicated, a page whose last row
 carries no `updated_at` produces no entry at all instead of a button that does nothing, and
 re-fetching replaces the list with the newest page and resets the cursor rather than continuing from
-the stale one.
+the stale one. Conversation Markdown export (#252) preserves the full Axios response only for the
+download request, parses UTF-8 filenames, rejects non-Markdown payloads, releases object URLs, and
+keeps ordinary JSON requests and login expiry handling unchanged. Mounted Chat.vue tests cover the
+real export button, unavailable states, duplicate clicks, errors and conversation changes while a
+download is pending.
 
 ## Python Tests
 
@@ -234,6 +240,7 @@ Current files:
 - `test_attachment_lifecycle.py`
 - `test_auth_service.py`
 - `test_boundary_modules.py`
+- `test_chat_export_252.py`
 - `test_chat_service_retrieval.py`
 - `test_checkpointer.py`
 - `test_checkpointer_threads_removed_236.py`
@@ -517,15 +524,19 @@ feedback on a user-authored message is rejected by the assistant-only role guard
 created message defaults to `0` (T7), and `_ensure_schema_columns()` adds the column to a legacy
 table idempotently so the pre-existing row reads back as `0` (T8). Conversation renaming rejects
 whitespace-only titles without changing storage and trims valid titles while preserving internal
-spaces, the request length limit, authentication and ownership checks (#265). Model generation that
-normally exhausts without any final text sends one explicit error before DONE, records
-`generation_failed` with `empty_response` and `assistant_not_saved`, and finishes the failed trace
-before the client can disconnect on that error (#259). The cases replace only model factories along
-the real chat-service/chain/LLM path, cover zero chunks and all-empty chunks, and keep empty-prefix
-success, existing model errors and fallback reset semantics intact. Cancellation, direct generator
-exceptions and pre-generation rejection keep their existing paths; no empty assistant is stored, no
-automatic retry is introduced, and the same conversation accepts the next question after the failed
-stream releases its concurrency slot.
+spaces, the request length limit, authentication and ownership checks (#265). Conversation Markdown
+export (#252) reads real SQLite messages in ascending ID batches of at most 200, without changing
+chat-history paging. Authenticated HTTP cases cover complete exports above the page cap, tied
+timestamps, ID gaps, user ownership, source-field filtering, empty conversations, safe UTF-8
+filenames, a fixed initial upper ID, and failure before any partial download can be returned. Model
+generation that normally exhausts without any final text sends one explicit error before DONE,
+records `generation_failed` with `empty_response` and `assistant_not_saved`, and finishes the failed
+trace before the client can disconnect on that error (#259). The cases replace only model factories
+along the real chat-service/chain/LLM path, cover zero chunks and all-empty chunks, and keep
+empty-prefix success, existing model errors and fallback reset semantics intact. Cancellation,
+direct generator exceptions and pre-generation rejection keep their existing paths; no empty
+assistant is stored, no automatic retry is introduced, and the same conversation accepts the next
+question after the failed stream releases its concurrency slot.
 
 `conftest.py` puts `backend/` on `sys.path` so the tests can import application modules, and holds the test doubles shared by more than one test file: the `FakeQuery`/`FakeDb`/`FakeUser`/`FakeKnowledgeBase`/`FakeTraceRecorder` classes, the pytest fixtures built on them (`fake_user`, `fake_db`, `fake_knowledge_base`, `trace_recorder_cls`), and the SSE helpers (`collect_stream`, `parse_sse_frames`, `frames_of_type`, `streamed_content`). Test doubles used by a single file stay in that file.
 

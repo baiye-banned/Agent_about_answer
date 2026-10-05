@@ -14,6 +14,13 @@ export const chatAPI = {
   getMessages(conversationId, params) {
     return request.get(`/chat/conversations/${conversationId}`, { params })
   },
+  exportConversation(conversationId) {
+    return request.get(`/chat/conversations/${conversationId}/export`, {
+      responseType: 'blob',
+      returnFullResponse: true,
+      silent: true,
+    })
+  },
   deleteConversation(id) {
     return request.delete(`/chat/conversations/${id}`)
   },

@@ -48,6 +48,15 @@
           </div>
         </div>
 
+        <el-button
+          :icon="Download"
+          :loading="exporting"
+          :disabled="!chatStore.currentId || chatStore.streaming || exporting"
+          data-testid="export-markdown"
+          @click="exportConversation"
+        >
+          导出 Markdown
+        </el-button>
         <el-button :icon="Plus" @click="createNewConversation">新建对话</el-button>
       </div>
     </header>
@@ -463,6 +472,7 @@ import {
   CloseBold,
   CopyDocument,
   Document,
+  Download,
   Edit,
   Loading,
   MagicStick,
@@ -479,6 +489,7 @@ import { useKnowledgeStore } from '@/stores/knowledge'
 import { chatAPI } from '@/api/chat'
 import { CHAT_SUGGESTIONS } from '@/utils/chatSuggestions'
 import { copyText } from '@/utils/clipboard'
+import { getConversationExportErrorMessage, saveConversationMarkdown } from '@/utils/chatExport'
 import { ACCEPTED_IMAGE_INPUT, validateImageFile } from '@/utils/fileValidation'
 import {
   imageAnalysisWarningText as getImageAnalysisWarningText,
@@ -516,6 +527,7 @@ const traceTab = ref('timeline')
 const activeTrace = ref({ trace_id: '', status: '', events: [] })
 const attachments = ref([])
 const uploadingAttachment = ref(false)
+const exporting = ref(false)
 const knowledgeBases = computed(() => knowledgeStore.knowledgeBases)
 const selectedKnowledgeBaseId = ref(null)
 
@@ -648,6 +660,23 @@ function createNewConversation() {
   chatStore.clearMessages()
   router.push('/chat')
   syncSelectedKnowledgeBase()
+}
+
+async function exportConversation() {
+  if (!chatStore.currentId || chatStore.streaming || exporting.value) return
+
+  // 等待下载时允许切换会话，文件始终对应这次点击的会话。
+  const conversationId = chatStore.currentId
+  const title = chatStore.currentConversation?.title || '未命名对话'
+  exporting.value = true
+  try {
+    const response = await chatAPI.exportConversation(conversationId)
+    saveConversationMarkdown(response, title)
+  } catch (error) {
+    ElMessage.error(await getConversationExportErrorMessage(error))
+  } finally {
+    exporting.value = false
+  }
 }
 
 function sendMessage() {

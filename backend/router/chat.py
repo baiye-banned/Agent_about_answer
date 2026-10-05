@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 
+from service.chat_export_service import export_conversation
 from service.trace_service import get_chat_trace, get_message_trace
 from service.chat_service import (
     delete_conversation,
@@ -15,6 +16,7 @@ from service.chat_service import (
 router = APIRouter()
 router.add_api_route("/api/chat/conversations", list_conversations, methods=["GET"])
 router.add_api_route("/api/chat/conversations/{cid}", get_messages, methods=["GET"])
+router.add_api_route("/api/chat/conversations/{cid}/export", export_conversation, methods=["GET"])
 router.add_api_route("/api/chat/traces/{trace_id}", get_chat_trace, methods=["GET"])
 router.add_api_route("/api/chat/messages/{message_id}/trace", get_message_trace, methods=["GET"])
 router.add_api_route("/api/chat/conversations/{cid}", delete_conversation, methods=["DELETE"])

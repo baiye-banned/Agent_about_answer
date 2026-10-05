@@ -201,6 +201,31 @@ def list_messages(
     return rows
 
 
+def get_message_export_upper_id(db: Session, cid: str) -> int | None:
+    """捕获本次导出的消息 ID 上界；调用方必须先校验会话归属。"""
+    return db.query(func.max(Message.id)).filter(Message.conversation_id == cid).scalar()
+
+
+def list_message_export_batch(
+    db: Session,
+    cid: str,
+    *,
+    upper_id: int,
+    after_id: int | None = None,
+) -> list:
+    """直接查库导出，按主键升序读一批；不复用倒序的聊天历史分页。
+
+    只读取 Markdown 需要的字段，避免把附件凭据、检索轨迹和评测数据带进导出。
+    ID 上界固定消息范围，不构成原子快照：读取期间的修改/删除仍可能被观察到。
+    """
+    query = db.query(
+        Message.id, Message.role, Message.created_at, Message.content, Message.sources
+    ).filter(Message.conversation_id == cid, Message.id <= upper_id)
+    if after_id is not None:
+        query = query.filter(Message.id > after_id)
+    return query.order_by(Message.id.asc()).limit(CHAT_MESSAGE_MAX_LIMIT).all()
+
+
 def list_conversation_attachment_owners(
     db: Session, cid: str, user_id: int
 ) -> list[tuple[str, int | None]] | None:

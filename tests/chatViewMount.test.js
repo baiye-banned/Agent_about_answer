@@ -563,3 +563,136 @@ test('反馈按钮：没有 id 的本地消息按钮禁用，且点击不发请�
     await close(view)
   }
 })
+
+// f. 会话导出（issue #252）：走真实按钮、chatAPI 和下载 helper，只替换 HTTP 与浏览器下载出口。
+function recordExportDownloads(t) {
+  const downloads = []
+  const urls = []
+  t.mock.method(URL, 'createObjectURL', (blob) => {
+    urls.push({ blob, revoked: false })
+    return `blob:export-${urls.length}`
+  })
+  t.mock.method(URL, 'revokeObjectURL', (url) => {
+    const index = Number(url.split('-').at(-1)) - 1
+    urls[index].revoked = true
+  })
+  t.mock.method(HTMLAnchorElement.prototype, 'click', function () {
+    downloads.push({ href: this.href, filename: this.download })
+  })
+  return { downloads, urls }
+}
+
+function exportRequests() {
+  return callsOf('get').filter((entry) => entry.args[0].endsWith('/export'))
+}
+
+test('导出按钮：未保存的新会话不可点，已保存的空会话可点，生成期间禁用', async (t) => {
+  const { downloads } = recordExportDownloads(t)
+  const { view } = await mountChat({ messages: [] })
+  try {
+    const button = view.query('[data-testid="export-markdown"]')
+    assert.ok(button, '顶部应当有导出按钮')
+    assert.equal(button.disabled, true, '新会话尚无 id 时不可导出')
+    button.click()
+    await view.flush(2)
+    assert.equal(exportRequests().length, 0)
+
+    const store = await viewStore(view)
+    await store.selectConversation('c1')
+    await view.flush(3)
+    assert.equal(store.messages.length, 0)
+    assert.equal(button.disabled, false, '已保存的空会话也允许导出标题')
+
+    store.streamingConversationId = 'c1'
+    store.streaming = true
+    await view.flush(2)
+    assert.equal(button.disabled, true, '回答生成期间不可导出')
+    button.click()
+    await view.flush(2)
+    assert.equal(exportRequests().length, 0)
+    assert.equal(downloads.length, 0)
+    store.streaming = false
+  } finally {
+    await close(view)
+  }
+})
+
+for (const { headers, filename } of [
+  {
+    headers: {
+      'content-disposition': `attachment; filename="conversation.md"; filename*=UTF-8''${encodeURIComponent('服务端标题.md')}`,
+    },
+    filename: '服务端标题.md',
+  },
+  { headers: {}, filename: '对话一.md' },
+]) {
+  test(`导出按钮：防重复点击，切换会话后仍下载点击时的会话（${filename}）`, async (t) => {
+    const { downloads, urls } = recordExportDownloads(t)
+    const { view, router } = await mountChat({ route: '/chat/c1' })
+    let resolveExport
+    const pendingExport = new Promise((resolve) => { resolveExport = resolve })
+    respond('get', (url) => {
+      if (url === '/chat/conversations/c1/export') return pendingExport
+      if (url === '/knowledge-bases') return [KB1, KB2]
+      if (url === '/chat/conversations/c2') return []
+      return []
+    })
+    try {
+      const store = await viewStore(view)
+      const initialMessages = JSON.stringify(store.messages)
+      store.conversations.push({ ...CONV1, id: 'c2', title: '对话二' })
+      const button = view.query('[data-testid="export-markdown"]')
+      button.click()
+      button.click()
+      await view.flush(2)
+      assert.equal(exportRequests().length, 1, '快速点击两次只发一个请求')
+      assert.deepEqual(exportRequests()[0].args, [
+        '/chat/conversations/c1/export',
+        { responseType: 'blob', returnFullResponse: true, silent: true },
+      ])
+      assert.equal(button.disabled, true, '导出请求在途期间按钮禁用')
+      assert.equal(JSON.stringify(store.messages), initialMessages, '导出不修改原消息')
+
+      await router.push('/chat/c2')
+      await view.flush(4)
+      assert.equal(store.currentId, 'c2', '前置：已经切换到了另一会话')
+      assert.equal(button.disabled, true)
+      const blob = new Blob(['# 对话一\n\n完整记录'], { type: 'text/markdown;charset=utf-8' })
+      resolveExport({ status: 200, data: blob, headers })
+      await settle(view)
+      assert.deepEqual(downloads, [{ href: 'blob:export-1', filename }])
+      assert.strictEqual(urls[0].blob, blob, '实际保存后端原始文件')
+      assert.equal(urls[0].revoked, true, '下载完成后释放临时 URL')
+      assert.equal(document.querySelector('a[download]'), null, '临时链接应已移除')
+      assert.equal(button.disabled, false, '结束后可导出当前会话')
+      assert.deepEqual(view.messages, [])
+    } finally {
+      await close(view)
+    }
+  })
+}
+
+test('导出按钮：HTTP 失败只提示一次，不保存文件且恢复可重试', async (t) => {
+  const { downloads, urls } = recordExportDownloads(t)
+  const { view } = await mountChat({ route: '/chat/c1' })
+  respond('get', () => {
+    const error = new Error('Request failed')
+    error.response = { status: 404, data: new Blob(['{"detail":"对话不存在"}'], { type: 'application/json' }) }
+    throw error
+  })
+  try {
+    const store = await viewStore(view)
+    const initialMessages = JSON.stringify(store.messages)
+    const button = view.query('[data-testid="export-markdown"]')
+    button.click()
+    await settle(view)
+    assert.equal(exportRequests().length, 1)
+    assert.deepEqual(view.messages, [{ level: 'error', message: '对话不存在或无权导出' }])
+    assert.equal(downloads.length, 0)
+    assert.equal(urls.length, 0)
+    assert.equal(button.disabled, false)
+    assert.equal(JSON.stringify(store.messages), initialMessages)
+  } finally {
+    await close(view)
+  }
+})
