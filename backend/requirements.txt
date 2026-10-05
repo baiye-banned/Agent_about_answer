@@ -3,7 +3,7 @@ uvicorn==0.54.0
 python-jose[cryptography]>=3.5.0
 passlib[bcrypt]==1.7.4
 bcrypt<5
-python-multipart>=0.0.31
+python-multipart>=0.0.32
 sqlalchemy==2.0.54
 pymysql==1.2.3
 cryptography>=50.0.2
