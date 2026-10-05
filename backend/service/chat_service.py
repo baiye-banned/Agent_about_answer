@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 # 失败分支回给用户的固定文案：异常原文（驱动报错、路径、上游地址）只进 logger，不进 SSE 帧
 # 或 HTTP detail。学习轨迹事件同时带上 trace_id，用户报错时可直接与日志里的 trace 对上。
 ASSISTANT_SAVE_FAILED_MESSAGE = "保存回答失败"
+EMPTY_MODEL_RESPONSE_MESSAGE = "本次未生成回答，请重新发送"
 RAGAS_SCHEDULE_FAILED_MESSAGE = "RAGAS 评估调度失败"
 MEMORY_SUMMARY_SCHEDULE_FAILED_MESSAGE = "长期记忆压缩调度失败"
 OSS_UPLOAD_FAILED_MESSAGE = "图片上传失败，请稍后重试"
@@ -1378,6 +1379,32 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                     await _safe_trace_finish(trace, "failed", conversation_id=cid)
                     for payload in _trace_sse_payloads(trace):
                         yield payload
+                else:
+                    # 这里只处理生成循环正常结束后的零正文，不覆盖前置早退或取消。
+                    # reset 作废的旧正文不能算成功；也不把错误提示存为正式回答。
+                    await _safe_trace_add(
+                        trace,
+                        "generation_failed",
+                        "stream_rag_answer",
+                        result={"reason": "empty_response", "message": EMPTY_MODEL_RESPONSE_MESSAGE},
+                        note="模型生成正常结束但未返回正文，本轮按失败处理。",
+                    )
+                    await _safe_trace_add(
+                        trace,
+                        "assistant_not_saved",
+                        "Message",
+                        result={"saved": False},
+                        note="模型未返回正文，不保存空的 assistant 消息。",
+                    )
+                    # 客户端收到 error 后可能断开，先持久化终态再发送错误帧。
+                    await _safe_trace_finish(trace, "failed", conversation_id=cid)
+                    for payload in _trace_sse_payloads(trace):
+                        yield payload
+                    data = json.dumps(
+                        {"type": "error", "message": EMPTY_MODEL_RESPONSE_MESSAGE},
+                        ensure_ascii=False,
+                    )
+                    yield f"data: {data}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
                 # 客户端断开时，Starlette 的 StreamingResponse 会取消正在跑流的任务，把
