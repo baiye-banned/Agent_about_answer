@@ -18,7 +18,7 @@
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.0",
     "axios": "^1.18.0",
-    "element-plus": "^2.14.6",
+    "element-plus": "^2.14.7",
     "highlight.js": "^11.12.0",
     "marked": "^18.0.14",
     "marked-highlight": "^2.1.0",
@@ -33,12 +33,12 @@
     "@vitejs/plugin-vue": "^6.0.9",
     "eslint": "^10.11.0",
     "eslint-plugin-vue": "^10.11.1",
-    "globals": "^17.12.0",
+    "globals": "^17.13.0",
     "jsdom": "^30.1.1",
     "postcss": "^8.5.23",
     "tailwindcss": "^4.3.3",
     "unplugin-auto-import": "^21.1.0",
     "unplugin-vue-components": "^32.1.0",
-    "vite": "^8.3.1"
+    "vite": "^8.3.2"
   }
 }
